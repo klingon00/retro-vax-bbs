@@ -50,44 +50,15 @@ old entry from your `known_hosts`.
 
 ## Module path
 
-This project's module path is `github.com/YOURNAME/retro-vms-bbs`. If
+This project's module path is `github.com/klingon00/retro-vms-bbs`. If
 you ever need to rename it again (new GitHub username, fork, etc.):
 
 ```bash
 go mod edit -module github.com/NEWUSER/NEWREPO
-grep -rl 'github.com/YOURNAME/retro-vms-bbs' --include='*.go' . \
-  | xargs sed -i 's#github.com/YOURNAME/retro-vms-bbs#github.com/NEWUSER/NEWREPO#g'
+grep -rl 'github.com/klingon00/retro-vms-bbs' --include='*.go' . \
+  | xargs sed -i 's#github.com/klingon00/retro-vms-bbs#github.com/NEWUSER/NEWREPO#g'
 go build ./...
 ```
-
-## A note on `go.mod`'s `replace` directives
-
-This project was originally scaffolded in a sandboxed environment
-without access to `proxy.golang.org` or `sum.golang.org` (the default Go
-module proxy and checksum database). To fetch dependencies anyway,
-`go.mod` contains `replace` directives that redirect `golang.org/x/*`
-packages to their `github.com/golang/*` mirrors, fetched directly via
-git rather than through the proxy, with `GOSUMDB=off`.
-
-**What this means for you:**
-
-- The `go.sum` in this repo has hashes that were computed locally but
-  **never cross-checked against the public sumdb transparency log**. For
-  well-known dependencies from the official Charm and Go orgs the
-  practical risk is low, but it's not the same guarantee a normal `go
-  get` gives you.
-- On your own machine, with normal internet access, run:
-```bash
-  GOPROXY=https://proxy.golang.org GOSUMDB=sum.golang.org go mod tidy
-```
-  This re-resolves everything through the real proxy and sumdb. If it
-  completes without error and `git diff go.sum` shows only hash
-  additions (not changes to existing entries), you're in good shape —
-  that confirms what was fetched here matches what the canonical proxy
-  serves. At that point you can also delete the `replace` lines for
-  `golang.org/x/sys`, `x/crypto`, `x/sync`, `x/text`, and `x/exp` at the
-  top of `go.mod` — they're a workaround for that sandbox's network
-  restrictions, not a permanent project requirement.
 
 ## Project layout
 
