@@ -1,0 +1,24 @@
+# Host SSH key + (eventually) the SQLite db. Never commit these — the
+# host key is a private key, and the db will hold password hashes.
+/data/
+*.db
+*.db-journal
+*.db-wal
+*.db-shm
+
+# Build output
+/bin/
+/dist/
+vms-server
+*.exe
+*.test
+*.out
+
+# Go workspace files (not used by this project, but harmless to ignore
+# if your editor or another tool creates one)
+go.work
+go.work.sum
+
+# OS / editor cruft
+.DS_Store
+*.swp
