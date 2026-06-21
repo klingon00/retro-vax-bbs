@@ -1,6 +1,8 @@
-# VMS/PHONE Revival — Design Doc
+# Retro VAX-BBS — Design Doc
 
-A modern, self-hosted, retro VMS/BBS-style multi-user environment. Not a replacement for `talk`/`ytalk` — those already exist. This is a closed-world shell environment in the spirit of early-90s campus VAX/VMS, with **PHONE** (real-time multi-party chat, à la the original VMS PHONE utility) as the flagship first app, built on a modular framework that can host future apps (mail, a text game, etc.).
+A modern, self-hosted, retro VAX/VMS-style multi-user environment. Not a replacement for `talk`/`ytalk` — those already exist. This is a closed-world shell environment in the spirit of early-90s campus VAX/VMS, with **PHONE** (real-time multi-party chat, à la the original VAX/VMS PHONE utility) as the flagship first app, built on a modular framework that can host future apps (mail, a text game, etc.).
+
+> **Naming note:** this project is an independent, non-commercial hobby homage to VAX/VMS terminal culture. It is not affiliated with, endorsed by, or representing VMS Software, Inc. (VSI) or Hewlett Packard Enterprise (HPE), who develop and support the actively-maintained OpenVMS operating system today. See the README for the full disclaimer.
 
 Designed with eventual public/community release in mind (stretch goal: Unraid Community Apps), so the architecture supports multiple deployment risk postures rather than assuming one trusted environment.
 
@@ -162,7 +164,7 @@ invites (
 
 Admin-only: `APPROVE`, `REJECT`, `KICK`, `BAN`, `UNLOCK`, `INVITE CREATE`.
 
-**Nice-to-have, low effort:** VMS-style command abbreviation — typing the shortest unambiguous prefix of a command works, just like classic DCL.
+**Nice-to-have, low effort:** VAX/VMS-style command abbreviation — typing the shortest unambiguous prefix of a command works, just like classic DCL.
 
 ---
 

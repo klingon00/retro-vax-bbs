@@ -25,7 +25,7 @@ import (
 	lm "github.com/charmbracelet/wish/logging"
 	recovermw "github.com/charmbracelet/wish/recover"
 
-	"github.com/klingon00/retro-vms-bbs/internal/lobby"
+	"github.com/klingon00/retro-vax-bbs/internal/lobby"
 )
 
 const (

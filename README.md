@@ -1,12 +1,25 @@
-# Retro VMS-BBS
+# Retro VAX-BBS
 
-A modern, self-hosted, retro VMS/BBS-style multi-user shell, built on
-`wish` + `bubbletea` + `lipgloss` over SSH. "Retro" is doing real work in
-the name — this is a love letter to early-90s VAX/VMS terminal culture,
-not an attempt to reimplement OpenVMS itself. See `docs/design-doc.md`
-and `docs/open-questions.md` for the full architecture and decision
-history — keep those up to date as design decisions get made; this
-README is just the "how do I run this" doc.
+A modern, self-hosted, retro VAX/VMS-style multi-user shell, built on
+`wish` + `bubbletea` + `lipgloss` over SSH. See `docs/design-doc.md` and
+`docs/open-questions.md` for the full architecture and decision history —
+keep those up to date as design decisions get made; this README is just
+the "how do I run this" doc.
+
+## What this is (and isn't)
+
+This is a hobbyist homage to early-1980s/90s DEC VAX/VMS terminal and BBS
+culture — the command-line aesthetic, the PHONE utility, the
+campus-cluster feel. It is **not** affiliated with, endorsed by, or
+representing VMS Software, Inc. (VSI) or Hewlett Packard Enterprise
+(HPE), who develop and support the actively-maintained, commercially
+licensed OpenVMS operating system today. No code, trademarks, or
+proprietary material from OpenVMS is used here — this is an independent,
+non-commercial fan project, built from scratch in Go. The project is
+named for VAX specifically (rather than VMS/OpenVMS) because VAX
+hardware and branding have been discontinued for decades with no current
+commercial product behind them, unlike OpenVMS, which remains actively
+sold and developed.
 
 ## Status
 
@@ -50,15 +63,23 @@ old entry from your `known_hosts`.
 
 ## Module path
 
-This project's module path is `github.com/klingon00/retro-vms-bbs`. If
+This project's module path is `github.com/klingon00/retro-vax-bbs`. If
 you ever need to rename it again (new GitHub username, fork, etc.):
 
 ```bash
 go mod edit -module github.com/NEWUSER/NEWREPO
-grep -rl 'github.com/klingon00/retro-vms-bbs' --include='*.go' . \
-  | xargs sed -i 's#github.com/klingon00/retro-vms-bbs#github.com/NEWUSER/NEWREPO#g'
+grep -rl 'github.com/klingon00/retro-vax-bbs' --include='*.go' . \
+  | xargs sed -i 's#github.com/klingon00/retro-vax-bbs#github.com/NEWUSER/NEWREPO#g'
 go build ./...
 ```
+
+## License
+
+MIT — see `LICENSE`. All current dependencies (Charm's `wish` /
+`bubbletea` / `lipgloss` / `log` / `keygen`, and Go's own `golang.org/x/*`
+packages) are MIT or BSD-3-Clause; none impose any additional
+obligations. Before public release, consider adding a third-party
+notices file listing dependency licenses — good practice, not yet done.
 
 ## Project layout
 

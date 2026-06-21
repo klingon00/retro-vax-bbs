@@ -1,4 +1,4 @@
-module github.com/klingon00/retro-vms-bbs
+module github.com/klingon00/retro-vax-bbs
 
 go 1.24.0
 
