@@ -32,7 +32,7 @@ These came up but were intentionally pushed past v1 — don't reopen them withou
   - [x] SQLite schema + argon2id password hashing
   - [x] Closed-mode (admin-created) accounts + real `wish` login auth
   - [ ] Registration modes (invite-only / open-with-approval)
-  - [ ] Account lockout
+  - [x] Account lockout
   - [ ] Per-IP rate limiting
 - [ ] Dual-listener split (public / admin)
 - [ ] `WHO` / `FINGER`
@@ -104,10 +104,15 @@ Implementation decisions made along the way, worth keeping on record:
   not just message content. Fixed by always running argon2id against a
   fixed dummy hash on the not-found/inactive paths, so every rejection
   costs the same regardless of why.
-- Lockout (`failed_attempts`/`locked_until` columns already exist in the
-  schema) is explicitly NOT implemented yet — a user can retry wrong
-  passwords indefinitely right now. Deferred to the next slice on
-  purpose, same reasoning as registration modes.
+- Account lockout implemented: 5 consecutive wrong passwords sets
+  `locked_until` to now + 15 minutes in the same atomic UPDATE as the
+  counter increment. Locked accounts are rejected before argon2id even
+  runs (no wasted compute, no counter extension past threshold — extending
+  the lock on each attempt past threshold would let an attacker
+  permanently lock a real user's account). Counter resets to 0 on
+  successful login. Admin `UNLOCK` command (future) calls
+  `ClearFailedAttempts` to release early. Tested with in-memory SQLite
+  in `internal/store/store_test.go`.
 - Live end-to-end test (2026-06-21): correct password → lobby, commands
   unaffected; wrong password, nonexistent username, and right-password-
   wrong-username all rejected identically, all logged with username +
@@ -115,9 +120,8 @@ Implementation decisions made along the way, worth keeping on record:
 
 ## Next concrete step (as of 2026-06-21)
 
-Closed-mode auth (SQLite + argon2id + real login) is done and tested
-end-to-end. Next up: account lockout — `failed_attempts`/`locked_until`
-already exist in the schema, this is a contained extension of the auth
-handler just built, and it finishes the design doc's "Auth & credential
-security" section before moving on to the larger, separate surface area
-of self-service registration modes (invite-only / open-with-approval).
+Account lockout done. Remaining auth sub-items: per-IP rate limiting,
+then registration modes (invite-only / open-with-approval). Per-IP rate
+limiting is the next contained slice — it closes the "no protection
+against connection flooding" gap in the security warning before opening
+the larger surface area of self-service registration.

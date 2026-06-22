@@ -1,12 +1,11 @@
 // Command server is the Retro VAX-BBS SSH entrypoint.
 //
-// SECURITY: real password authentication is now wired in (argon2id,
-// checked against SQLite-stored accounts), but account lockout, per-IP
-// rate limiting, and the dual-listener public/admin split are NOT yet
-// implemented — those are the next milestones. It is bound to localhost
-// specifically so this is safe for local development, but DO NOT change
-// the host constant below or otherwise expose this build on a network
-// until lockout and rate limiting land.
+// SECURITY: real password authentication and account lockout are now
+// wired in, but per-IP rate limiting and the dual-listener public/admin
+// split are NOT yet implemented. It is bound to localhost specifically
+// so this is safe for local development, but DO NOT change the host
+// constant below or otherwise expose this build on a network until
+// rate limiting and the listener split land.
 package main
 
 import (
@@ -99,7 +98,7 @@ func main() {
 	done := make(chan os.Signal, 1)
 	signal.Notify(done, os.Interrupt, syscall.SIGTERM)
 
-	log.Printf("starting SSH server on %s (auth: argon2id, no lockout/rate-limiting yet — local dev only, do not expose)", s.Addr)
+	log.Printf("starting SSH server on %s (auth: argon2id + lockout, no rate-limiting yet — local dev only, do not expose)", s.Addr)
 	go func() {
 		if err := s.ListenAndServe(); err != nil && !errors.Is(err, ssh.ErrServerClosed) {
 			log.Fatalln(err)
@@ -116,13 +115,10 @@ func main() {
 }
 
 // passwordHandler returns a wish/ssh PasswordHandler closing over the
-// store. Every rejection path — user not found, account not active,
-// wrong password — returns false uniformly and is logged identically in
-// shape (so the log itself doesn't become an enumeration vector either),
-// per the design doc's auth-failure logging and no-enumeration
-// requirements. Lockout (failed_attempts/locked_until) is deliberately
-// not implemented here yet — this slice proves the auth path works; the
-// next slice adds lockout on top of it.
+// store. Every rejection path returns false and is logged with the same
+// shape. Lockout is now enforced: a locked account is rejected before
+// password verification even runs, and failed_attempts is incremented on
+// every wrong password, clearing on success.
 func passwordHandler(db *store.Store) ssh.PasswordHandler {
 	return func(ctx ssh.Context, password string) bool {
 		username := ctx.User()
@@ -130,9 +126,7 @@ func passwordHandler(db *store.Store) ssh.PasswordHandler {
 		user, err := db.GetUserByUsername(username)
 		if errors.Is(err, store.ErrNotFound) {
 			// Burn the same argon2id cost as a real wrong-password check
-			// would, against a fixed dummy hash, so this path isn't
-			// distinguishable by timing. Result is always false; only
-			// the cost matters here.
+			// so this path isn't distinguishable by timing.
 			_, _ = auth.VerifyPassword(password, dummyHash)
 			log.Printf("auth failure: unknown user %q from %s", username, ctx.RemoteAddr())
 			return false
@@ -143,18 +137,25 @@ func passwordHandler(db *store.Store) ssh.PasswordHandler {
 		}
 
 		if user.Status != "active" {
-			// Still run the verification so a pending/suspended account
-			// doesn't leak its status via timing either — same
-			// reasoning as the not-found case above.
 			_, _ = auth.VerifyPassword(password, dummyHash)
 			log.Printf("auth failure: account %q not active (status=%s) from %s", username, user.Status, ctx.RemoteAddr())
 			return false
 		}
 
+		// Check lockout before running the password — no point spending
+		// the argon2id cost if the account is already locked, and we
+		// deliberately don't increment the counter on a locked account
+		// (doing so would extend the lock window on each attempt,
+		// which could be used to permanently lock a real user's account
+		// by hammering it).
+		if user.LockedUntil.Valid && user.LockedUntil.Time.After(time.Now()) {
+			_, _ = auth.VerifyPassword(password, dummyHash)
+			log.Printf("auth failure: account %q locked until %s, from %s",
+				username, user.LockedUntil.Time.Format(time.RFC3339), ctx.RemoteAddr())
+			return false
+		}
+
 		if !user.PasswordHash.Valid {
-			// Account exists but has no password set yet (e.g. pending
-			// first-login flow, not built yet). Reject, same timing
-			// treatment.
 			_, _ = auth.VerifyPassword(password, dummyHash)
 			log.Printf("auth failure: account %q has no password set, from %s", username, ctx.RemoteAddr())
 			return false
@@ -166,10 +167,18 @@ func passwordHandler(db *store.Store) ssh.PasswordHandler {
 			return false
 		}
 		if !ok {
+			if err := db.RecordFailedAttempt(user.ID); err != nil {
+				log.Printf("auth: error recording failed attempt for %q: %v", username, err)
+			}
 			log.Printf("auth failure: wrong password for %q from %s", username, ctx.RemoteAddr())
 			return false
 		}
 
+		// Successful login — clear the failure counter so a future
+		// string of mistakes starts fresh, not compounding past ones.
+		if err := db.ClearFailedAttempts(user.ID); err != nil {
+			log.Printf("auth: error clearing failed attempts for %q: %v", username, err)
+		}
 		log.Printf("auth success: %q from %s", username, ctx.RemoteAddr())
 		return true
 	}

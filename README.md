@@ -31,7 +31,7 @@ Per the build order in `docs/open-questions.md`:
   - [x] SQLite schema + argon2id password hashing
   - [x] Closed-mode (admin-created) accounts + real `wish` login auth
   - [ ] Registration modes (invite-only / open-with-approval)
-  - [ ] Account lockout
+  - [x] Account lockout
   - [ ] Per-IP rate limiting
 - [ ] Dual-listener split (public / admin)
 - [ ] `WHO` / `FINGER` (real implementation — registry-backed)
@@ -40,14 +40,14 @@ Per the build order in `docs/open-questions.md`:
 
 ## ⚠️ Security status — read before running anywhere but your laptop
 
-**Real password authentication exists now** (argon2id, checked against
-SQLite-stored accounts), but **account lockout, per-IP rate limiting,
-and the dual-listener public/admin split are not implemented yet.** A
-user can retry a wrong password indefinitely with no lockout, and
-there's no protection against connection flooding. The server binds to
-`localhost:2222` specifically so this is safe for local development —
-**do not** change that to `0.0.0.0` or forward a port to it until
-lockout and rate limiting land.
+**Real password authentication and account lockout exist now** (argon2id,
+checked against SQLite-stored accounts; 5 failed attempts locks the
+account for 15 minutes), but **per-IP rate limiting and the dual-listener
+public/admin split are not implemented yet.** There is no protection
+against connection flooding. The server binds to `localhost:2222`
+specifically so this is safe for local development — **do not** change
+that to `0.0.0.0` or forward a port to it until rate limiting and the
+listener split land.
 
 ## Running it
 

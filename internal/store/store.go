@@ -24,11 +24,10 @@ import (
 var ErrNotFound = errors.New("not found")
 
 // User mirrors the design doc's schema sketch. Several fields
-// (SSHPubkey, PlanText, ColorOptIn, AdminVisible, FailedAttempts,
-// LockedUntil) aren't read or written by anything yet this slice — the
-// columns exist now so the schema doesn't need a migration later for
-// lockout, FINGER, or SET KEY, but the Go-level logic for them is
-// explicitly future work, not silently half-implemented.
+// (SSHPubkey, PlanText, ColorOptIn, AdminVisible) aren't read or written
+// by anything yet — the columns exist so the schema doesn't need a
+// migration later for FINGER or SET KEY. FailedAttempts and LockedUntil
+// are now fully active (see RecordFailedAttempt / ClearFailedAttempts).
 type User struct {
 	ID             int64
 	Username       string
@@ -161,6 +160,58 @@ func (s *Store) GetUserByID(id int64) (*User, error) {
 		id,
 	)
 	return scanUser(row)
+}
+
+// lockoutThreshold is the number of consecutive wrong passwords before
+// an account is locked. Matches the design doc: "per-account lockout
+// after 5 failed attempts."
+const lockoutThreshold = 5
+
+// lockoutDuration is how long an account stays locked before the timer
+// expires naturally. Admin UNLOCK clears it early regardless. 15 minutes
+// is a reasonable starting point — long enough to make brute-forcing
+// very slow (5 attempts per 15 minutes = 480 attempts/day), short enough
+// not to be punishing for a real user who simply forgot their password.
+const lockoutDuration = 15 * time.Minute
+
+// RecordFailedAttempt increments failed_attempts for the given user ID.
+// If the new count reaches lockoutThreshold, locked_until is set to
+// now + lockoutDuration in the same UPDATE, so the lock is always
+// applied atomically with the counter increment — no window where the
+// counter is at threshold but the lock hasn't been written yet.
+func (s *Store) RecordFailedAttempt(userID int64) error {
+	_, err := s.db.Exec(`
+		UPDATE users
+		SET
+			failed_attempts = failed_attempts + 1,
+			locked_until = CASE
+				WHEN failed_attempts + 1 >= ? THEN datetime('now', ?)
+				ELSE locked_until
+			END
+		WHERE id = ?`,
+		lockoutThreshold,
+		fmt.Sprintf("+%d seconds", int(lockoutDuration.Seconds())),
+		userID,
+	)
+	if err != nil {
+		return fmt.Errorf("recording failed attempt for user %d: %w", userID, err)
+	}
+	return nil
+}
+
+// ClearFailedAttempts resets failed_attempts to 0 and clears locked_until
+// for the given user ID. Called on successful login (clean counter after
+// a good password), and by the future admin UNLOCK command (early
+// release from a lockout).
+func (s *Store) ClearFailedAttempts(userID int64) error {
+	_, err := s.db.Exec(
+		`UPDATE users SET failed_attempts = 0, locked_until = NULL WHERE id = ?`,
+		userID,
+	)
+	if err != nil {
+		return fmt.Errorf("clearing failed attempts for user %d: %w", userID, err)
+	}
+	return nil
 }
 
 func scanUser(row *sql.Row) (*User, error) {
