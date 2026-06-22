@@ -28,7 +28,12 @@ These came up but were intentionally pushed past v1 — don't reopen them withou
 
 - [x] Project scaffolding
 - [x] Lobby shell / command dispatcher
-- [ ] Account & auth (registration modes, argon2id, lockout, rate limiting)
+- [ ] Account & auth
+  - [x] SQLite schema + argon2id password hashing
+  - [x] Closed-mode (admin-created) accounts + real `wish` login auth
+  - [ ] Registration modes (invite-only / open-with-approval)
+  - [ ] Account lockout
+  - [ ] Per-IP rate limiting
 - [ ] Dual-listener split (public / admin)
 - [ ] `WHO` / `FINGER`
 - [ ] PHONE app (`DIAL` / `ANSWER` / `HANGUP` / `ADD`)
@@ -87,10 +92,32 @@ Implementation decisions made along the way, worth keeping on record:
   for the auth milestone — preferred over `mattn/go-sqlite3` (MIT, but
   CGo-based) specifically because CGo would undercut the design doc's
   single-static-binary rationale for choosing Go in the first place.
+- `closed` registration mode's entire account-creation path, for now, is
+  the standalone `cmd/adduser` CLI tool — hashes the password and
+  inserts directly. Deliberately a separate binary, not a server flag,
+  since it has no business being reachable from the running server.
+- Real `wish.WithPasswordAuth` wired in, replacing the old accept-anyone
+  behavior. Caught and fixed a timing side channel while building this:
+  checking "does the user exist" before running argon2id meant a
+  nonexistent username returned near-instantly while a wrong password on
+  a real account took ~0.5s — an enumeration vector via response timing,
+  not just message content. Fixed by always running argon2id against a
+  fixed dummy hash on the not-found/inactive paths, so every rejection
+  costs the same regardless of why.
+- Lockout (`failed_attempts`/`locked_until` columns already exist in the
+  schema) is explicitly NOT implemented yet — a user can retry wrong
+  passwords indefinitely right now. Deferred to the next slice on
+  purpose, same reasoning as registration modes.
+- Live end-to-end test (2026-06-21): correct password → lobby, commands
+  unaffected; wrong password, nonexistent username, and right-password-
+  wrong-username all rejected identically, all logged with username +
+  remote address + reason.
 
-## Next concrete step (as of 2026-06-20)
+## Next concrete step (as of 2026-06-21)
 
-Scaffolding is done and tested. Next milestone per the build order is
-account & auth: SQLite schema (users/invites — see design doc), argon2id
-password hashing, registration modes (invite-only / open-with-approval /
-closed), and lockout.
+Closed-mode auth (SQLite + argon2id + real login) is done and tested
+end-to-end. Next up: account lockout — `failed_attempts`/`locked_until`
+already exist in the schema, this is a contained extension of the auth
+handler just built, and it finishes the design doc's "Auth & credential
+security" section before moving on to the larger, separate surface area
+of self-service registration modes (invite-only / open-with-approval).
