@@ -32,7 +32,7 @@ Per the build order in `docs/open-questions.md`:
   - [x] Closed-mode (admin-created) accounts + real `wish` login auth
   - [ ] Registration modes (invite-only / open-with-approval)
   - [x] Account lockout
-  - [ ] Per-IP rate limiting
+  - [x] Per-IP rate limiting
 - [ ] Dual-listener split (public / admin)
 - [ ] `WHO` / `FINGER` (real implementation — registry-backed)
 - [ ] PHONE app
@@ -40,14 +40,14 @@ Per the build order in `docs/open-questions.md`:
 
 ## ⚠️ Security status — read before running anywhere but your laptop
 
-**Real password authentication and account lockout exist now** (argon2id,
-checked against SQLite-stored accounts; 5 failed attempts locks the
-account for 15 minutes), but **per-IP rate limiting and the dual-listener
-public/admin split are not implemented yet.** There is no protection
-against connection flooding. The server binds to `localhost:2222`
-specifically so this is safe for local development — **do not** change
-that to `0.0.0.0` or forward a port to it until rate limiting and the
-listener split land.
+**Real password authentication, account lockout, and per-IP rate limiting
+exist now** (argon2id, checked against SQLite-stored accounts; 5 failed
+attempts locks the account for 15 minutes; connection rate limited to 1
+sustained/min per IP with a burst of 5), but **the dual-listener
+public/admin split is not implemented yet.** The server binds to
+`localhost:2222` specifically so this is safe for local development —
+**do not** change that to `0.0.0.0` or forward a port to it until the
+listener split lands.
 
 ## Running it
 
@@ -77,6 +77,25 @@ lives alongside it at `data/retro-vax-bbs.db`. Both are gitignored —
 don't commit either. If you delete the host key, your SSH client will
 warn about a changed host key on next connect; that's expected for a dev
 box, just remove the old entry from your `known_hosts`.
+
+## Configuration
+
+The server reads configuration from environment variables, with safe
+defaults for local development. Set these to tune behaviour for your
+deployment:
+
+| Variable | Default | Description |
+|---|---|---|
+| `SSH_HOST` | `localhost` | Bind host |
+| `SSH_PORT` | `2222` | Bind port |
+| `RATELIMIT_PER_MINUTE` | `1` | New connections per minute per IP |
+| `RATELIMIT_BURST` | `5` | Burst allowance before rate kicks in |
+| `RATELIMIT_MAX_IPS` | `1000` | Number of IPs to track simultaneously |
+
+The burst default of 5 is intentional — concurrent sessions from one
+account (e.g. PHONE in one window, mail in another) are a core feature,
+and opening a few sessions in quick succession shouldn't trigger the
+limiter for a legitimate user.
 
 ## Module path
 

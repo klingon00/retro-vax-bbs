@@ -33,7 +33,7 @@ These came up but were intentionally pushed past v1 — don't reopen them withou
   - [x] Closed-mode (admin-created) accounts + real `wish` login auth
   - [ ] Registration modes (invite-only / open-with-approval)
   - [x] Account lockout
-  - [ ] Per-IP rate limiting
+  - [x] Per-IP rate limiting
 - [ ] Dual-listener split (public / admin)
 - [ ] `WHO` / `FINGER`
 - [ ] PHONE app (`DIAL` / `ANSWER` / `HANGUP` / `ADD`)
@@ -112,16 +112,30 @@ Implementation decisions made along the way, worth keeping on record:
   permanently lock a real user's account). Counter resets to 0 on
   successful login. Admin `UNLOCK` command (future) calls
   `ClearFailedAttempts` to release early. Tested with in-memory SQLite
-  in `internal/store/store_test.go`.
-- Live end-to-end test (2026-06-21): correct password → lobby, commands
-  unaffected; wrong password, nonexistent username, and right-password-
-  wrong-username all rejected identically, all logged with username +
-  remote address + reason.
+  in `internal/store/store_test.go`. Live end-to-end test confirmed:
+  lock triggered at 5th attempt, correct password rejected during lock
+  window, access restored after 15 minutes with counter reset confirmed.
+- **OpenSSH client behavior:** default 3-attempts-per-connection means a
+  5-attempt lockout triggers across ~2 SSH invocations, not 5 separate
+  connections. Worth knowing for UX reasoning around the lockout
+  threshold — not a bug, just how SSH clients work.
+- Per-IP rate limiting implemented via `wish/ratelimiter` middleware
+  (token bucket, `golang.org/x/time/rate`, LRU-cached by IP). Defaults:
+  1 connection/min sustained, burst of 5. Burst of 5 chosen specifically
+  to accommodate concurrent sessions (PHONE in one window, mail in
+  another — a core feature per the design doc) without triggering the
+  limiter for a legitimate user opening a few sessions in quick
+  succession. All three parameters are tunable via environment variables
+  (`RATELIMIT_PER_MINUTE`, `RATELIMIT_BURST`, `RATELIMIT_MAX_IPS`) for
+  operator adjustment at deploy time, mapping cleanly onto the planned
+  Unraid Community Apps template model.
 
-## Next concrete step (as of 2026-06-21)
+## Next concrete step (as of 2026-06-22)
 
-Account lockout done. Remaining auth sub-items: per-IP rate limiting,
-then registration modes (invite-only / open-with-approval). Per-IP rate
-limiting is the next contained slice — it closes the "no protection
-against connection flooding" gap in the security warning before opening
-the larger surface area of self-service registration.
+Per-IP rate limiting done. The auth sub-checklist is now: registration
+modes (invite-only / open-with-approval) remaining. Before that, the
+dual-listener split (public port refuses admin accounts, admin-only port
+refuses non-admin accounts) is worth considering — it's the structural
+security boundary the design doc calls out as the primary admin-access
+control mechanism, and registration modes will need to know about account
+roles to work correctly anyway.
