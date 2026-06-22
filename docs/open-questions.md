@@ -23,6 +23,7 @@ These came up but were intentionally pushed past v1 — don't reopen them withou
 - External notification hooks
 - Mail and text-game apps
 - Unraid packaging
+- **MFA for admin accounts** — considered, not implemented. Out of scope for a hobby project at this scale. Structural separation (dual-listener + VPN gate) is the primary admin access control mechanism. Worst-case recovery via backups.
 
 ## Build status
 
@@ -34,7 +35,7 @@ These came up but were intentionally pushed past v1 — don't reopen them withou
   - [ ] Registration modes (invite-only / open-with-approval)
   - [x] Account lockout
   - [x] Per-IP rate limiting
-- [ ] Dual-listener split (public / admin)
+- [x] Dual-listener split (public / admin)
 - [ ] `WHO` / `FINGER`
 - [ ] PHONE app (`DIAL` / `ANSWER` / `HANGUP` / `ADD`)
 - [ ] Docker packaging
@@ -129,13 +130,23 @@ Implementation decisions made along the way, worth keeping on record:
   (`RATELIMIT_PER_MINUTE`, `RATELIMIT_BURST`, `RATELIMIT_MAX_IPS`) for
   operator adjustment at deploy time, mapping cleanly onto the planned
   Unraid Community Apps template model.
+- **Dual-listener split implemented.** Two `wish.Server` instances share
+  one host key but bind to separate ports. Public listener
+  (`SSH_HOST`/`SSH_PORT`, default `localhost:2222`) refuses admin-role
+  accounts before checking the password — right-password-wrong-listener
+  is indistinguishable from wrong-password by design. Admin listener
+  (`ADMIN_HOST`/`ADMIN_PORT`, default `localhost:2223`) refuses non-admin
+  accounts symmetrically. Each listener has its own independent rate
+  limiter. Enforcement is by network binding, not IP matching. In
+  production the operator binds `ADMIN_HOST` to a VPN interface
+  (WireGuard/Tailscale); the app has no opinion on which VPN is used.
+  `cmd/adduser` now accepts a `-role` flag (default `user`) to create
+  admin accounts. Both listeners share one SSH host key — the host key
+  identifies the server to clients, not clients to the server, so
+  sharing it between ports does not weaken the admin boundary.
 
 ## Next concrete step (as of 2026-06-22)
 
-Per-IP rate limiting done. The auth sub-checklist is now: registration
-modes (invite-only / open-with-approval) remaining. Before that, the
-dual-listener split (public port refuses admin accounts, admin-only port
-refuses non-admin accounts) is worth considering — it's the structural
-security boundary the design doc calls out as the primary admin-access
-control mechanism, and registration modes will need to know about account
-roles to work correctly anyway.
+Dual-listener split done. The build order now points at registration
+modes (invite-only / open-with-approval) as the remaining auth
+sub-checklist item before moving on to `WHO`/`FINGER`.

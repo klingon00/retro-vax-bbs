@@ -117,15 +117,13 @@ func (s *Store) migrate() error {
 	return err
 }
 
-// CreateUser inserts a new user with the given username and pre-hashed
-// password (see internal/auth.HashPassword). Used for now by the
-// standalone cmd/adduser tool to seed admin-created accounts — this is
-// the `closed` registration mode's entire account-creation path until
-// the lobby's NEW/APPROVE command flow exists.
-func (s *Store) CreateUser(username, passwordHash string) (*User, error) {
+// CreateUser inserts a new user with the given username, pre-hashed
+// password, and role ("user" or "admin"). Used by cmd/adduser to seed
+// accounts in closed registration mode.
+func (s *Store) CreateUser(username, passwordHash, role string) (*User, error) {
 	res, err := s.db.Exec(
-		`INSERT INTO users (username, password_hash, status, role) VALUES (?, ?, 'active', 'user')`,
-		username, passwordHash,
+		`INSERT INTO users (username, password_hash, status, role) VALUES (?, ?, 'active', ?)`,
+		username, passwordHash, role,
 	)
 	if err != nil {
 		return nil, fmt.Errorf("inserting user: %w", err)

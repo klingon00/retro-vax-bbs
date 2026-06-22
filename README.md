@@ -33,61 +33,72 @@ Per the build order in `docs/open-questions.md`:
   - [ ] Registration modes (invite-only / open-with-approval)
   - [x] Account lockout
   - [x] Per-IP rate limiting
-- [ ] Dual-listener split (public / admin)
+- [x] Dual-listener split (public / admin)
 - [ ] `WHO` / `FINGER` (real implementation — registry-backed)
 - [ ] PHONE app
 - [ ] Docker packaging
 
 ## ⚠️ Security status — read before running anywhere but your laptop
 
-**Real password authentication, account lockout, and per-IP rate limiting
-exist now** (argon2id, checked against SQLite-stored accounts; 5 failed
-attempts locks the account for 15 minutes; connection rate limited to 1
-sustained/min per IP with a burst of 5), but **the dual-listener
-public/admin split is not implemented yet.** The server binds to
-`localhost:2222` specifically so this is safe for local development —
-**do not** change that to `0.0.0.0` or forward a port to it until the
-listener split lands.
+**Real password authentication, account lockout, per-IP rate limiting,
+and the dual-listener public/admin split exist now** (argon2id, checked
+against SQLite-stored accounts; 5 failed attempts locks the account for
+15 minutes; connection rate limited to 1 sustained/min per IP with a
+burst of 5), but **the server still binds to localhost by default.**
+
+To expose the public port safely: set `SSH_HOST=0.0.0.0` (or a specific
+interface) and forward `SSH_PORT` to the internet. Set `ADMIN_HOST` to a
+VPN interface address (WireGuard/Tailscale) and **never** forward
+`ADMIN_PORT` to the internet — the VPN is the gate.
 
 ## Running it
 
-First, create at least one account — there's no self-service
-registration yet, so this is the only way in:
+First, create at least one account:
 
 ```bash
-go run ./cmd/adduser -username YOURNAME -password 'pick-something-decent'
+# Regular user account
+go run ./cmd/adduser -username alice -password 'pick-something-decent'
+
+# Admin account (connects via the admin listener only)
+go run ./cmd/adduser -username sysop -password 'admin-password' -role admin
 ```
 
 Then run the server:
 
 ```bash
 go run ./cmd/server
-# in another terminal:
-ssh -p 2222 YOURNAME@localhost
 ```
 
-You'll be prompted for the password you set above. Once in, try `HELP`,
-`WHO`, `LOGOUT`. Resize your terminal mid-session — Bubble Tea picks up
-`WindowSizeMsg` natively, which is the original VAX/VMS terminal-resize
-problem, solved for free by the stack.
+Two listeners start: the public one on port 2222, the admin one on 2223.
+
+```bash
+# Regular user — public listener
+ssh -p 2222 alice@localhost
+
+# Admin — admin listener only (will be rejected on port 2222)
+ssh -p 2223 sysop@localhost
+```
+
+Try `HELP`, `WHO`, `LOGOUT`. Resize your terminal mid-session — Bubble
+Tea picks up `WindowSizeMsg` natively, which is the original VAX/VMS
+terminal-resize problem, solved for free by the stack.
 
 The SSH host key is generated on first run at `data/ssh_host_ed25519`
 (0600 permissions, directory created at 0700), and the account database
 lives alongside it at `data/retro-vax-bbs.db`. Both are gitignored —
-don't commit either. If you delete the host key, your SSH client will
-warn about a changed host key on next connect; that's expected for a dev
-box, just remove the old entry from your `known_hosts`.
+don't commit either.
 
 ## Configuration
 
 The server reads configuration from environment variables, with safe
-defaults for local development. Set these to tune behaviour for your
-deployment:
+defaults for local development:
 
 | Variable | Default | Description |
 |---|---|---|
-| `SSH_HOST` | `localhost` | Bind host |
-| `SSH_PORT` | `2222` | Bind port |
+| `SSH_HOST` | `localhost` | Public listener bind host |
+| `SSH_PORT` | `2222` | Public listener bind port |
+| `ADMIN_HOST` | `localhost` | Admin listener bind host (set to VPN interface in production) |
+| `ADMIN_PORT` | `2223` | Admin listener bind port (never forward to internet) |
 | `RATELIMIT_PER_MINUTE` | `1` | New connections per minute per IP |
 | `RATELIMIT_BURST` | `5` | Burst allowance before rate kicks in |
 | `RATELIMIT_MAX_IPS` | `1000` | Number of IPs to track simultaneously |
@@ -121,7 +132,7 @@ not yet done.
 ## Project layout
 
 ```
-cmd/server/        — entrypoint: wish server setup, middleware chain, auth wiring
+cmd/server/        — entrypoint: dual SSH listeners, middleware chain, auth wiring
 cmd/adduser/        — CLI tool to seed admin-created accounts (closed registration mode)
 internal/lobby/     — the command-loop shell (Bubble Tea model + dispatch)
 internal/app/       — the modular app interface future apps (PHONE, mail) implement

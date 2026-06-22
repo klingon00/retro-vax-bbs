@@ -1,14 +1,13 @@
 // Command adduser creates a user directly in the database, with a
 // properly argon2id-hashed password. This is the entire account-creation
-// mechanism for `closed` registration mode (per the design doc: "admin
-// creates every account directly; no self-service at all") until the
-// lobby's NEW/APPROVE command flow exists. It's deliberately a separate
-// binary rather than a server flag — it touches the database directly
-// and has no business being reachable from a running server process.
+// mechanism for `closed` registration mode until the lobby's NEW/APPROVE
+// command flow exists. Deliberately a separate binary — it has no
+// business being reachable from a running server process.
 //
 // Usage:
 //
 //	go run ./cmd/adduser -username alice -password 'some-strong-password'
+//	go run ./cmd/adduser -username sysop -password 'admin-password' -role admin
 package main
 
 import (
@@ -25,10 +24,15 @@ const dbPath = "data/retro-vax-bbs.db"
 func main() {
 	username := flag.String("username", "", "username for the new account (required)")
 	password := flag.String("password", "", "password for the new account (required)")
+	role := flag.String("role", "user", "account role: user or admin")
 	flag.Parse()
 
 	if *username == "" || *password == "" {
-		fmt.Fprintln(os.Stderr, "usage: adduser -username NAME -password PASSWORD")
+		fmt.Fprintln(os.Stderr, "usage: adduser -username NAME -password PASSWORD [-role user|admin]")
+		os.Exit(1)
+	}
+	if *role != "user" && *role != "admin" {
+		fmt.Fprintf(os.Stderr, "invalid role %q: must be 'user' or 'admin'\n", *role)
 		os.Exit(1)
 	}
 
@@ -45,11 +49,12 @@ func main() {
 	}
 	defer s.Close()
 
-	user, err := s.CreateUser(*username, hash)
+	user, err := s.CreateUser(*username, hash, *role)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "creating user: %v\n", err)
 		os.Exit(1)
 	}
 
-	fmt.Printf("Created user %q (id=%d, status=%s, role=%s)\n", user.Username, user.ID, user.Status, user.Role)
+	fmt.Printf("Created user %q (id=%d, status=%s, role=%s)\n",
+		user.Username, user.ID, user.Status, user.Role)
 }

@@ -20,7 +20,7 @@ func openTestStore(t *testing.T) *Store {
 func TestCreateAndGetUser(t *testing.T) {
 	s := openTestStore(t)
 
-	u, err := s.CreateUser("testuser", "$argon2id$v=19$fake-hash-for-test")
+	u, err := s.CreateUser("testuser", "$argon2id$v=19$fake-hash-for-test", "user")
 	if err != nil {
 		t.Fatalf("CreateUser: %v", err)
 	}
@@ -57,7 +57,7 @@ func TestGetUserByUsername_NotFound(t *testing.T) {
 
 func TestRecordFailedAttempt_IncrementsCounter(t *testing.T) {
 	s := openTestStore(t)
-	u, _ := s.CreateUser("testuser", "hash")
+	u, _ := s.CreateUser("testuser", "hash", "user")
 
 	if err := s.RecordFailedAttempt(u.ID); err != nil {
 		t.Fatalf("RecordFailedAttempt: %v", err)
@@ -74,7 +74,7 @@ func TestRecordFailedAttempt_IncrementsCounter(t *testing.T) {
 
 func TestRecordFailedAttempt_LocksAtThreshold(t *testing.T) {
 	s := openTestStore(t)
-	u, _ := s.CreateUser("testuser", "hash")
+	u, _ := s.CreateUser("testuser", "hash", "user")
 
 	for i := 0; i < lockoutThreshold; i++ {
 		if err := s.RecordFailedAttempt(u.ID); err != nil {
@@ -96,7 +96,7 @@ func TestRecordFailedAttempt_LocksAtThreshold(t *testing.T) {
 
 func TestClearFailedAttempts_ResetsCounter(t *testing.T) {
 	s := openTestStore(t)
-	u, _ := s.CreateUser("testuser", "hash")
+	u, _ := s.CreateUser("testuser", "hash", "user")
 
 	// Drive it up to threshold so locked_until gets set too.
 	for i := 0; i < lockoutThreshold; i++ {
@@ -122,7 +122,7 @@ func TestClearFailedAttempts_ResetsCounter(t *testing.T) {
 
 func TestRecordFailedAttempt_DoesNotExtendLockBeyondThreshold(t *testing.T) {
 	s := openTestStore(t)
-	u, _ := s.CreateUser("testuser", "hash")
+	u, _ := s.CreateUser("testuser", "hash", "user")
 
 	// Reach threshold.
 	for i := 0; i < lockoutThreshold; i++ {
