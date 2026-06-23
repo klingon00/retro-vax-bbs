@@ -12,6 +12,7 @@ import (
 	"github.com/charmbracelet/lipgloss"
 
 	"github.com/klingon00/retro-vax-bbs/internal/registry"
+	"github.com/klingon00/retro-vax-bbs/internal/store"
 )
 
 // Model is the root Bubble Tea model for a session sitting at the lobby
@@ -23,10 +24,14 @@ import (
 // through the registry pointer, which is safe for concurrent read access
 // from multiple goroutines — each session's tea.Program runs in its own
 // goroutine, but the registry uses sync.RWMutex internally.
+//
+// The store pointer is used by commands that need to query account data
+// (FINGER). database/sql connection pools are safe for concurrent use.
 type Model struct {
 	username string
-	role     string             // "user" or "admin" — for WHO visibility
-	reg      *registry.Registry // nil until a real registry exists (safe: whoCommand checks)
+	role     string             // "user" or "admin" — for WHO/FINGER visibility
+	reg      *registry.Registry // nil-safe; whoCommand checks before use
+	db       *store.Store       // nil-safe; fingerCommand checks before use
 	input    string
 	history  []string
 	width    int
@@ -35,14 +40,15 @@ type Model struct {
 
 // New returns a fresh lobby Model for the authenticated session.
 // username and role come from the verified account record; reg is the
-// shared session registry used by WHO. Both the role and registry are
-// passed in explicitly — not read from package-level state — so the
-// lobby has no hidden dependencies and remains easy to test.
-func New(username, role string, reg *registry.Registry) Model {
+// shared session registry used by WHO; db is used by FINGER and future
+// commands that need to query account data. All are passed explicitly
+// rather than through package-level state.
+func New(username, role string, reg *registry.Registry, db *store.Store) Model {
 	return Model{
 		username: username,
 		role:     role,
 		reg:      reg,
+		db:       db,
 		history:  []string{fmt.Sprintf("Welcome, %s. Type HELP for a list of commands.", username)},
 	}
 }

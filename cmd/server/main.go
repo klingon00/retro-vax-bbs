@@ -90,6 +90,7 @@ func main() {
 	defer db.Close()
 
 	reg := registry.New()
+	globalDB = db
 	globalReg = reg // set before listeners start; read-only after that
 
 	publicLimiter := newLimiter(cfg)
@@ -225,17 +226,21 @@ func teaHandler(s ssh.Session) (tea.Model, []tea.ProgramOption) {
 	// to teaHandler without a package-level variable would require
 	// restructuring main into a struct, which is more complexity than
 	// the clarity it would bring at this scale.
-	m := lobby.New(s.User(), role, globalReg)
+	m := lobby.New(s.User(), role, globalReg, globalDB)
 	return m, []tea.ProgramOption{tea.WithAltScreen()}
 }
 
-// globalReg is set once in main before any listeners start. It is
-// read-only after that point (only the registry's own methods mutate its
-// internal state under a mutex). This is explicitly not a pattern to
-// expand — it exists only because wish.Middleware and teaHandler are
-// function values that can't easily receive additional parameters through
-// wish's API without wrapping everything in a struct.
-var globalReg *registry.Registry
+// globalDB and globalReg are set once in main before any listeners
+// start, then treated as read-only by the rest of the program. They
+// exist as package-level variables only because wish's teaHandler API
+// (func(ssh.Session) (tea.Model, []tea.ProgramOption)) cannot easily
+// receive additional parameters without wrapping everything in a struct.
+// Both database/sql and the Registry are safe for concurrent use from
+// multiple goroutines.
+var (
+	globalDB  *store.Store
+	globalReg *registry.Registry
+)
 
 func newLimiter(cfg config) rl.RateLimiter {
 	return rl.NewRateLimiter(
@@ -325,6 +330,9 @@ func completeAuth(db *store.Store, user *store.User, password, listener string, 
 	}
 	if err := db.ClearFailedAttempts(user.ID); err != nil {
 		log.Printf("%s auth: error clearing failed attempts for %q: %v", listener, username, err)
+	}
+	if err := db.UpdateLastLogin(user.ID); err != nil {
+		log.Printf("%s auth: error updating last login for %q: %v", listener, username, err)
 	}
 	log.Printf("%s auth success: %q from %s", listener, username, ctx.RemoteAddr())
 	return true

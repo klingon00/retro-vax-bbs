@@ -38,7 +38,7 @@ These came up but were intentionally pushed past v1 — don't reopen them withou
 - [x] Dual-listener split (public / admin)
 - [ ] `WHO` / `FINGER`
   - [x] `WHO` (real implementation — session registry-backed)
-  - [ ] `FINGER <user>`
+  - [x] `FINGER <user>`
 - [ ] PHONE app (`DIAL` / `ANSWER` / `HANGUP` / `ADD`)
 - [ ] Docker packaging
 
@@ -166,9 +166,25 @@ Implementation decisions made along the way, worth keeping on record:
   format: `DD-MON-YYYY HH:MM:SS` (e.g. `22-JUN-2026 15:30:24`).
   Also accessible as `SHOW TIME`.
 
+- **`last_login_at` now updated** on every successful login via
+  `store.UpdateLastLogin()`, called from `completeAuth` in `cmd/server/main.go`.
+  FINGER reads it and displays in VAX/VMS date format.
+- **FINGER <username> implemented** (also: SHOW USER <username>). Applies the
+  same visibility rules as WHO — invisible admins appear nonexistent to
+  non-admin viewers. Shows: current connection status (with app and session
+  count from the registry), last login time, and plan text (always "(no plan
+  set)" until SET PLAN is implemented). The store is now passed into
+  `lobby.New()` via `globalDB` for commands that need DB access.
+- **Argument dispatch added to dispatch().** A prefix-match table
+  (`argCommands`) is checked before the exact-match `commands` map.
+  `FINGER <username>` and `SHOW USER <username>` are the first entries.
+  Future admin commands (`APPROVE <user>`, `REJECT <user>`, etc.) will
+  use the same mechanism. The `commandHandler` signature is unchanged for
+  no-argument commands.
+
 ## Next concrete step (as of 2026-06-22)
 
-WHO done. Next: FINGER <username> — shows a user's plan text and last
+FINGER done. Next: registration modes (invite-only / open-with-approval) — the last remaining auth sub-checklist item before moving on to PHONE.
 login time. Builds on the same session registry and store infrastructure
 already in place. After FINGER, registration modes (invite-only /
 open-with-approval) complete the auth sub-checklist.

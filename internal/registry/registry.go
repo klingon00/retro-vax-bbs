@@ -119,3 +119,22 @@ func (r *Registry) List(viewerRole string) []SessionView {
 	})
 	return views
 }
+
+// Get returns the session info for a specific username, regardless of
+// visibility rules. Used by FINGER, which applies its own visibility
+// check based on the target user's role and admin_visible setting.
+// Returns (SessionView, true) if the user has active sessions,
+// (SessionView{}, false) if they are not currently connected.
+func (r *Registry) Get(username string) (SessionView, bool) {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	e, ok := r.sessions[username]
+	if !ok {
+		return SessionView{}, false
+	}
+	return SessionView{
+		Username:   username,
+		Count:      e.count,
+		CurrentApp: e.currentApp,
+	}, true
+}

@@ -227,3 +227,16 @@ func scanUser(row *sql.Row) (*User, error) {
 	}
 	return &u, nil
 }
+
+// UpdateLastLogin sets last_login_at to the current UTC time for the
+// given user ID. Called from the auth handler on every successful login.
+func (s *Store) UpdateLastLogin(userID int64) error {
+	_, err := s.db.Exec(
+		`UPDATE users SET last_login_at = datetime('now') WHERE id = ?`,
+		userID,
+	)
+	if err != nil {
+		return fmt.Errorf("updating last login for user %d: %w", userID, err)
+	}
+	return nil
+}

@@ -36,7 +36,7 @@ Per the build order in `docs/open-questions.md`:
 - [x] Dual-listener split (public / admin)
 - [ ] `WHO` / `FINGER`
   - [x] `WHO` (registry-backed, with alias `SHOW USERS`)
-  - [ ] `FINGER <user>`
+  - [x] `FINGER <user>`
 - [ ] PHONE app
 - [ ] Docker packaging
 
@@ -81,7 +81,7 @@ ssh -p 2222 alice@localhost
 ssh -p 2223 sysop@localhost
 ```
 
-Try `HELP`, `WHO`, `SHOW USERS`, `TIME`, `SHOW TIME`, `LOGOUT`. Resize
+Try `HELP`, `WHO`, `SHOW USERS`, `FINGER <username>`, `TIME`, `SHOW TIME`, `LOGOUT`. Resize
 your terminal mid-session — Bubble Tea picks up `WindowSizeMsg` natively,
 which is the original VAX/VMS terminal-resize problem, solved for free
 by the stack.
