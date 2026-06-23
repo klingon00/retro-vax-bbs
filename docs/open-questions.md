@@ -10,7 +10,7 @@ Companion to the main design doc. This is the "still soft" stuff — things ackn
 - **External notifications** — hook point reserved in the login/presence path, but the actual mechanism (webhook vs. ntfy-style push vs. something else), subscription command syntax, and notification rate-limiting are all undesigned.
 - **Unraid Community Apps template** — not started. XML template, icon, port-mapping documentation, README for the listing: all pending.
 - **CIDR-based admin allowlist** — documented as an alternative/complement to the dual-listener split, not implemented, not required (the listener split is the primary mechanism).
-- **Multi-session `WHO` display** — agreed that concurrent sessions from one account are allowed (true to the original VAX/VMS-cluster PHONE experience) and should show as a count, e.g. `alice (2 sessions)`. Exact display format not finalized.
+- **Multi-session `WHO` display** — implemented: concurrent sessions show as "alice  (2 sessions)". Display format confirmed working.
 - **VAX/VMS-style command abbreviation** — agreed as a nice-to-have (shortest unambiguous prefix), not yet scoped into v1 build order.
 - **Argon2id tuning** — rough starting params given (~64MB memory, 3 iterations) but not benchmarked against actual deployment hardware.
 - **Third-party notices file** — license is MIT (see below), all current and planned dependencies are MIT/BSD-3-Clause, but a proper notices file listing each dependency's license hasn't been created yet. Good practice before public/Unraid release.
@@ -37,6 +37,8 @@ These came up but were intentionally pushed past v1 — don't reopen them withou
   - [x] Per-IP rate limiting
 - [x] Dual-listener split (public / admin)
 - [ ] `WHO` / `FINGER`
+  - [x] `WHO` (real implementation — session registry-backed)
+  - [ ] `FINGER <user>`
 - [ ] PHONE app (`DIAL` / `ANSWER` / `HANGUP` / `ADD`)
 - [ ] Docker packaging
 
@@ -55,12 +57,6 @@ Implementation decisions made along the way, worth keeping on record:
   — closest to real DCL behavior), wish's session-level `recover`
   middleware as a backstop, and Bubble Tea's own internal panic recovery
   as a third layer.
-- `WHO` is a stub — real behavior (browsable list, admin invisibility,
-  multi-session counts) is blocked on the account/session registry that
-  comes with the auth milestone, not yet designed in code.
-- No authentication exists yet. Current build binds to `localhost` only
-  and accepts any username — explicitly not safe to expose, by design,
-  until the auth milestone lands.
 - Bubble Tea `View()` functions use `\n` between lines, never `\r\n` — the
   renderer adds its own `\r` before each line during raw-terminal output,
   plus an erase-to-end-of-line cleanup after each line. A manual `\r\n`
@@ -144,9 +140,35 @@ Implementation decisions made along the way, worth keeping on record:
   admin accounts. Both listeners share one SSH host key — the host key
   identifies the server to clients, not clients to the server, so
   sharing it between ports does not weaken the admin boundary.
+- **Command handler signature changed** from `func() (string, tea.Cmd)`
+  to `func(m Model) (string, tea.Cmd)`. Handlers receive the current
+  Model so they can access session context (role, registry) without
+  package-level variables or closures. The closed-command-grammar
+  guarantee is preserved — the `commands` map is still the only path
+  from raw user input to executing code.
+- **Command aliases and SHOW subcommands added.** `WHO` and `SHOW USERS`
+  both dispatch to the same handler; `TIME` and `SHOW TIME` similarly.
+  `SHOW` alone returns a helpful error listing valid keywords. HELP
+  displays grouped alias pairs rather than flat command names. This
+  captures VAX/VMS muscle memory without implementing a full DCL
+  verb-noun parser — `SHOW USERS` is just a longer map key, not a
+  grammar production.
+- **WHO implemented** via `internal/registry` — a `sync.RWMutex`-
+  protected map tracking active sessions keyed by username, with role
+  and `admin_visible` stored at connect time. Regular users see
+  non-admin accounts plus opted-in admins; admins see everyone.
+  Concurrent sessions from one account show as "(N sessions)". The
+  registry is created once in `main()`, stored in `globalReg`, and
+  passed into `lobby.New()` via `teaHandler`. Session middleware
+  (wrapping `bm.Middleware`) registers on connect and defers
+  unregistration on disconnect.
+- **TIME command added** — displays current server time in VAX/VMS
+  format: `DD-MON-YYYY HH:MM:SS` (e.g. `22-JUN-2026 15:30:24`).
+  Also accessible as `SHOW TIME`.
 
 ## Next concrete step (as of 2026-06-22)
 
-Dual-listener split done. The build order now points at registration
-modes (invite-only / open-with-approval) as the remaining auth
-sub-checklist item before moving on to `WHO`/`FINGER`.
+WHO done. Next: FINGER <username> — shows a user's plan text and last
+login time. Builds on the same session registry and store infrastructure
+already in place. After FINGER, registration modes (invite-only /
+open-with-approval) complete the auth sub-checklist.

@@ -6,22 +6,10 @@
 //     the password. Intended for eventual internet exposure once an
 //     operator has set up appropriate network controls.
 //   - Admin listener   — refuses non-admin accounts. Never published;
-//     reachable only via the operator's VPN tunnel (WireGuard,
-//     Tailscale, etc. — entirely the operator's setup).
+//     reachable only via the operator's VPN tunnel.
 //
-// Enforcement is by network binding, not IP matching: the listeners bind
-// to different addresses, so the separation cannot be fooled by spoofed
-// source IPs or proxy headers.
-//
-// Both listeners share one SSH host key (identifies the server to
-// clients, not clients to the server — sharing it between ports does
-// not weaken the admin boundary).
-//
-// SECURITY: the dual-listener split is now implemented. Per the design
-// doc, the remaining gate before safe internet exposure is operator
-// network setup (don't forward the public port until you're ready, and
-// never forward the admin port). Both listeners still default to
-// localhost for local development.
+// Both listeners share one SSH host key and one session registry.
+// The registry tracks active sessions for WHO and future PHONE routing.
 package main
 
 import (
@@ -46,55 +34,35 @@ import (
 
 	"github.com/klingon00/retro-vax-bbs/internal/auth"
 	"github.com/klingon00/retro-vax-bbs/internal/lobby"
+	"github.com/klingon00/retro-vax-bbs/internal/registry"
 	"github.com/klingon00/retro-vax-bbs/internal/store"
 )
 
 const (
-	// One host key shared by both listeners — identifies the server to
-	// clients (MITM prevention), not clients to the server.
 	hostKeyPath = "data/ssh_host_ed25519"
 	dbPath      = "data/retro-vax-bbs.db"
 
-	// dummyHash is verified against on fast-exit paths (user not found,
-	// wrong-listener role check, inactive account) so every rejection
-	// costs the same argon2id computation regardless of why. Prevents
-	// username/role enumeration via response-time differences.
 	dummyHash = "$argon2id$v=19$m=65536,t=3,p=4$PBeQih8r5fJuNB0J6vk/XA$VT14oAs2u5DJILc+W5E+VwUpB17pcNC33Em2HeHt054"
 )
 
-// config holds all server settings resolved from environment variables.
+// contextKey is an unexported type for ssh.Context keys set by this
+// package. Using a named type (rather than a plain string) prevents
+// accidental collision with keys set by wish or other middleware.
+type contextKey string
+
+const roleKey contextKey = "role"
+
 type config struct {
-	// Public listener — the port users connect to.
 	publicHost string
 	publicPort string
+	adminHost  string
+	adminPort  string
 
-	// Admin listener — never published; operator routes to it via VPN.
-	adminHost string
-	adminPort string
-
-	// Rate limiting applies independently to each listener.
 	rateLimitPerMinute float64
 	rateLimitBurst     int
 	rateLimitMaxIPs    int
 }
 
-// loadConfig reads configuration from environment variables with safe
-// defaults. Logs the effective config at startup.
-//
-// Environment variables:
-//
-//	SSH_HOST              — public listener bind host   (default: localhost)
-//	SSH_PORT              — public listener bind port   (default: 2222)
-//	ADMIN_HOST            — admin listener bind host    (default: localhost)
-//	ADMIN_PORT            — admin listener bind port    (default: 2223)
-//	RATELIMIT_PER_MINUTE  — connections/min per IP      (default: 1)
-//	RATELIMIT_BURST       — burst allowance             (default: 5)
-//	RATELIMIT_MAX_IPS     — IPs tracked in LRU cache    (default: 1000)
-//
-// In production the operator sets ADMIN_HOST to a VPN interface address
-// (e.g. a WireGuard or Tailscale IP) so the admin port is reachable
-// only from the tunnel. SSH_HOST can be set to 0.0.0.0 once the
-// operator is ready to expose the public port.
 func loadConfig() config {
 	c := config{
 		publicHost:         envOr("SSH_HOST", "localhost"),
@@ -121,18 +89,30 @@ func main() {
 	}
 	defer db.Close()
 
-	// Each listener gets its own rate limiter — independent token
-	// buckets, independent LRU caches. An attacker hammering the public
-	// port doesn't consume the admin port's burst budget, and vice versa.
+	reg := registry.New()
+	globalReg = reg // set before listeners start; read-only after that
+
 	publicLimiter := newLimiter(cfg)
 	adminLimiter := newLimiter(cfg)
+
+	sessionMW := sessionMiddleware(db, reg)
 
 	publicSrv, err := wish.NewServer(
 		wish.WithAddress(net.JoinHostPort(cfg.publicHost, cfg.publicPort)),
 		wish.WithHostKeyPath(hostKeyPath),
 		wish.WithPasswordAuth(publicPasswordHandler(db)),
 		wish.WithMiddleware(
-			recovermw.Middleware(bm.Middleware(teaHandler)),
+			// wish.WithMiddleware composes innermost-to-outermost (last
+			// entry runs first). Order:
+			//   1. lm.StructuredMiddleware() — logs connect/disconnect
+			//   2. rl.Middleware(limiter)    — per-IP rate limiting
+			//   3. recovermw.Middleware()    — session-level panic recovery
+			//   4. sessionMW                — register in WHO registry +
+			//                                 store role in ssh.Context
+			//   5. bm.Middleware(teaHandler) — runs the lobby tea.Program
+			bm.Middleware(teaHandler),
+			sessionMW,
+			recovermw.Middleware(),
 			rl.Middleware(publicLimiter),
 			lm.StructuredMiddleware(),
 		),
@@ -146,7 +126,9 @@ func main() {
 		wish.WithHostKeyPath(hostKeyPath),
 		wish.WithPasswordAuth(adminPasswordHandler(db)),
 		wish.WithMiddleware(
-			recovermw.Middleware(bm.Middleware(teaHandler)),
+			bm.Middleware(teaHandler),
+			sessionMW,
+			recovermw.Middleware(),
 			rl.Middleware(adminLimiter),
 			lm.StructuredMiddleware(),
 		),
@@ -176,16 +158,12 @@ func main() {
 	<-done
 	log.Println("stopping servers")
 
-	// Shut both down concurrently — no reason to serialize, and we want
-	// the 10-second grace period to apply to both together, not each in
-	// sequence.
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
 
 	shutdownErrs := make(chan error, 2)
 	go func() { shutdownErrs <- publicSrv.Shutdown(ctx) }()
 	go func() { shutdownErrs <- adminSrv.Shutdown(ctx) }()
-
 	for i := 0; i < 2; i++ {
 		if err := <-shutdownErrs; err != nil {
 			log.Printf("shutdown error: %v", err)
@@ -193,8 +171,72 @@ func main() {
 	}
 }
 
-// newLimiter constructs a rate limiter from config. Called once per
-// listener so each has an independent token bucket.
+// sessionMiddleware returns a wish.Middleware that registers the
+// authenticated session in the WHO registry and stores the user's role
+// in the ssh.Context for teaHandler to read. The registration is
+// deferred-unregistered so it is always cleaned up when the session ends,
+// regardless of how it exits.
+func sessionMiddleware(db *store.Store, reg *registry.Registry) wish.Middleware {
+	return func(next ssh.Handler) ssh.Handler {
+		return func(s ssh.Session) {
+			user, err := db.GetUserByUsername(s.User())
+			if err != nil {
+				// Shouldn't happen — auth already verified this user —
+				// but degrade gracefully rather than refusing the session.
+				log.Printf("session middleware: could not look up %q: %v", s.User(), err)
+				next(s)
+				return
+			}
+			// Store role in ssh.Context so teaHandler can build the
+			// lobby model without a second DB lookup.
+			s.Context().SetValue(roleKey, user.Role)
+
+			reg.Register(s.User(), user.Role, user.AdminVisible, "LOBBY")
+			defer reg.Unregister(s.User())
+			next(s)
+		}
+	}
+}
+
+// teaHandler builds the per-session lobby Model, reading the user's role
+// from the ssh.Context set by sessionMiddleware. The registry pointer is
+// captured from the outer scope via the closure — same instance shared by
+// all sessions on both listeners.
+func teaHandler(s ssh.Session) (tea.Model, []tea.ProgramOption) {
+	_, _, active := s.Pty()
+	if !active {
+		return nil, nil
+	}
+
+	role, _ := s.Context().Value(roleKey).(string)
+	if role == "" {
+		role = "user" // safe default; sessionMiddleware should always set this
+	}
+
+	// reg is captured from main's scope via the closure over sessionMW.
+	// This works because teaHandler is defined inside the outer scope
+	// that has access to reg... except Go closures capture variables, not
+	// values. Since teaHandler is a package-level function here, we need
+	// a different approach.
+	//
+	// The registry is passed via a package-level variable set in main.
+	// This is the one deliberate exception to the "no package-level state"
+	// rule — the registry IS the shared state, and making it available
+	// to teaHandler without a package-level variable would require
+	// restructuring main into a struct, which is more complexity than
+	// the clarity it would bring at this scale.
+	m := lobby.New(s.User(), role, globalReg)
+	return m, []tea.ProgramOption{tea.WithAltScreen()}
+}
+
+// globalReg is set once in main before any listeners start. It is
+// read-only after that point (only the registry's own methods mutate its
+// internal state under a mutex). This is explicitly not a pattern to
+// expand — it exists only because wish.Middleware and teaHandler are
+// function values that can't easily receive additional parameters through
+// wish's API without wrapping everything in a struct.
+var globalReg *registry.Registry
+
 func newLimiter(cfg config) rl.RateLimiter {
 	return rl.NewRateLimiter(
 		rate.Every(time.Duration(float64(time.Minute)/cfg.rateLimitPerMinute)),
@@ -203,15 +245,9 @@ func newLimiter(cfg config) rl.RateLimiter {
 	)
 }
 
-// publicPasswordHandler authenticates users on the public listener.
-// Rejects admin-role accounts before checking the password — an attacker
-// who correctly guesses an admin password gets the same rejection as
-// someone with a wrong password, so the public listener leaks nothing
-// about whether a guessed admin password was correct.
 func publicPasswordHandler(db *store.Store) ssh.PasswordHandler {
 	return func(ctx ssh.Context, password string) bool {
 		username := ctx.User()
-
 		user, err := db.GetUserByUsername(username)
 		if errors.Is(err, store.ErrNotFound) {
 			_, _ = auth.VerifyPassword(password, dummyHash)
@@ -222,27 +258,19 @@ func publicPasswordHandler(db *store.Store) ssh.PasswordHandler {
 			log.Printf("public auth error looking up %q from %s: %v", username, ctx.RemoteAddr(), err)
 			return false
 		}
-
-		// Role check before password — admin accounts are not permitted
-		// on the public listener regardless of password correctness.
 		if user.Role == "admin" {
 			_, _ = auth.VerifyPassword(password, dummyHash)
 			log.Printf("public auth failure: admin account %q rejected on public listener from %s",
 				username, ctx.RemoteAddr())
 			return false
 		}
-
 		return completeAuth(db, user, password, "public", ctx)
 	}
 }
 
-// adminPasswordHandler authenticates users on the admin listener.
-// Rejects non-admin accounts — mirrors the public listener's logic,
-// symmetric partition by role.
 func adminPasswordHandler(db *store.Store) ssh.PasswordHandler {
 	return func(ctx ssh.Context, password string) bool {
 		username := ctx.User()
-
 		user, err := db.GetUserByUsername(username)
 		if errors.Is(err, store.ErrNotFound) {
 			_, _ = auth.VerifyPassword(password, dummyHash)
@@ -253,47 +281,36 @@ func adminPasswordHandler(db *store.Store) ssh.PasswordHandler {
 			log.Printf("admin auth error looking up %q from %s: %v", username, ctx.RemoteAddr(), err)
 			return false
 		}
-
-		// Non-admin accounts are not permitted on the admin listener.
 		if user.Role != "admin" {
 			_, _ = auth.VerifyPassword(password, dummyHash)
 			log.Printf("admin auth failure: non-admin account %q rejected on admin listener from %s",
 				username, ctx.RemoteAddr())
 			return false
 		}
-
 		return completeAuth(db, user, password, "admin", ctx)
 	}
 }
 
-// completeAuth runs the shared checks (status, lockout, password
-// verification, counter management) that apply identically on both
-// listeners once the role gate has passed. The listener label is used
-// only for log messages.
 func completeAuth(db *store.Store, user *store.User, password, listener string, ctx ssh.Context) bool {
 	username := ctx.User()
-
 	if user.Status != "active" {
 		_, _ = auth.VerifyPassword(password, dummyHash)
 		log.Printf("%s auth failure: account %q not active (status=%s) from %s",
 			listener, username, user.Status, ctx.RemoteAddr())
 		return false
 	}
-
 	if user.LockedUntil.Valid && user.LockedUntil.Time.After(time.Now()) {
 		_, _ = auth.VerifyPassword(password, dummyHash)
 		log.Printf("%s auth failure: account %q locked until %s, from %s",
 			listener, username, user.LockedUntil.Time.Format(time.RFC3339), ctx.RemoteAddr())
 		return false
 	}
-
 	if !user.PasswordHash.Valid {
 		_, _ = auth.VerifyPassword(password, dummyHash)
 		log.Printf("%s auth failure: account %q has no password set, from %s",
 			listener, username, ctx.RemoteAddr())
 		return false
 	}
-
 	ok, err := auth.VerifyPassword(password, user.PasswordHash.String)
 	if err != nil {
 		log.Printf("%s auth error verifying %q from %s: %v", listener, username, ctx.RemoteAddr(), err)
@@ -306,24 +323,11 @@ func completeAuth(db *store.Store, user *store.User, password, listener string, 
 		log.Printf("%s auth failure: wrong password for %q from %s", listener, username, ctx.RemoteAddr())
 		return false
 	}
-
 	if err := db.ClearFailedAttempts(user.ID); err != nil {
 		log.Printf("%s auth: error clearing failed attempts for %q: %v", listener, username, err)
 	}
 	log.Printf("%s auth success: %q from %s", listener, username, ctx.RemoteAddr())
 	return true
-}
-
-// teaHandler builds the per-session lobby Model. Shared by both
-// listeners — the lobby itself has no concept of which port the session
-// arrived on, and doesn't need to.
-func teaHandler(s ssh.Session) (tea.Model, []tea.ProgramOption) {
-	_, _, active := s.Pty()
-	if !active {
-		return nil, nil
-	}
-	m := lobby.New(s.User())
-	return m, []tea.ProgramOption{tea.WithAltScreen()}
 }
 
 func envOr(key, fallback string) string {

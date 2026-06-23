@@ -34,7 +34,9 @@ Per the build order in `docs/open-questions.md`:
   - [x] Account lockout
   - [x] Per-IP rate limiting
 - [x] Dual-listener split (public / admin)
-- [ ] `WHO` / `FINGER` (real implementation — registry-backed)
+- [ ] `WHO` / `FINGER`
+  - [x] `WHO` (registry-backed, with alias `SHOW USERS`)
+  - [ ] `FINGER <user>`
 - [ ] PHONE app
 - [ ] Docker packaging
 
@@ -79,9 +81,10 @@ ssh -p 2222 alice@localhost
 ssh -p 2223 sysop@localhost
 ```
 
-Try `HELP`, `WHO`, `LOGOUT`. Resize your terminal mid-session — Bubble
-Tea picks up `WindowSizeMsg` natively, which is the original VAX/VMS
-terminal-resize problem, solved for free by the stack.
+Try `HELP`, `WHO`, `SHOW USERS`, `TIME`, `SHOW TIME`, `LOGOUT`. Resize
+your terminal mid-session — Bubble Tea picks up `WindowSizeMsg` natively,
+which is the original VAX/VMS terminal-resize problem, solved for free
+by the stack.
 
 The SSH host key is generated on first run at `data/ssh_host_ed25519`
 (0600 permissions, directory created at 0700), and the account database
@@ -137,6 +140,7 @@ cmd/adduser/        — CLI tool to seed admin-created accounts (closed registra
 internal/lobby/     — the command-loop shell (Bubble Tea model + dispatch)
 internal/app/       — the modular app interface future apps (PHONE, mail) implement
 internal/auth/       — argon2id password hashing
+internal/registry/  — session registry for WHO (and future PHONE routing)
 internal/store/     — SQLite-backed account persistence
 docs/                — design doc + open questions, copied in for git history
 ```
