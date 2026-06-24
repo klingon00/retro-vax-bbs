@@ -50,7 +50,10 @@ const (
 // accidental collision with keys set by wish or other middleware.
 type contextKey string
 
-const roleKey contextKey = "role"
+const (
+	roleKey     contextKey = "role"
+	authDoneKey contextKey = "authDone"
+)
 
 type config struct {
 	publicHost string
@@ -61,6 +64,13 @@ type config struct {
 	rateLimitPerMinute float64
 	rateLimitBurst     int
 	rateLimitMaxIPs    int
+
+	// authTimeoutSecs is how long a connection has to complete
+	// authentication before being closed. 0 disables the timeout.
+	// Applies only during the pre-auth phase — once a session is
+	// authenticated there is no idle timeout, so users can remain
+	// connected waiting for friends indefinitely.
+	authTimeoutSecs int
 }
 
 func loadConfig() config {
@@ -72,11 +82,13 @@ func loadConfig() config {
 		rateLimitPerMinute: envFloat("RATELIMIT_PER_MINUTE", 1.0),
 		rateLimitBurst:     envInt("RATELIMIT_BURST", 5),
 		rateLimitMaxIPs:    envInt("RATELIMIT_MAX_IPS", 1000),
+		authTimeoutSecs:    envInt("AUTH_TIMEOUT_SECONDS", 120),
 	}
-	log.Printf("config: public=%s admin=%s ratelimit=%.1f/min burst=%d maxIPs=%d",
+	log.Printf("config: public=%s admin=%s ratelimit=%.1f/min burst=%d maxIPs=%d authTimeout=%ds",
 		net.JoinHostPort(c.publicHost, c.publicPort),
 		net.JoinHostPort(c.adminHost, c.adminPort),
-		c.rateLimitPerMinute, c.rateLimitBurst, c.rateLimitMaxIPs)
+		c.rateLimitPerMinute, c.rateLimitBurst, c.rateLimitMaxIPs,
+		c.authTimeoutSecs)
 	return c
 }
 
@@ -98,31 +110,36 @@ func main() {
 
 	sessionMW := sessionMiddleware(db, reg)
 
-	publicSrv, err := wish.NewServer(
+	// Build the pre-auth timeout option once; used by both listeners.
+	// If authTimeoutSecs is 0, no timeout is applied (wish.NewServer
+	// accepts a nil option gracefully... actually we just skip it).
+	var authTimeoutOpt ssh.Option
+	if cfg.authTimeoutSecs > 0 {
+		authTimeoutOpt = preAuthTimeout(time.Duration(cfg.authTimeoutSecs) * time.Second)
+	}
+
+	publicOpts := []ssh.Option{
 		wish.WithAddress(net.JoinHostPort(cfg.publicHost, cfg.publicPort)),
 		wish.WithHostKeyPath(hostKeyPath),
 		wish.WithPasswordAuth(publicPasswordHandler(db)),
 		wish.WithMiddleware(
-			// wish.WithMiddleware composes innermost-to-outermost (last
-			// entry runs first). Order:
-			//   1. lm.StructuredMiddleware() — logs connect/disconnect
-			//   2. rl.Middleware(limiter)    — per-IP rate limiting
-			//   3. recovermw.Middleware()    — session-level panic recovery
-			//   4. sessionMW                — register in WHO registry +
-			//                                 store role in ssh.Context
-			//   5. bm.Middleware(teaHandler) — runs the lobby tea.Program
 			bm.Middleware(teaHandler),
 			sessionMW,
 			recovermw.Middleware(),
 			rl.Middleware(publicLimiter),
 			lm.StructuredMiddleware(),
 		),
-	)
+	}
+	if authTimeoutOpt != nil {
+		publicOpts = append(publicOpts, authTimeoutOpt)
+	}
+
+	publicSrv, err := wish.NewServer(publicOpts...)
 	if err != nil {
 		log.Fatalln("creating public server:", err)
 	}
 
-	adminSrv, err := wish.NewServer(
+	adminOpts := []ssh.Option{
 		wish.WithAddress(net.JoinHostPort(cfg.adminHost, cfg.adminPort)),
 		wish.WithHostKeyPath(hostKeyPath),
 		wish.WithPasswordAuth(adminPasswordHandler(db)),
@@ -133,7 +150,12 @@ func main() {
 			rl.Middleware(adminLimiter),
 			lm.StructuredMiddleware(),
 		),
-	)
+	}
+	if authTimeoutOpt != nil {
+		adminOpts = append(adminOpts, authTimeoutOpt)
+	}
+
+	adminSrv, err := wish.NewServer(adminOpts...)
 	if err != nil {
 		log.Fatalln("creating admin server:", err)
 	}
@@ -250,6 +272,56 @@ func newLimiter(cfg config) rl.RateLimiter {
 	)
 }
 
+// preAuthTimeout returns a wish.Option that closes connections that do
+// not complete authentication within d. It works by setting ConnCallback
+// — which fires before the SSH handshake — to start a goroutine that
+// races a timer against an "auth done" signal.
+//
+// On successful authentication, completeAuth signals the done channel,
+// and the goroutine exits without closing the connection. After that
+// point, there is no idle timeout: authenticated users can remain
+// connected indefinitely, which is correct for a multi-user system where
+// people stay logged in waiting for others.
+//
+// On failed or abandoned auth (wrong password, client just holds the
+// TCP connection open), the timer fires and closes the connection
+// silently. There is nothing useful to log — we don't know the username
+// for a connection that never sent a password, and a connection that
+// failed auth 3 times already has log entries from the passwordHandler.
+//
+// The ctx.Done() case exits the goroutine cleanly if the connection is
+// closed for any other reason before the timer fires (e.g. client
+// disconnected normally after a failed attempt).
+func preAuthTimeout(d time.Duration) ssh.Option {
+	return func(s *ssh.Server) error {
+		s.ConnCallback = func(ctx ssh.Context, conn net.Conn) net.Conn {
+			authDone := make(chan struct{})
+			ctx.SetValue(authDoneKey, authDone)
+			go func() {
+				select {
+				case <-time.After(d):
+					// Server-side resources (goroutine, file descriptor) are
+					// freed immediately when conn.Close() is called here. The
+					// client's terminal may still show the password prompt until
+					// the user types something — this is a known limitation of
+					// how OpenSSH blocks on /dev/tty for password input rather
+					// than polling the socket, so it doesn't notice the server
+					// FIN until it next tries to write. From the server's
+					// perspective the connection is cleaned up.
+					conn.Close()
+				case <-authDone:
+					// auth completed; no timeout from here — authenticated
+					// sessions may remain connected indefinitely
+				case <-ctx.Done():
+					// connection already gone; nothing to do
+				}
+			}()
+			return conn
+		}
+		return nil
+	}
+}
+
 func publicPasswordHandler(db *store.Store) ssh.PasswordHandler {
 	return func(ctx ssh.Context, password string) bool {
 		username := ctx.User()
@@ -334,6 +406,18 @@ func completeAuth(db *store.Store, user *store.User, password, listener string, 
 	if err := db.UpdateLastLogin(user.ID); err != nil {
 		log.Printf("%s auth: error updating last login for %q: %v", listener, username, err)
 	}
+
+	// Signal the pre-auth timeout goroutine that authentication is done.
+	// From this point, there is no idle timeout — the session can remain
+	// open indefinitely.
+	if ch, ok := ctx.Value(authDoneKey).(chan struct{}); ok {
+		select {
+		case <-ch: // already closed (shouldn't happen)
+		default:
+			close(ch)
+		}
+	}
+
 	log.Printf("%s auth success: %q from %s", listener, username, ctx.RemoteAddr())
 	return true
 }
