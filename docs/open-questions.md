@@ -14,6 +14,7 @@ Companion to the main design doc. This is the "still soft" stuff — things ackn
 - **VAX/VMS-style command abbreviation** — agreed as a nice-to-have (shortest unambiguous prefix), not yet scoped into v1 build order.
 - **Argon2id tuning** — rough starting params given (~64MB memory, 3 iterations) but not benchmarked against actual deployment hardware.
 - **Third-party notices file** — license is MIT (see below), all current and planned dependencies are MIT/BSD-3-Clause, but a proper notices file listing each dependency's license hasn't been created yet. Good practice before public/Unraid release.
+- **HELP expansion** — the lobby HELP command lists commands but gives no usage details. Agreed that PHONE's switch-hook behavior and other non-obvious features warrant inline help text eventually. Not yet designed.
 
 ## Decisions explicitly deferred on purpose
 
@@ -24,6 +25,9 @@ These came up but were intentionally pushed past v1 — don't reopen them withou
 - Mail and text-game apps
 - Unraid packaging
 - **MFA for admin accounts** — considered, not implemented. Out of scope for a hobby project at this scale. Structural separation (dual-listener + VPN gate) is the primary admin access control mechanism. Worst-case recovery via backups.
+- **PHONE: HOLD/UNHOLD** — useful but not essential for v1. Can be added later without touching the core call architecture.
+- **PHONE: FACSIMILE** — file-sending during a call. Out of scope entirely for now.
+- **PHONE: MAIL (in-call quick message)** — the PHONE-internal MAIL command for leaving a message when a callee isn't available. Deferred; the lobby already has a path to a future mail app.
 
 ## Build status
 
@@ -165,7 +169,6 @@ Implementation decisions made along the way, worth keeping on record:
 - **TIME command added** — displays current server time in VAX/VMS
   format: `DD-MON-YYYY HH:MM:SS` (e.g. `22-JUN-2026 15:30:24`).
   Also accessible as `SHOW TIME`.
-
 - **`last_login_at` now updated** on every successful login via
   `store.UpdateLastLogin()`, called from `completeAuth` in `cmd/server/main.go`.
   FINGER reads it and displays in VAX/VMS date format.
@@ -181,10 +184,59 @@ Implementation decisions made along the way, worth keeping on record:
   Future admin commands (`APPROVE <user>`, `REJECT <user>`, etc.) will
   use the same mechanism. The `commandHandler` signature is unchanged for
   no-argument commands.
+- **Pre-auth connection timeout implemented** via `ConnCallback` — a
+  goroutine races a timer against an "auth done" signal per connection.
+  If authentication completes, the signal fires and the goroutine exits
+  with no further effect; authenticated sessions have no idle timeout
+  and can remain open indefinitely. If the timer fires first (connection
+  held open without authenticating), it closes the connection silently
+  — no log entry, since there is nothing useful to attribute. Controlled
+  via `AUTH_TIMEOUT_SECONDS` env var (default: 120). Implemented without
+  `wish.WithIdleTimeout`, which resets on every Read and would disconnect
+  idle but authenticated Bubble Tea sessions. Note: the server-side
+  connection is cleaned up on timeout, but the OpenSSH client may
+  continue to show the password prompt until the user types (it blocks
+  on /dev/tty, not the socket, while waiting for password input).
 
-## Next concrete step (as of 2026-06-22)
+## PHONE app design (locked in, not yet built)
 
-FINGER done. Next: registration modes (invite-only / open-with-approval) — the last remaining auth sub-checklist item before moving on to PHONE.
-login time. Builds on the same session registry and store infrastructure
-already in place. After FINGER, registration modes (invite-only /
-open-with-approval) complete the auth sub-checklist.
+Architecture decisions made before implementation:
+
+- **Character-by-character, not line-by-line.** Every keypress routes
+  immediately to all participants' viewports. This is the defining
+  characteristic of the original — you see typos, backspaces, and
+  corrections in real time. Resource cost is trivial (Go channel
+  operations at typing speed are negligible).
+- **Multi-party from the start.** Conference calls via `ADD <username>`
+  are architecturally natural — fanout to a slice of channels instead
+  of one. Viewport layout math divides screen height among N participants.
+  No reason to artificially limit to two-party.
+- **Switch-hook character: `%` (percent, original default).** When inside
+  PHONE, all keypresses go to the conversation EXCEPT those prefixed
+  with `%`, which enter command mode. A status line tip
+  ("type freely to chat, %HANGUP to leave") is displayed when idle in a
+  call to help new users, disappearing when command mode is entered.
+- **Ring behavior matches originals:** rings every 10 seconds, shown as
+  "Ringing <user>...  (Press any key to cancel call and continue.)" for
+  the caller. At the callee's lobby, broadcasts "<caller> is phoning you
+  (HH:MM:SS)" once per 10 seconds.
+- **New packages:** `internal/phone/` (app.go, call.go, layout.go).
+  Registry gains `CallNotify chan PhoneEvent` per session. The lobby
+  Model gains `activeApp app.App` and delegates all input/view to it
+  when non-nil, restoring the lobby when `Done()` returns true.
+- **v1 command set:** `DIAL <user>` (also: `PHONE <user>`), `ANSWER`,
+  `HANGUP` (or Ctrl+Z in-call), `REJECT`, `EXIT`, `ADD <user>`.
+  `HOLD`/`UNHOLD`, `FACSIMILE`, and the PHONE-internal `MAIL` command
+  are explicitly deferred.
+- **Registry App column** updates to "PHONE" when a session enters a
+  call, back to "LOBBY" on hangup — WHO reflects real-time app state.
+
+## Next concrete step (as of 2026-06-23)
+
+PHONE app. Architecture locked in above. Building in order:
+1. Registry extension (CallNotify channel, PhoneEvent type)
+2. `internal/phone/call.go` — call table, fanout, ring timers
+3. `internal/phone/app.go` — Bubble Tea model implementing app.App
+4. `internal/phone/layout.go` — viewport geometry for N participants
+5. Lobby integration (activeApp field, DIAL/ANSWER/REJECT dispatch,
+   ring notification polling)

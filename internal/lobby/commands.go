@@ -8,6 +8,8 @@ import (
 
 	tea "github.com/charmbracelet/bubbletea"
 
+	"github.com/klingon00/retro-vax-bbs/internal/app"
+	"github.com/klingon00/retro-vax-bbs/internal/phone"
 	"github.com/klingon00/retro-vax-bbs/internal/store"
 )
 
@@ -37,8 +39,11 @@ var argCommands []struct {
 }
 
 // helpEntries drives the HELP output display. Separate from the dispatch
-// tables so aliases are grouped visually and display order is deterministic.
 var helpEntries = []struct{ display string }{
+	{"PHONE                       — enter phone facility (or: PHONE <username> to dial directly)"},
+	{"DIAL <username>             — place a call (or: PHONE <username>)"},
+	{"ANSWER                      — answer an incoming call"},
+	{"REJECT                      — decline an incoming call"},
 	{"FINGER <username>           (or: SHOW USER <username>)"},
 	{"HELP"},
 	{"LOGOUT"},
@@ -56,20 +61,25 @@ func init() {
 		"WHO":        whoCommand,
 		"SHOW USERS": whoCommand,
 		"SHOW":       showCommand,
-		// FINGER and SHOW USER with no argument — usage hints.
-		// The real argument-taking forms are handled by argCommands below.
-		"FINGER":    fingerUsage,
-		"SHOW USER": fingerUsage,
+		"ANSWER":     answerCommand,
+		"REJECT":     rejectCommand,
+		"FINGER":     fingerUsage,
+		"SHOW USER":  fingerUsage,
+		// PHONE alone opens the facility in idle state.
+		// DIAL alone shows usage (you must specify a username to dial).
+		"PHONE": phoneOpenCommand,
+		"DIAL":  dialUsage,
 	}
 
 	argCommands = []struct {
 		prefix  string
 		handler argCommandHandler
 	}{
-		// Checked in order; first match wins. SHOW USER must come before
-		// SHOW alone would match (but SHOW is exact-match only, so no conflict).
 		{"SHOW USER", fingerByName},
 		{"FINGER", fingerByName},
+		// PHONE <user> and DIAL <user> both dial directly.
+		{"PHONE", phoneDialCommand},
+		{"DIAL", phoneDialCommand},
 	}
 }
 
@@ -242,4 +252,119 @@ func fingerByName(m Model, username string) (string, tea.Cmd) {
 	}
 
 	return b.String(), nil
+}
+
+// phoneUsage handles DIAL or PHONE typed without a username.
+// phoneOpenCommand opens PHONE in idle state — no call started yet.
+// The user lands at the % prompt and can dial, answer, etc. from there.
+func phoneOpenCommand(m Model) (string, tea.Cmd) {
+	if m.calls == nil {
+		return "%PHONE-E-NOCALLS, phone system not initialized.", nil
+	}
+	phoneModel := phone.NewIdle(m.username, m.calls, m.reg, m.out, m.width, m.height)
+	return "", launchAppCmd(phoneModel)
+}
+
+// dialUsage is shown when DIAL is typed with no username at the lobby prompt.
+func dialUsage(m Model) (string, tea.Cmd) {
+	return "Usage: DIAL <username>  (or: PHONE <username>)", nil
+}
+
+// phoneDialCommand places a call to another user, launching the PHONE app.
+func phoneDialCommand(m Model, username string) (string, tea.Cmd) {
+	if username == "" {
+		return "Usage: DIAL <username>  (or: PHONE <username>)", nil
+	}
+	if m.calls == nil {
+		return "%PHONE-E-NOCALLS, phone system not initialized.", nil
+	}
+
+	call, callerP, err := m.calls.Dial(m.username, username)
+	if err != nil {
+		return fmt.Sprintf("%%PHONE-E-NOLOGIN, %v", err), nil
+	}
+
+	phoneModel := phone.New(
+		m.username, call.ID, username,
+		m.calls, m.reg,
+		callerP.IncomingChar,
+		m.out, m.width, m.height,
+	)
+
+	return "", launchAppCmd(phoneModel)
+}
+
+// answerCommand answers the most recent pending incoming call.
+func answerCommand(m Model) (string, tea.Cmd) {
+	if m.calls == nil {
+		return "%PHONE-E-NOCALLS, phone system not initialized.", nil
+	}
+
+	callID := findPendingCallID(m)
+	if callID == "" {
+		return "%PHONE-W-NOCALL, no incoming call to answer.", nil
+	}
+
+	call, calleeP, err := m.calls.Answer(callID, m.username)
+	if err != nil {
+		return fmt.Sprintf("%%PHONE-E-ANSWER, %v", err), nil
+	}
+
+	// Build the "others" list from all call participants so conference calls
+	// get proper viewports for everyone, not just the original caller.
+	allParticipants := m.calls.Participants(call.ID)
+	others := make([]string, 0, len(allParticipants)-1)
+	for _, p := range allParticipants {
+		if p != m.username {
+			others = append(others, p)
+		}
+	}
+
+	phoneModel := phone.NewAnswering(
+		m.username, call.ID, others,
+		m.calls, m.reg,
+		calleeP.IncomingChar,
+		m.out, m.width, m.height,
+	)
+
+	return "", launchAppCmd(phoneModel)
+}
+
+// rejectCommand declines the most recent pending incoming call.
+func rejectCommand(m Model) (string, tea.Cmd) {
+	if m.calls == nil {
+		return "%PHONE-E-NOCALLS, phone system not initialized.", nil
+	}
+
+	callID := findPendingCallID(m)
+	if callID == "" {
+		return "%PHONE-W-NOCALL, no incoming call to reject.", nil
+	}
+
+	if err := m.calls.Reject(callID, m.username); err != nil {
+		return fmt.Sprintf("%%PHONE-E-REJECT, %v", err), nil
+	}
+	return "Call rejected.", nil
+}
+
+// findPendingCallID returns the call-id of the most recent incoming ring,
+// stored directly on the model when the ring event arrived.
+func findPendingCallID(m Model) string {
+	return m.pendingCallID
+}
+
+// launchAppCmd returns a tea.Cmd that, when executed, sends a
+// launchAppMsg to the lobby's Update loop so it can set m.activeApp.
+// We can't mutate the model directly from a command handler (handlers
+// only return string + tea.Cmd), so we use a message to carry the app.
+func launchAppCmd(a app.App) tea.Cmd {
+	return func() tea.Msg {
+		return launchAppMsg{app: a}
+	}
+}
+
+// launchAppMsg is received by the lobby's Update and triggers the
+// transition into the given app.
+type launchAppMsg struct {
+	app app.App
 }

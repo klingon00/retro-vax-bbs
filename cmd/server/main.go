@@ -34,6 +34,7 @@ import (
 
 	"github.com/klingon00/retro-vax-bbs/internal/auth"
 	"github.com/klingon00/retro-vax-bbs/internal/lobby"
+	"github.com/klingon00/retro-vax-bbs/internal/phone"
 	"github.com/klingon00/retro-vax-bbs/internal/registry"
 	"github.com/klingon00/retro-vax-bbs/internal/store"
 )
@@ -103,7 +104,8 @@ func main() {
 
 	reg := registry.New()
 	globalDB = db
-	globalReg = reg // set before listeners start; read-only after that
+	globalReg = reg
+	globalCalls = phone.NewCalls(reg)
 
 	publicLimiter := newLimiter(cfg)
 	adminLimiter := newLimiter(cfg)
@@ -248,7 +250,7 @@ func teaHandler(s ssh.Session) (tea.Model, []tea.ProgramOption) {
 	// to teaHandler without a package-level variable would require
 	// restructuring main into a struct, which is more complexity than
 	// the clarity it would bring at this scale.
-	m := lobby.New(s.User(), role, globalReg, globalDB)
+	m := lobby.New(s.User(), role, globalReg, globalDB, globalCalls, s)
 	return m, []tea.ProgramOption{tea.WithAltScreen()}
 }
 
@@ -260,8 +262,9 @@ func teaHandler(s ssh.Session) (tea.Model, []tea.ProgramOption) {
 // Both database/sql and the Registry are safe for concurrent use from
 // multiple goroutines.
 var (
-	globalDB  *store.Store
-	globalReg *registry.Registry
+	globalDB    *store.Store
+	globalReg   *registry.Registry
+	globalCalls *phone.Calls
 )
 
 func newLimiter(cfg config) rl.RateLimiter {

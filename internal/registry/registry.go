@@ -1,9 +1,8 @@
-// Package registry tracks active lobby sessions for the WHO command and
-// future PHONE call routing. It is the shared, concurrent-safe data
-// structure the lobby model comment has anticipated since the scaffold:
-// "Anything that genuinely needs to be cross-session (the WHO list,
-// PHONE call routing) will live behind an explicit registry passed into
-// New(), once one exists — not smuggled in as a package-level variable."
+// Package registry tracks active lobby sessions for WHO, FINGER, and
+// PHONE call routing. It is the shared, concurrent-safe data structure
+// the lobby model comment has anticipated since the scaffold: "Anything
+// that genuinely needs to be cross-session (the WHO list, PHONE call
+// routing) will live behind an explicit registry passed into New()."
 package registry
 
 import (
@@ -11,23 +10,50 @@ import (
 	"sync"
 )
 
+// EventType identifies what kind of PHONE event a PhoneEvent carries.
+type EventType int
+
+const (
+	EventRing    EventType = iota // incoming call — answer or reject
+	EventHangup                   // caller hung up before answer, or mid-call
+	EventReject                   // callee explicitly rejected the call
+	EventAnswer                   // callee answered — call is now live
+	EventRinging                  // advisory: someone in the call is ringing another user
+)
+
+// PhoneEvent is sent over a session's Notify channel when something
+// call-related happens that the session's Bubble Tea program needs to
+// react to. The channel is buffered (size 8) so senders never block on
+// a slow receiver.
+type PhoneEvent struct {
+	Type   EventType
+	CallID string // opaque identifier for the call; stable across ring/answer/hangup
+	Caller string // username who initiated the call
+	Callee string // username being called
+}
+
 // entry tracks active sessions for one account.
 type entry struct {
 	role         string
 	adminVisible bool
 	count        int    // number of concurrently active sessions
 	currentApp   string // e.g. "LOBBY", "PHONE", "MAIL"
+
+	// notify is the channel through which PHONE events (ring, hangup,
+	// reject, answer) are delivered to this session's Bubble Tea program.
+	// Buffered so senders don't block. Created when the first session
+	// registers; all concurrent sessions for the same user share it.
+	notify chan PhoneEvent
 }
 
-// SessionView is a display-ready snapshot of one account's presence,
-// returned by List. Exported so the lobby package can use it directly.
+// SessionView is a display-ready snapshot of one account's presence.
 type SessionView struct {
 	Username   string
-	Count      int    // 1 = single session, >1 = concurrent sessions
-	CurrentApp string // what the user (or their primary session) is doing
+	Count      int
+	CurrentApp string
 }
 
-// Registry tracks all currently active authenticated lobby sessions.
+// Registry tracks all currently active authenticated sessions.
 // Safe for concurrent use — one goroutine per SSH session.
 type Registry struct {
 	mu       sync.RWMutex
@@ -42,11 +68,8 @@ func New() *Registry {
 }
 
 // Register records a new session for username. If the user already has
-// active sessions (concurrent windows), increments their count rather
-// than creating a duplicate entry. adminVisible is read from the
-// account's stored preference at connect time. initialApp is the app
-// the session starts in — always "LOBBY" at connect time; updated later
-// via SetApp when the user launches PHONE, MAIL, etc.
+// active sessions, increments their count and reuses the existing notify
+// channel. adminVisible and initialApp are only set on the first session.
 func (r *Registry) Register(username, role string, adminVisible bool, initialApp string) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
@@ -58,25 +81,13 @@ func (r *Registry) Register(username, role string, adminVisible bool, initialApp
 			adminVisible: adminVisible,
 			count:        1,
 			currentApp:   initialApp,
+			notify:       make(chan PhoneEvent, 8),
 		}
 	}
 }
 
-// SetApp updates the current app for a user's session. Called by app
-// launchers (PHONE, MAIL, etc.) when a user enters or exits an app.
-// With the current aggregated-by-username registry design, this updates
-// the display for all of a user's sessions — per-session app tracking
-// is a future refinement when multi-app concurrent sessions need it.
-func (r *Registry) SetApp(username, app string) {
-	r.mu.Lock()
-	defer r.mu.Unlock()
-	if e, ok := r.sessions[username]; ok {
-		e.currentApp = app
-	}
-}
-
 // Unregister decrements the session count for username and removes the
-// entry entirely when the count reaches zero (last window closed).
+// entry (and its notify channel) when the count reaches zero.
 func (r *Registry) Unregister(username string) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
@@ -90,15 +101,41 @@ func (r *Registry) Unregister(username string) {
 	}
 }
 
-// List returns a visibility-filtered, alphabetically sorted snapshot of
-// active sessions for a viewer with the given role. Visibility rules per
-// the design doc:
-//   - Regular users (role="user") see: non-admin accounts + any admin
-//     who has opted into visibility (admin_visible=true).
-//   - Admins (role="admin") see everyone — including invisible admins.
-//
-// This is a snapshot; the registry continues to change as sessions
-// connect and disconnect. Callers should not cache the result.
+// SetApp updates the current app label for the user's session(s).
+func (r *Registry) SetApp(username, app string) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if e, ok := r.sessions[username]; ok {
+		e.currentApp = app
+	}
+}
+
+// Notify returns the PhoneEvent channel for the given username, so that
+// PHONE infrastructure can send ring/hangup/etc. events directly to that
+// user's session. Returns nil if the user is not connected — callers
+// must check.
+func (r *Registry) Notify(username string) chan<- PhoneEvent {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	if e, ok := r.sessions[username]; ok {
+		return e.notify
+	}
+	return nil
+}
+
+// Events returns the receive end of the PhoneEvent channel for the given
+// username, so that the user's own Bubble Tea program can poll for
+// incoming events. Returns nil if not connected.
+func (r *Registry) Events(username string) <-chan PhoneEvent {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	if e, ok := r.sessions[username]; ok {
+		return e.notify
+	}
+	return nil
+}
+
+// List returns a visibility-filtered, alphabetically sorted snapshot.
 func (r *Registry) List(viewerRole string) []SessionView {
 	r.mu.RLock()
 	defer r.mu.RUnlock()
@@ -106,7 +143,7 @@ func (r *Registry) List(viewerRole string) []SessionView {
 	views := make([]SessionView, 0, len(r.sessions))
 	for username, e := range r.sessions {
 		if e.role == "admin" && viewerRole != "admin" && !e.adminVisible {
-			continue // invisible admin; non-admin viewer cannot see them
+			continue
 		}
 		views = append(views, SessionView{
 			Username:   username,
@@ -120,11 +157,8 @@ func (r *Registry) List(viewerRole string) []SessionView {
 	return views
 }
 
-// Get returns the session info for a specific username, regardless of
-// visibility rules. Used by FINGER, which applies its own visibility
-// check based on the target user's role and admin_visible setting.
-// Returns (SessionView, true) if the user has active sessions,
-// (SessionView{}, false) if they are not currently connected.
+// Get returns session info for a specific username without visibility
+// filtering. Used by FINGER and PHONE routing.
 func (r *Registry) Get(username string) (SessionView, bool) {
 	r.mu.RLock()
 	defer r.mu.RUnlock()
