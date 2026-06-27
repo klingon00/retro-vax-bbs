@@ -6,15 +6,19 @@ Companion to the main design doc. This is the "still soft" stuff — things ackn
 
 - **Mail app** — interface contract exists (modular app framework), but no UX/content design yet.
 - **Text game** — acknowledged as a future modular app, nothing scoped beyond that.
-- **Color/emphasis** — opt-in negotiation agreed at a high level (both sender and receiver must opt in). Exact command syntax (e.g. `SET COLOR ON`) and which UI elements support emphasis: not yet detailed.
+- **Color/emphasis** — opt-in negotiation agreed at a high level (both sender and receiver must opt in). `color_opt_in` column already in schema. Exact command syntax (e.g. `SET COLOR ON`) and which UI elements support emphasis: not yet detailed. Implementation path: sender wraps text in ANSI codes, receiver strips them if `color_opt_in = false`.
 - **External notifications** — hook point reserved in the login/presence path, but the actual mechanism (webhook vs. ntfy-style push vs. something else), subscription command syntax, and notification rate-limiting are all undesigned.
 - **Unraid Community Apps template** — not started. XML template, icon, port-mapping documentation, README for the listing: all pending.
 - **CIDR-based admin allowlist** — documented as an alternative/complement to the dual-listener split, not implemented, not required (the listener split is the primary mechanism).
 - **Multi-session `WHO` display** — implemented: concurrent sessions show as "alice  (2 sessions)". Display format confirmed working.
 - **VAX/VMS-style command abbreviation** — agreed as a nice-to-have (shortest unambiguous prefix), not yet scoped into v1 build order.
 - **Argon2id tuning** — rough starting params given (~64MB memory, 3 iterations) but not benchmarked against actual deployment hardware.
-- **Third-party notices file** — license is MIT (see below), all current and planned dependencies are MIT/BSD-3-Clause, but a proper notices file listing each dependency's license hasn't been created yet. Good practice before public/Unraid release.
-- **HELP expansion** — the lobby HELP command lists commands but gives no usage details. Agreed that PHONE's switch-hook behavior and other non-obvious features warrant inline help text eventually. Not yet designed.
+- **Third-party notices file** — license is MIT, all current and planned dependencies are MIT/BSD-3-Clause, but a proper notices file listing each dependency's license hasn't been created yet. Good practice before public/Unraid release.
+- **Lobby HELP expansion** — the lobby HELP command lists commands but gives no usage details. PHONE now has a full in-viewport HELP display; the lobby prompt should get similar treatment eventually.
+- **SET PLAN** — FINGER currently always shows "(no plan set)". Simple one-command addition.
+- **Admin commands** — APPROVE/REJECT/KICK/BAN/UNLOCK are designed but not implemented. Needed for registration modes to be usable.
+- **PHONE: Ctrl-G sender self-bell** — when a user presses Ctrl-G, the bell broadcasts to all *other* participants but the sender doesn't hear their own. One-liner fix: return `tea.Batch(m.ringBellCmd(), ...)` from the Ctrl-G handler. Deferred as minor.
+- **PHONE: mute / do-not-disturb** — bell suppression for ring notifications and Ctrl-G. Future config flag; deferred.
 
 ## Decisions explicitly deferred on purpose
 
@@ -40,11 +44,13 @@ These came up but were intentionally pushed past v1 — don't reopen them withou
   - [x] Account lockout
   - [x] Per-IP rate limiting
 - [x] Dual-listener split (public / admin)
-- [ ] `WHO` / `FINGER`
+- [x] `WHO` / `FINGER`
   - [x] `WHO` (real implementation — session registry-backed)
   - [x] `FINGER <user>`
-- [ ] PHONE app (`DIAL` / `ANSWER` / `HANGUP` / `ADD`)
+- [x] PHONE app — **v1 complete** (see implementation notes below)
 - [ ] Docker packaging
+
+---
 
 **Scaffolding (done):** Go module set up; `wish` SSH server + `bubbletea`
 lobby loop running and tested end-to-end over a real SSH client
@@ -52,6 +58,7 @@ lobby loop running and tested end-to-end over a real SSH client
 `internal/lobby/`, `internal/app/`.
 
 Implementation decisions made along the way, worth keeping on record:
+
 - Command handlers return `(string, tea.Cmd)`, not just a string — gives
   a handler (e.g. `LOGOUT`) a constrained way to trigger a side effect
   like `tea.Quit` without opening the door to arbitrary handler behavior.
@@ -198,9 +205,9 @@ Implementation decisions made along the way, worth keeping on record:
   continue to show the password prompt until the user types (it blocks
   on /dev/tty, not the socket, while waiting for password input).
 
-## PHONE app design (locked in, not yet built)
+## PHONE app — v1 complete (2026-06-26)
 
-Architecture decisions made before implementation:
+Architecture decisions made before implementation, all confirmed as implemented:
 
 - **Character-by-character, not line-by-line.** Every keypress routes
   immediately to all participants' viewports. This is the defining
@@ -210,33 +217,103 @@ Architecture decisions made before implementation:
 - **Multi-party from the start.** Conference calls via `ADD <username>`
   are architecturally natural — fanout to a slice of channels instead
   of one. Viewport layout math divides screen height among N participants.
-  No reason to artificially limit to two-party.
+  No reason to artificially limit to two-party. Confirmed working with
+  3-party calls.
 - **Switch-hook character: `%` (percent, original default).** When inside
   PHONE, all keypresses go to the conversation EXCEPT those prefixed
-  with `%`, which enter command mode. A status line tip
-  ("type freely to chat, %HANGUP to leave") is displayed when idle in a
-  call to help new users, disappearing when command mode is entered.
-- **Ring behavior matches originals:** rings every 10 seconds, shown as
-  "Ringing <user>...  (Press any key to cancel call and continue.)" for
-  the caller. At the callee's lobby, broadcasts "<caller> is phoning you
-  (HH:MM:SS)" once per 10 seconds.
-- **New packages:** `internal/phone/` (app.go, call.go, layout.go).
-  Registry gains `CallNotify chan PhoneEvent` per session. The lobby
-  Model gains `activeApp app.App` and delegates all input/view to it
-  when non-nil, restoring the lobby when `Done()` returns true.
-- **v1 command set:** `DIAL <user>` (also: `PHONE <user>`), `ANSWER`,
-  `HANGUP` (or Ctrl+Z in-call), `REJECT`, `EXIT`, `ADD <user>`.
+  with `%`, which enter command mode. An info line below the command line
+  shows the appropriate tip for the current state; it restores
+  automatically when timed notifications clear.
+- **Ring behavior matches originals:** rings every 10 seconds. At the
+  callee's lobby, broadcasts "<caller> is phoning you (HH:MM:SS)".
+  While ringing, the caller sees "Ringing <user>... (Press any key to
+  cancel)". Any keypress cancels the pending ring and notifies both the
+  callee and all other active call participants.
+- **Packages:** `internal/phone/` with `app.go`, `call.go`, `layout.go`.
+  Registry gained `CallNotify chan PhoneEvent` per session. The lobby
+  Model gained `activeApp app.App` and delegates all input/view to it
+  when non-nil.
+- **v1 command set implemented:** `DIAL <user>` (also: `PHONE <user>`),
+  `ANSWER`, `HANGUP` (or Ctrl-Z in-call), `REJECT`, `EXIT`, `ADD <user>`.
   `HOLD`/`UNHOLD`, `FACSIMILE`, and the PHONE-internal `MAIL` command
-  are explicitly deferred.
+  remain explicitly deferred.
 - **Registry App column** updates to "PHONE" when a session enters a
   call, back to "LOBBY" on hangup — WHO reflects real-time app state.
+- **Keyboard shortcuts implemented:** Ctrl-G (broadcast BEL to all
+  participants), Tab (insert 5 spaces), Ctrl-L (clear own viewport,
+  broadcast via `\f`), Ctrl-U (clear current line, broadcast via `\x15`
+  NAK so all participants see the cleared line simultaneously).
+- **HELP** fills the own viewport with a full command/keyboard reference
+  and persists until any keypress, which clears the viewport and returns
+  to normal operation.
 
-## Next concrete step (as of 2026-06-23)
+### BubbleTea v1.x rendering discoveries (critical for future apps)
 
-PHONE app. Architecture locked in above. Building in order:
-1. Registry extension (CallNotify channel, PhoneEvent type)
-2. `internal/phone/call.go` — call table, fanout, ring timers
-3. `internal/phone/app.go` — Bubble Tea model implementing app.App
-4. `internal/phone/layout.go` — viewport geometry for N participants
-5. Lobby integration (activeApp field, DIAL/ANSWER/REJECT dispatch,
-   ring notification polling)
+Hard-won knowledge from implementing PHONE that applies to any future
+full-screen app launched via the lobby delegation pattern:
+
+- **BubbleTea v1.3.x + wish SSH: line 1 of View() is always off-screen.**
+  In this stack (BubbleTea v1.3.10, wish v1.4.7), line 1 of any View()
+  rendered via the lobby's `activeApp` delegation is placed at "row 0"
+  — one row above the terminal's visible area. Every line shifts up by 1.
+  Root cause is in how BubbleTea v1.x's cellbuf renderer positions the
+  initial frame during the lobby→app transition. This may be fixed in
+  future BubbleTea/wish versions; check before applying the workaround
+  to new apps.
+
+- **Workaround: sacrifice blank line + layout compensation.** Prepend
+  `b.WriteString("\n")` as line 1 of every full-screen app's `View()`.
+  This blank line is absorbed off-screen; the actual content starts at
+  line 2, which appears at screen row 1. To keep total content at exactly
+  `termHeight+1` (so only the sacrifice blank goes off-screen and content
+  fills the terminal), the layout must compensate: use
+  `available = termHeight - chromeRows - 1` in `Compute()`. Floor division
+  of `available` by participant count can leave total content at
+  `termHeight` in some combinations (sacrifice visible again) — fix by
+  adding filler blank lines at the bottom of the viewport area to pad to
+  exactly `termHeight+1`. See `internal/phone/layout.go` and the filler
+  loop in `View()`.
+
+- **BubbleTea v1.x cellbuf renderer strips `\a` (BEL).** `\a` embedded
+  in the View string is processed as a C0 control by the ANSI parser in
+  `charmbracelet/x/ansi` and does not reach the terminal output. To ring
+  the terminal bell, write `\a` directly to the SSH session's `io.Writer`
+  from a `tea.Cmd`, bypassing the renderer entirely. The lobby stores the
+  SSH session writer as `Model.out io.Writer` (passed from `teaHandler`
+  via `lobby.New(... out io.Writer)`); phone models receive it via the
+  same constructor chain. `ringBellCmd()` on both models captures `out`
+  in a closure and writes `\a` to it.
+
+- **EventHangup Callee field convention.** `EventHangup` is used for two
+  distinct situations: a participant leaving an active call (Callee empty)
+  and a pending ring being cancelled before answer (Callee non-empty,
+  set to the username that was being rung). Receivers in CallActive state
+  check `event.Callee != ""` to distinguish the two cases — a non-empty
+  Callee means "clear the ring notification" rather than "remove a
+  viewport". This convention is load-bearing; preserve it when adding
+  new event handling.
+
+- **Ctrl-U / line-clear sync via NAK (`\x15`).** Clearing only the local
+  `Current` field on the sender's viewport leaves other participants'
+  view of that line stale. Broadcast `\x15` (ASCII NAK, Ctrl-U) via
+  `BroadcastChar` so all participants clear the sender's `Current` field
+  simultaneously. Similarly, `\f` (form feed) clears the entire viewport
+  on receipt. Both are handled in `charArrivedMsg` before falling through
+  to normal character routing.
+
+## Next concrete steps (as of 2026-06-26)
+
+Suggested order based on design doc priorities and dependencies:
+
+1. **Registration modes** — invite-only and open-with-approval. Schema
+   (`invites` table) and config knob already designed. Requires admin
+   commands (APPROVE/REJECT) to be useful. Largest remaining auth feature.
+2. **Admin commands** — APPROVE/REJECT/KICK/BAN/UNLOCK. Blocked on
+   registration modes being meaningful without them.
+3. **SET PLAN** — one command, lets users set their FINGER blurb.
+4. **Lobby HELP expansion** — per-command usage text, modeled on PHONE's
+   in-viewport HELP display.
+5. **VAX/VMS command abbreviation** — shortest unambiguous prefix (DCL
+   style). Nice-to-have, non-blocking.
+6. **Docker packaging** — straightforward given the single-binary build.
+   Required before any Unraid Community Apps work.
