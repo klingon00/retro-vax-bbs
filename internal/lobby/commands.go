@@ -1,8 +1,10 @@
 package lobby
 
 import (
+	crand "crypto/rand"
 	"errors"
 	"fmt"
+	"strconv"
 	"strings"
 	"time"
 
@@ -69,6 +71,20 @@ func init() {
 		// DIAL alone shows usage (you must specify a username to dial).
 		"PHONE": phoneOpenCommand,
 		"DIAL":  dialUsage,
+		// Admin commands (enforced by role check inside each handler).
+		"LIST PENDING":  listPendingCommand,
+		"LIST USERS":    listUsersCommand,
+		"LIST INVITES":  listInvitesCommand,
+		"INVITE":        inviteUsage,
+		"INVITE CREATE": inviteCreateCommand,
+		"APPROVE":       approveUsage,
+		"REJECT USER":   rejectUserUsage,
+		"DELETE USER":   deleteUserUsage,
+		"UNLOCK":        unlockUsage,
+		"KICK":          kickUsage,
+		"BAN":           banUsage,
+		"UNBAN":         unbanUsage,
+		"PURGE PENDING": purgePendingCommand,
 	}
 
 	argCommands = []struct {
@@ -80,6 +96,15 @@ func init() {
 		// PHONE <user> and DIAL <user> both dial directly.
 		{"PHONE", phoneDialCommand},
 		{"DIAL", phoneDialCommand},
+		// Admin argument commands.
+		{"APPROVE", approveCommand},
+		{"REJECT USER", rejectUserCommand},
+		{"DELETE USER", deleteUserCommand},
+		{"UNLOCK", unlockCommand},
+		{"KICK", kickCommand},
+		{"BAN", banCommand},
+		{"UNBAN", unbanCommand},
+		{"INVITE CREATE", inviteCreateArgCommand},
 	}
 }
 
@@ -367,4 +392,439 @@ func launchAppCmd(a app.App) tea.Cmd {
 // transition into the given app.
 type launchAppMsg struct {
 	app app.App
+}
+
+// ---- Admin guard --------------------------------------------------------
+
+// requireAdmin returns an error string if m.role != "admin", or "" if ok.
+func requireAdmin(m Model) string {
+	if m.role != "admin" {
+		return "%VAX-BBS-E-NOACCESS, you do not have administrative access."
+	}
+	return ""
+}
+
+// ---- APPROVE / REJECT USER ----------------------------------------------
+
+func approveUsage(m Model) (string, tea.Cmd) {
+	return "Usage: APPROVE <username>", nil
+}
+func rejectUserUsage(m Model) (string, tea.Cmd) {
+	return "Usage: REJECT USER <username>", nil
+}
+
+func approveCommand(m Model, username string) (string, tea.Cmd) {
+	if e := requireAdmin(m); e != "" {
+		return e, nil
+	}
+	if m.db == nil {
+		return "%VAX-BBS-E-NODB, database unavailable.", nil
+	}
+	if err := m.db.ApprovePendingAccount(username); err != nil {
+		return fmt.Sprintf("%%VAX-BBS-E-APPROVE, %v", err), nil
+	}
+	return fmt.Sprintf("Account '%s' approved. The user may now log in.", username), nil
+}
+
+func rejectUserCommand(m Model, username string) (string, tea.Cmd) {
+	if e := requireAdmin(m); e != "" {
+		return e, nil
+	}
+	if m.db == nil {
+		return "%VAX-BBS-E-NODB, database unavailable.", nil
+	}
+	if err := m.db.RejectPendingAccount(username); err != nil {
+		return fmt.Sprintf("%%VAX-BBS-E-REJECT, %v", err), nil
+	}
+	return fmt.Sprintf("Account request for '%s' rejected and removed.", username), nil
+}
+
+// ---- LIST PENDING -------------------------------------------------------
+
+func listPendingCommand(m Model) (string, tea.Cmd) {
+	if e := requireAdmin(m); e != "" {
+		return e, nil
+	}
+	if m.db == nil {
+		return "%VAX-BBS-E-NODB, database unavailable.", nil
+	}
+	users, err := m.db.ListPendingAccounts()
+	if err != nil {
+		return fmt.Sprintf("%%VAX-BBS-E-LIST, %v", err), nil
+	}
+	if len(users) == 0 {
+		return "No accounts pending approval.", nil
+	}
+	var sb strings.Builder
+	sb.WriteString(fmt.Sprintf("  %-20s  %-30s  %s\n", "USERNAME", "EMAIL", "REQUESTED"))
+	sb.WriteString("  " + strings.Repeat("-", 65))
+	for _, u := range users {
+		email := "(none)"
+		if u.Email.String != "" {
+			email = u.Email.String
+		}
+		sb.WriteString(fmt.Sprintf("\n  %-20s  %-30s  %s",
+			u.Username, email, u.CreatedAt.Format("02-Jan-2006 15:04")))
+	}
+	sb.WriteString(fmt.Sprintf("\n\n  %d pending. Use APPROVE <user> or REJECT USER <user>.", len(users)))
+	return sb.String(), nil
+}
+
+// ---- UNLOCK -------------------------------------------------------------
+
+func unlockUsage(m Model) (string, tea.Cmd) {
+	return "Usage: UNLOCK <username>  — clear login lockout for a user", nil
+}
+
+func unlockCommand(m Model, username string) (string, tea.Cmd) {
+	if e := requireAdmin(m); e != "" {
+		return e, nil
+	}
+	if m.db == nil {
+		return "%VAX-BBS-E-NODB, database unavailable.", nil
+	}
+	user, err := m.db.GetUserByUsername(username)
+	if err != nil {
+		return fmt.Sprintf("%%VAX-BBS-E-UNLOCK, user '%s' not found.", username), nil
+	}
+	if err := m.db.ClearFailedAttempts(user.ID); err != nil {
+		return fmt.Sprintf("%%VAX-BBS-E-UNLOCK, %v", err), nil
+	}
+	return fmt.Sprintf("Lockout cleared for '%s'. They may now log in.", username), nil
+}
+
+// ---- KICK ---------------------------------------------------------------
+
+func kickUsage(m Model) (string, tea.Cmd) {
+	return "Usage: KICK <username>  — disconnect a user's active session", nil
+}
+
+func kickCommand(m Model, username string) (string, tea.Cmd) {
+	if e := requireAdmin(m); e != "" {
+		return e, nil
+	}
+	if m.reg.Kick(username) {
+		return fmt.Sprintf("'%s' has been disconnected.", username), nil
+	}
+	return fmt.Sprintf("'%s' is not currently connected.", username), nil
+}
+
+// ---- BAN / UNBAN --------------------------------------------------------
+
+func banUsage(m Model) (string, tea.Cmd) {
+	return "Usage: BAN <username> <duration>  (e.g. 30m, 2h, 7d, perm)", nil
+}
+func unbanUsage(m Model) (string, tea.Cmd) {
+	return "Usage: UNBAN <username>", nil
+}
+
+func banCommand(m Model, args string) (string, tea.Cmd) {
+	if e := requireAdmin(m); e != "" {
+		return e, nil
+	}
+	if m.db == nil {
+		return "%VAX-BBS-E-NODB, database unavailable.", nil
+	}
+	parts := strings.Fields(args)
+	if len(parts) < 2 {
+		return banUsage(m)
+	}
+	username, durStr := parts[0], parts[1]
+
+	until, display, err := parseBanDuration(durStr)
+	if err != nil {
+		return fmt.Sprintf("%%VAX-BBS-E-BAN, %v", err), nil
+	}
+	// Kick the user first if they're connected.
+	m.reg.Kick(username)
+	if err := m.db.BanUser(username, until); err != nil {
+		return fmt.Sprintf("%%VAX-BBS-E-BAN, %v", err), nil
+	}
+	return fmt.Sprintf("'%s' has been banned (%s).", username, display), nil
+}
+
+func unbanCommand(m Model, username string) (string, tea.Cmd) {
+	if e := requireAdmin(m); e != "" {
+		return e, nil
+	}
+	if m.db == nil {
+		return "%VAX-BBS-E-NODB, database unavailable.", nil
+	}
+	if err := m.db.UnbanUser(username); err != nil {
+		return fmt.Sprintf("%%VAX-BBS-E-UNBAN, %v", err), nil
+	}
+	return fmt.Sprintf("Ban lifted for '%s'. They may now log in.", username), nil
+}
+
+// parseBanDuration parses strings like "30m", "2h", "7d", "perm".
+// Returns (until *time.Time, display string, error).
+// until is nil for permanent bans.
+func parseBanDuration(s string) (*time.Time, string, error) {
+	switch strings.ToLower(s) {
+	case "perm", "permanent", "forever", "never":
+		return nil, "permanent", nil
+	}
+	if len(s) < 2 {
+		return nil, "", fmt.Errorf("invalid duration %q; use e.g. 30m, 2h, 7d, perm", s)
+	}
+	n, err := strconv.Atoi(s[:len(s)-1])
+	if err != nil || n <= 0 {
+		return nil, "", fmt.Errorf("invalid duration %q; use e.g. 30m, 2h, 7d, perm", s)
+	}
+	var d time.Duration
+	var unit string
+	switch s[len(s)-1] {
+	case 's':
+		d, unit = time.Duration(n)*time.Second, fmt.Sprintf("%ds", n)
+	case 'm':
+		d, unit = time.Duration(n)*time.Minute, fmt.Sprintf("%dm", n)
+	case 'h':
+		d, unit = time.Duration(n)*time.Hour, fmt.Sprintf("%dh", n)
+	case 'd':
+		d, unit = time.Duration(n)*24*time.Hour, fmt.Sprintf("%d days", n)
+	case 'w':
+		d, unit = time.Duration(n)*7*24*time.Hour, fmt.Sprintf("%d weeks", n)
+	default:
+		return nil, "", fmt.Errorf("unknown unit %q; use s/m/h/d/w or perm", string(s[len(s)-1]))
+	}
+	t := time.Now().Add(d)
+	return &t, unit, nil
+}
+
+// ---- INVITE CREATE ------------------------------------------------------
+
+func inviteUsage(m Model) (string, tea.Cmd) {
+	return "Usage: INVITE CREATE [uses] [duration]  (e.g. INVITE CREATE 5 7d)", nil
+}
+
+// inviteCreateCommand handles bare "INVITE CREATE" (no arguments).
+func inviteCreateCommand(m Model) (string, tea.Cmd) {
+	return inviteCreateArgCommand(m, "")
+}
+
+// inviteCreateArgCommand handles "INVITE CREATE [args]".
+func inviteCreateArgCommand(m Model, args string) (string, tea.Cmd) {
+	if e := requireAdmin(m); e != "" {
+		return e, nil
+	}
+	if m.db == nil {
+		return "%VAX-BBS-E-NODB, database unavailable.", nil
+	}
+	// Parse optional: uses count, expiry duration.
+	uses := 1
+	expiresAt := store.NeverExpires()
+	expiryDisplay := "never"
+
+	parts := strings.Fields(args)
+	if len(parts) >= 1 {
+		n, err := strconv.Atoi(parts[0])
+		if err != nil || n < 1 {
+			return "%VAX-BBS-E-INVITE, uses must be a positive integer.", nil
+		}
+		uses = n
+	}
+	if len(parts) >= 2 {
+		_, display, err := parseBanDuration(parts[1]) // reuse duration parser
+		if err != nil {
+			return fmt.Sprintf("%%VAX-BBS-E-INVITE, %v", err), nil
+		}
+		dur := parts[1]
+		_, expiresPtr, parseErr := parseBanDurationFull(dur)
+		if parseErr != nil {
+			return fmt.Sprintf("%%VAX-BBS-E-INVITE, %v", parseErr), nil
+		}
+		if expiresPtr != nil {
+			expiresAt = *expiresPtr
+		}
+		expiryDisplay = display
+	}
+
+	// Look up admin's user ID for the created_by FK.
+	adminUser, err := m.db.GetUserByUsername(m.username)
+	if err != nil {
+		return "%VAX-BBS-E-INVITE, could not look up your account.", nil
+	}
+
+	code := generateInviteCode()
+	if err := m.db.CreateInvite(code, adminUser.ID, uses, expiresAt); err != nil {
+		return fmt.Sprintf("%%VAX-BBS-E-INVITE, %v", err), nil
+	}
+	return fmt.Sprintf("Invite code created: %s\n  Uses: %d  Expires: %s",
+		code, uses, expiryDisplay), nil
+}
+
+// parseBanDurationFull returns (display, *time.Time, error) for durations.
+// nil time.Time = permanent/no expiry.
+func parseBanDurationFull(s string) (string, *time.Time, error) {
+	switch strings.ToLower(s) {
+	case "perm", "permanent", "forever", "never":
+		return "never", nil, nil
+	}
+	if len(s) < 2 {
+		return "", nil, fmt.Errorf("invalid duration %q", s)
+	}
+	n, err := strconv.Atoi(s[:len(s)-1])
+	if err != nil || n <= 0 {
+		return "", nil, fmt.Errorf("invalid duration %q", s)
+	}
+	var d time.Duration
+	var unit string
+	switch s[len(s)-1] {
+	case 's':
+		d, unit = time.Duration(n)*time.Second, fmt.Sprintf("%ds", n)
+	case 'm':
+		d, unit = time.Duration(n)*time.Minute, fmt.Sprintf("%dm", n)
+	case 'h':
+		d, unit = time.Duration(n)*time.Hour, fmt.Sprintf("%dh", n)
+	case 'd':
+		d, unit = time.Duration(n)*24*time.Hour, fmt.Sprintf("%d days", n)
+	case 'w':
+		d, unit = time.Duration(n)*7*24*time.Hour, fmt.Sprintf("%d weeks", n)
+	default:
+		return "", nil, fmt.Errorf("unknown unit %q", string(s[len(s)-1]))
+	}
+	t := time.Now().Add(d)
+	return unit, &t, nil
+}
+
+// ---- LIST INVITES -------------------------------------------------------
+
+func listInvitesCommand(m Model) (string, tea.Cmd) {
+	if e := requireAdmin(m); e != "" {
+		return e, nil
+	}
+	if m.db == nil {
+		return "%VAX-BBS-E-NODB, database unavailable.", nil
+	}
+	invites, err := m.db.ListInvites()
+	if err != nil {
+		return fmt.Sprintf("%%VAX-BBS-E-LIST, %v", err), nil
+	}
+	if len(invites) == 0 {
+		return "No invite codes. Use INVITE CREATE to generate one.", nil
+	}
+	var sb strings.Builder
+	sb.WriteString(fmt.Sprintf("  %-22s  %5s  %s\n", "CODE", "USES", "EXPIRES"))
+	sb.WriteString("  " + strings.Repeat("-", 45))
+	for _, inv := range invites {
+		sb.WriteString(fmt.Sprintf("\n  %-22s  %5d  %s",
+			inv.Code, inv.UsesRemaining, inv.DisplayExpiry()))
+	}
+	return sb.String(), nil
+}
+
+// ---- Invite code generation ---------------------------------------------
+
+var inviteAdj = []string{
+	"able", "amber", "bold", "brave", "brisk", "calm", "clean", "clear",
+	"cool", "crisp", "dark", "deep", "fair", "fast", "firm", "free",
+	"gold", "good", "gray", "hard", "keen", "kind", "late", "light",
+	"long", "mild", "neat", "open", "quick", "quiet", "safe", "sharp",
+	"slim", "slow", "soft", "still", "swift", "tall", "warm", "wide",
+}
+
+var inviteNoun = []string{
+	"arc", "ash", "bay", "birch", "blade", "brook", "cedar", "cliff",
+	"code", "cove", "creek", "dale", "dawn", "disk", "dusk", "echo",
+	"elm", "fern", "ford", "gate", "glen", "grove", "hill", "key",
+	"lake", "leaf", "link", "log", "maple", "marsh", "mist", "moss",
+	"oak", "path", "peak", "pine", "pond", "reed", "ridge", "rock",
+}
+
+func generateInviteCode() string {
+	b := make([]byte, 4)
+	if _, err := crand.Read(b); err != nil {
+		// Fallback to time-seeded if crypto/rand fails (shouldn't happen).
+		b[0] = byte(time.Now().UnixNano())
+	}
+	adj := inviteAdj[int(b[0])%len(inviteAdj)]
+	noun := inviteNoun[int(b[1])%len(inviteNoun)]
+	num := 10 + int(b[2])%80
+	return fmt.Sprintf("%s-%s-%02d", adj, noun, num)
+}
+
+// ---- LIST USERS ---------------------------------------------------------
+
+func listUsersCommand(m Model) (string, tea.Cmd) {
+	if m.role != "admin" {
+		return "%VAX-BBS-F-PRIV, Insufficient privilege for LIST USERS.", nil
+	}
+	users, err := m.db.ListAllUsers()
+	if err != nil {
+		return fmt.Sprintf("%%VAX-BBS-E-LISTUSERS, %v", err), nil
+	}
+	if len(users) == 0 {
+		return "No accounts found.", nil
+	}
+
+	var sb strings.Builder
+	sb.WriteString(fmt.Sprintf("\n  %-20s  %-9s  %-9s  %s\n", "Username", "Role", "Status", "Last Login"))
+	sb.WriteString(fmt.Sprintf("  %-20s  %-9s  %-9s  %s\n", "--------", "----", "------", "----------"))
+	for _, u := range users {
+		lastLogin := "never"
+		if u.LastLoginAt.Valid {
+			lastLogin = u.LastLoginAt.Time.Format("02-Jan-2006")
+		}
+		status := u.Status
+		if u.BannedUntil.Valid {
+			if u.BannedUntil.Time.Year() >= 2090 {
+				status = "banned(perm)"
+			} else {
+				status = "banned"
+			}
+		}
+		if u.LockedUntil.Valid && time.Now().Before(u.LockedUntil.Time) {
+			status = "locked"
+		}
+		sb.WriteString(fmt.Sprintf("  %-20s  %-9s  %-9s  %s\n", u.Username, u.Role, status, lastLogin))
+	}
+	sb.WriteString(fmt.Sprintf("\n  %d account(s) total.", len(users)))
+	return sb.String(), nil
+}
+
+// ---- DELETE USER --------------------------------------------------------
+
+func deleteUserUsage(m Model) (string, tea.Cmd) {
+	return "Usage: DELETE USER <username>  — permanently remove an account", nil
+}
+
+func deleteUserCommand(m Model, username string) (string, tea.Cmd) {
+	if m.role != "admin" {
+		return "%VAX-BBS-F-PRIV, Insufficient privilege for DELETE USER.", nil
+	}
+	if username == "" {
+		return deleteUserUsage(m)
+	}
+	// Safety check: don't let an admin delete themselves.
+	if strings.EqualFold(username, m.username) {
+		return "%VAX-BBS-E-SELF, Cannot DELETE USER on your own account.", nil
+	}
+	// Kick the user if they're currently connected.
+	_ = m.reg.Kick(username) // ignore "not online" errors
+	if err := m.db.DeleteUser(username); err != nil {
+		if errors.Is(err, store.ErrNotFound) {
+			return fmt.Sprintf("%%VAX-BBS-E-NOUSER, User '%s' not found.", username), nil
+		}
+		return fmt.Sprintf("%%VAX-BBS-E-DELETE, %v", err), nil
+	}
+	return fmt.Sprintf("%%VAX-BBS-S-DELETED, Account '%s' has been permanently deleted.", username), nil
+}
+
+// ---- PURGE PENDING ------------------------------------------------------
+
+func purgePendingCommand(m Model) (string, tea.Cmd) {
+	if m.role != "admin" {
+		return "%VAX-BBS-F-PRIV, Insufficient privilege for PURGE PENDING.", nil
+	}
+	n, err := m.db.PurgeExpiredPendingAccounts(m.pendingExpiry)
+	if err != nil {
+		return fmt.Sprintf("%%VAX-BBS-E-PURGE, %v", err), nil
+	}
+	if m.pendingExpiry == 0 {
+		return "%VAX-BBS-W-PURGE, PENDING_EXPIRY_DAYS is 0 — auto-expiry is disabled; nothing to purge.", nil
+	}
+	if n == 0 {
+		return "%VAX-BBS-I-PURGE, No expired pending accounts found.", nil
+	}
+	return fmt.Sprintf("%%VAX-BBS-S-PURGE, Purged %d expired pending account(s).", n), nil
 }

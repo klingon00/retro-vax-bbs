@@ -14,11 +14,12 @@ import (
 type EventType int
 
 const (
-	EventRing    EventType = iota // incoming call — answer or reject
-	EventHangup                   // caller hung up before answer, or mid-call
-	EventReject                   // callee explicitly rejected the call
-	EventAnswer                   // callee answered — call is now live
-	EventRinging                  // advisory: someone in the call is ringing another user
+	EventRing        EventType = iota // incoming call — answer or reject
+	EventHangup                       // caller hung up before answer, or mid-call
+	EventReject                       // callee explicitly rejected the call
+	EventAnswer                       // callee answered — call is now live
+	EventRinging                      // advisory: someone in the call is ringing another user
+	EventAdminNotify                  // one-shot notification delivered to admin lobby sessions
 )
 
 // PhoneEvent is sent over a session's Notify channel when something
@@ -44,6 +45,10 @@ type entry struct {
 	// Buffered so senders don't block. Created when the first session
 	// registers; all concurrent sessions for the same user share it.
 	notify chan PhoneEvent
+
+	// kick, when non-nil, terminates the user's active SSH session.
+	// Set by sessionMiddleware; used by the KICK admin command.
+	kick func()
 }
 
 // SessionView is a display-ready snapshot of one account's presence.
@@ -171,4 +176,49 @@ func (r *Registry) Get(username string) (SessionView, bool) {
 		Count:      e.count,
 		CurrentApp: e.currentApp,
 	}, true
+}
+
+// SetKick stores a function that terminates the given user's active SSH
+// session. Called by sessionMiddleware when a session starts; the stored
+// function calls ssh.Session.Exit(0) on the underlying connection.
+func (r *Registry) SetKick(username string, kick func()) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if e, ok := r.sessions[username]; ok {
+		e.kick = kick
+	}
+}
+
+// Kick calls the stored kick function for username, forcibly closing their
+// SSH session. Returns true if a session was found and kicked.
+func (r *Registry) Kick(username string) bool {
+	r.mu.RLock()
+	e, ok := r.sessions[username]
+	var kick func()
+	if ok {
+		kick = e.kick
+	}
+	r.mu.RUnlock()
+	if kick != nil {
+		kick()
+		return true
+	}
+	return false
+}
+
+// NotifyAdmins sends a PhoneEvent to every connected admin session.
+// Used to push registration and other admin-relevant notifications
+// to the lobby without requiring admins to poll.
+func (r *Registry) NotifyAdmins(event PhoneEvent) {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	for _, e := range r.sessions {
+		if e.role != "admin" || e.notify == nil {
+			continue
+		}
+		select {
+		case e.notify <- event:
+		default: // don't block if admin channel is full
+		}
+	}
 }

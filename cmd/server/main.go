@@ -20,6 +20,7 @@ import (
 	"os"
 	"os/signal"
 	"strconv"
+	"strings"
 	"syscall"
 	"time"
 
@@ -35,6 +36,7 @@ import (
 	"github.com/klingon00/retro-vax-bbs/internal/auth"
 	"github.com/klingon00/retro-vax-bbs/internal/lobby"
 	"github.com/klingon00/retro-vax-bbs/internal/phone"
+	"github.com/klingon00/retro-vax-bbs/internal/registration"
 	"github.com/klingon00/retro-vax-bbs/internal/registry"
 	"github.com/klingon00/retro-vax-bbs/internal/store"
 )
@@ -54,6 +56,7 @@ type contextKey string
 const (
 	roleKey     contextKey = "role"
 	authDoneKey contextKey = "authDone"
+	regModeKey  contextKey = "regMode" // set when username=="new"
 )
 
 type config struct {
@@ -72,9 +75,26 @@ type config struct {
 	// authenticated there is no idle timeout, so users can remain
 	// connected waiting for friends indefinitely.
 	authTimeoutSecs int
+
+	// registrationMode controls self-service account creation.
+	// "closed"              — admin creates all accounts via cmd/adduser.
+	// "invite-only"         — user SSHs as "new", provides invite code; account activates immediately.
+	// "open-with-approval"  — user SSHs as "new", account sits pending until admin APPROVEs.
+	registrationMode string
+
+	// pendingExpiryDays: pending accounts older than this are auto-deleted
+	// to prevent username squatting. 0 = never expire.
+	pendingExpiryDays int
 }
 
 func loadConfig() config {
+	regMode := envOr("REGISTRATION_MODE", "closed")
+	switch regMode {
+	case "closed", "invite-only", "open-with-approval":
+	default:
+		log.Printf("config: unknown REGISTRATION_MODE %q, defaulting to 'closed'", regMode)
+		regMode = "closed"
+	}
 	c := config{
 		publicHost:         envOr("SSH_HOST", "localhost"),
 		publicPort:         envOr("SSH_PORT", "2222"),
@@ -84,12 +104,14 @@ func loadConfig() config {
 		rateLimitBurst:     envInt("RATELIMIT_BURST", 5),
 		rateLimitMaxIPs:    envInt("RATELIMIT_MAX_IPS", 1000),
 		authTimeoutSecs:    envInt("AUTH_TIMEOUT_SECONDS", 120),
+		registrationMode:   regMode,
+		pendingExpiryDays:  envInt("PENDING_EXPIRY_DAYS", 7),
 	}
-	log.Printf("config: public=%s admin=%s ratelimit=%.1f/min burst=%d maxIPs=%d authTimeout=%ds",
+	log.Printf("config: public=%s admin=%s ratelimit=%.1f/min burst=%d maxIPs=%d authTimeout=%ds registration=%s pendingExpiry=%dd",
 		net.JoinHostPort(c.publicHost, c.publicPort),
 		net.JoinHostPort(c.adminHost, c.adminPort),
 		c.rateLimitPerMinute, c.rateLimitBurst, c.rateLimitMaxIPs,
-		c.authTimeoutSecs)
+		c.authTimeoutSecs, c.registrationMode, c.pendingExpiryDays)
 	return c
 }
 
@@ -106,6 +128,34 @@ func main() {
 	globalDB = db
 	globalReg = reg
 	globalCalls = phone.NewCalls(reg)
+	globalRegMode = cfg.registrationMode
+	if cfg.pendingExpiryDays > 0 {
+		globalPendingExpiry = time.Duration(cfg.pendingExpiryDays) * 24 * time.Hour
+	}
+
+	// Wire the password hashing function into the registration package so
+	// it can hash passwords without a direct import of internal/auth.
+	registration.SetHashFn(auth.HashPassword)
+
+	// Purge expired pending accounts at startup, then every 6 hours.
+	if globalPendingExpiry > 0 {
+		if n, err := db.PurgeExpiredPendingAccounts(globalPendingExpiry); err != nil {
+			log.Printf("startup: purge expired pending accounts: %v", err)
+		} else if n > 0 {
+			log.Printf("startup: purged %d expired pending account(s)", n)
+		}
+		go func() {
+			t := time.NewTicker(6 * time.Hour)
+			defer t.Stop()
+			for range t.C {
+				if n, err := db.PurgeExpiredPendingAccounts(globalPendingExpiry); err != nil {
+					log.Printf("periodic purge: %v", err)
+				} else if n > 0 {
+					log.Printf("periodic purge: removed %d expired pending account(s)", n)
+				}
+			}
+		}()
+	}
 
 	publicLimiter := newLimiter(cfg)
 	adminLimiter := newLimiter(cfg)
@@ -123,7 +173,7 @@ func main() {
 	publicOpts := []ssh.Option{
 		wish.WithAddress(net.JoinHostPort(cfg.publicHost, cfg.publicPort)),
 		wish.WithHostKeyPath(hostKeyPath),
-		wish.WithPasswordAuth(publicPasswordHandler(db)),
+		wish.WithPasswordAuth(publicPasswordHandler(db, cfg.registrationMode)),
 		wish.WithMiddleware(
 			bm.Middleware(teaHandler),
 			sessionMW,
@@ -204,19 +254,24 @@ func main() {
 func sessionMiddleware(db *store.Store, reg *registry.Registry) wish.Middleware {
 	return func(next ssh.Handler) ssh.Handler {
 		return func(s ssh.Session) {
+			// Registration sessions connect as "new" — no DB account exists yet.
+			// Just run the handler; teaHandler routes them to the registration TUI.
+			if strings.EqualFold(s.User(), "new") {
+				next(s)
+				return
+			}
+
 			user, err := db.GetUserByUsername(s.User())
 			if err != nil {
-				// Shouldn't happen — auth already verified this user —
-				// but degrade gracefully rather than refusing the session.
 				log.Printf("session middleware: could not look up %q: %v", s.User(), err)
 				next(s)
 				return
 			}
-			// Store role in ssh.Context so teaHandler can build the
-			// lobby model without a second DB lookup.
 			s.Context().SetValue(roleKey, user.Role)
 
 			reg.Register(s.User(), user.Role, user.AdminVisible, "LOBBY")
+			// Store a kick function so admin KICK command can close this session.
+			reg.SetKick(s.User(), func() { s.Exit(0) })
 			defer reg.Unregister(s.User())
 			next(s)
 		}
@@ -233,24 +288,19 @@ func teaHandler(s ssh.Session) (tea.Model, []tea.ProgramOption) {
 		return nil, nil
 	}
 
-	role, _ := s.Context().Value(roleKey).(string)
-	if role == "" {
-		role = "user" // safe default; sessionMiddleware should always set this
+	// Registration flow: username "new" was authenticated as a guest.
+	// Use inline rendering (no alt screen) — simpler for a sequential
+	// prompt form and avoids the BubbleTea v1.x sacrifice-line issue.
+	if regMode, ok := s.Context().Value(regModeKey).(string); ok && regMode != "" {
+		m := registration.New(regMode, globalDB, globalReg, globalPendingExpiry)
+		return m, nil
 	}
 
-	// reg is captured from main's scope via the closure over sessionMW.
-	// This works because teaHandler is defined inside the outer scope
-	// that has access to reg... except Go closures capture variables, not
-	// values. Since teaHandler is a package-level function here, we need
-	// a different approach.
-	//
-	// The registry is passed via a package-level variable set in main.
-	// This is the one deliberate exception to the "no package-level state"
-	// rule — the registry IS the shared state, and making it available
-	// to teaHandler without a package-level variable would require
-	// restructuring main into a struct, which is more complexity than
-	// the clarity it would bring at this scale.
-	m := lobby.New(s.User(), role, globalReg, globalDB, globalCalls, s)
+	role, _ := s.Context().Value(roleKey).(string)
+	if role == "" {
+		role = "user"
+	}
+	m := lobby.New(s.User(), role, globalReg, globalDB, globalCalls, s, globalPendingExpiry)
 	return m, []tea.ProgramOption{tea.WithAltScreen()}
 }
 
@@ -262,9 +312,11 @@ func teaHandler(s ssh.Session) (tea.Model, []tea.ProgramOption) {
 // Both database/sql and the Registry are safe for concurrent use from
 // multiple goroutines.
 var (
-	globalDB    *store.Store
-	globalReg   *registry.Registry
-	globalCalls *phone.Calls
+	globalDB            *store.Store
+	globalReg           *registry.Registry
+	globalCalls         *phone.Calls
+	globalRegMode       string        // "closed", "invite-only", or "open-with-approval"
+	globalPendingExpiry time.Duration // 0 = never auto-expire pending accounts
 )
 
 func newLimiter(cfg config) rl.RateLimiter {
@@ -325,9 +377,22 @@ func preAuthTimeout(d time.Duration) ssh.Option {
 	}
 }
 
-func publicPasswordHandler(db *store.Store) ssh.PasswordHandler {
+func publicPasswordHandler(db *store.Store, regMode string) ssh.PasswordHandler {
 	return func(ctx ssh.Context, password string) bool {
 		username := ctx.User()
+
+		// "new" is the registration entry point. Accept it when registration
+		// is not closed; store the mode for teaHandler to pick up.
+		if strings.EqualFold(username, "new") {
+			if regMode == "closed" {
+				log.Printf("public auth: registration rejected (closed mode) from %s", ctx.RemoteAddr())
+				return false
+			}
+			ctx.SetValue(regModeKey, regMode)
+			log.Printf("public auth: registration from %s (mode=%s)", ctx.RemoteAddr(), regMode)
+			return true
+		}
+
 		user, err := db.GetUserByUsername(username)
 		if errors.Is(err, store.ErrNotFound) {
 			_, _ = auth.VerifyPassword(password, dummyHash)
@@ -343,6 +408,12 @@ func publicPasswordHandler(db *store.Store) ssh.PasswordHandler {
 			log.Printf("public auth failure: admin account %q rejected on public listener from %s",
 				username, ctx.RemoteAddr())
 			return false
+		}
+		// Auto-lift expired timed bans before normal auth proceeds.
+		if user.Status == "suspended" {
+			if lifted, _ := db.CheckAndLiftExpiredBan(user.ID); lifted {
+				user.Status = "active"
+			}
 		}
 		return completeAuth(db, user, password, "public", ctx)
 	}
@@ -366,6 +437,11 @@ func adminPasswordHandler(db *store.Store) ssh.PasswordHandler {
 			log.Printf("admin auth failure: non-admin account %q rejected on admin listener from %s",
 				username, ctx.RemoteAddr())
 			return false
+		}
+		if user.Status == "suspended" {
+			if lifted, _ := db.CheckAndLiftExpiredBan(user.ID); lifted {
+				user.Status = "active"
+			}
 		}
 		return completeAuth(db, user, password, "admin", ctx)
 	}

@@ -29,11 +29,12 @@ type phoneRingMsg struct {
 // When activeApp is non-nil, all input and rendering is delegated to it;
 // the lobby resumes when activeApp.Done() returns true.
 type Model struct {
-	username string
-	role     string
-	reg      *registry.Registry
-	db       *store.Store
-	calls    *phone.Calls
+	username      string
+	role          string
+	reg           *registry.Registry
+	db            *store.Store
+	calls         *phone.Calls
+	pendingExpiry time.Duration // for PURGE PENDING; 0 = disabled
 
 	// out is the SSH session's output writer, used for direct terminal
 	// writes that must bypass BubbleTea's renderer (e.g. the bell character).
@@ -49,16 +50,32 @@ type Model struct {
 }
 
 // New returns a fresh lobby Model for the authenticated session.
-func New(username, role string, reg *registry.Registry, db *store.Store, calls *phone.Calls, out io.Writer) Model {
+func New(username, role string, reg *registry.Registry, db *store.Store, calls *phone.Calls, out io.Writer, pendingExpiry time.Duration) Model {
 	return Model{
-		username: username,
-		role:     role,
-		reg:      reg,
-		db:       db,
-		calls:    calls,
-		out:      out,
-		history:  []string{fmt.Sprintf("Welcome, %s. Type HELP for a list of commands.", username)},
+		username:      username,
+		role:          role,
+		reg:           reg,
+		db:            db,
+		calls:         calls,
+		out:           out,
+		pendingExpiry: pendingExpiry,
+		history:       buildWelcome(username, role, db),
 	}
+}
+
+// buildWelcome constructs the initial history for a new session.
+// Admins additionally see a count of pending registrations if any exist.
+func buildWelcome(username, role string, db *store.Store) []string {
+	msgs := []string{fmt.Sprintf("Welcome, %s. Type HELP for a list of commands.", username)}
+	if role == "admin" && db != nil {
+		if n, err := db.CountPendingAccounts(); err == nil && n > 0 {
+			msgs = append(msgs,
+				fmt.Sprintf("%%VAX-BBS-I-PEND, %d account registration(s) awaiting approval.", n),
+				"  Type LIST PENDING to review.",
+			)
+		}
+	}
+	return msgs
 }
 
 // ringBellCmd writes BEL directly to the SSH session output, bypassing
@@ -201,6 +218,13 @@ func (m Model) handleRing(event registry.PhoneEvent) (Model, tea.Cmd) {
 		m.pendingCallID = ""
 		m.history = append(m.history,
 			fmt.Sprintf("%%VAX-BBS-I-PHONE, %s cancelled the call.", event.Caller))
+	case registry.EventAdminNotify:
+		// One-shot notification to admin sessions about a new registration.
+		if m.role == "admin" {
+			m.history = append(m.history,
+				fmt.Sprintf("%%VAX-BBS-I-REG, %s has requested an account.", event.Caller),
+				"  Type LIST PENDING to review.")
+		}
 	}
 	return m, nil
 }
