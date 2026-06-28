@@ -59,8 +59,14 @@ This is enforced by **network binding**, not by app-layer IP/CIDR string-matchin
 
 ```mermaid
 flowchart TD
-    A["Connect: SSH handshake"] --> B["Login / Register"]
-    B --> C["Lobby shell (command loop)"]
+    A["Connect: SSH handshake"] --> B{"Username = 'new'?"}
+    B -->|"yes, and registration enabled"| R["Registration TUI"]
+    B -->|"no"| Auth["Verify credentials (argon2id)"]
+    R -->|"invite-only: code accepted"| Active["Active account"]
+    R -->|"open-with-approval: submitted"| Pend["Pending: admin reviews"]
+    Pend -->|"admin APPROVE"| Active
+    Auth --> C["Lobby shell (command loop)"]
+    Active --> Auth
     C -->|"WHO, FINGER, PHONE, etc. all return here"| C
     C --> D["Logout"]
 ```
@@ -77,25 +83,27 @@ Apps (PHONE first, mail and a text game planned) implement a common lifecycle co
 
 ## Account & registration
 
-**Registration mode is a deploy-time config choice**, not hardcoded — supports different operator risk tolerances:
-- `invite-only` — requires a code (see below)
-- `open-with-approval` — anyone can request an account; no code needed; admin manually approves
-- `closed` — admin creates every account directly; no self-service at all
+**Registration mode is a deploy-time config choice** (`REGISTRATION_MODE` env var), not hardcoded — supports different operator risk tolerances:
+- `closed` (default) — admin creates every account directly via `cmd/adduser`; no self-service at all
+- `invite-only` — user SSHs in as `new`, enters a username, invite code, and password; account activates immediately
+- `open-with-approval` — user SSHs in as `new`, submits a request (username, optional email, password); admin manually approves
 
 **Registration flow:**
 
 ```mermaid
 flowchart TD
-    A["Username prompt"] -->|"existing user"| B["Verify credentials (password or SSH key)"]
-    A -->|"NEW"| C["Invite code (if invite-only) + registration"]
-    C --> D["Pending: admin reviews"]
-    D -->|"admin APPROVE"| E["First login: set password"]
-    B --> F["Lobby shell"]
-    E --> F
+    A["SSH as 'new'"] --> B{"Mode?"}
+    B -->|"invite-only"| C["Enter username + invite code + password"]
+    B -->|"open-with-approval"| D["Enter username + email (optional) + password"]
+    C -->|"valid code"| Active["Account active — log in now"]
+    D --> Pend["Pending: admin reviews via LIST PENDING"]
+    Pend -->|"APPROVE username"| Active
+    Pend -->|"REJECT USER username"| Gone["Request deleted"]
 ```
 
-- **Invite codes** (when used): short, human-typeable (word-pair style, e.g. `tackle-otter-42`, not a hex string), multi-use, expiring, generated via an admin command (`INVITE CREATE --uses N --expires Nd`).
-- New account → `pending` status → admin `APPROVE`/`REJECT` → first login sets password.
+- **Invite codes:** short and human-typeable (`adjective-noun-NN` format, e.g. `swift-oak-42`), generated with `crypto/rand`, multi-use, optionally expiring. Generated via `INVITE CREATE [N] [duration]`; listed via `LIST INVITES`.
+- **Password set during registration**, not deferred to first login.
+- **Pending accounts auto-expire** after `PENDING_EXPIRY_DAYS` (default 7 days) to prevent username squatting. Admins can also `REJECT USER` or `DELETE USER` immediately to free a name.
 - Existing account → password (argon2id) or registered SSH public key.
 - **SSH key upgrade (optional, opt-in):** `SET KEY` registers a public key against an account; future connections skip the password prompt entirely if the key matches. Off by default, available to anyone who wants it.
 
@@ -118,7 +126,7 @@ flowchart TD
 - **Admin accounts are invisible by default** in both `WHO` (the browsable list) and `FINGER <user>` (a direct, targeted lookup) — hiding only from `WHO` and not `FINGER` would leak existence the moment someone guesses/knows the username, so both are covered.
   - **Exception:** admins are always visible to other admins.
   - **Opt-in:** an individual admin account can run `SET VISIBLE` to be discoverable (e.g., a sysop who wants people to know they're around to help). Not the typical case.
-- **All admin actions are always logged** with the real account name — `APPROVE`, `REJECT`, `KICK`, `BAN`, `UNLOCK` — regardless of that account's visibility setting. Invisibility is about presence-browsing for regular users, not about accountability.
+- **All admin actions are always logged** with the real account name — `APPROVE`, `REJECT`, `KICK`, `BAN`, `UNLOCK`, `DELETE USER` — regardless of that account's visibility setting. Invisibility is about presence-browsing for regular users, not about accountability.
 
 ---
 
@@ -129,21 +137,23 @@ flowchart TD
 
 ---
 
-## Schema sketch (SQLite)
+## Schema (SQLite)
 
 ```sql
 users (
   id INTEGER PRIMARY KEY,
   username TEXT UNIQUE NOT NULL,
-  password_hash TEXT,            -- null until first login post-approval
-  ssh_pubkey TEXT,                -- null until SET KEY
-  status TEXT NOT NULL,           -- pending | active | suspended
+  password_hash TEXT,              -- set during registration
+  ssh_pubkey TEXT,                  -- null until SET KEY
+  email TEXT,                       -- optional; used for open-with-approval
+  status TEXT NOT NULL,             -- pending | active | suspended
   role TEXT NOT NULL DEFAULT 'user',
-  plan_text TEXT,                 -- FINGER profile blurb
+  plan_text TEXT,                   -- FINGER profile blurb
   color_opt_in BOOLEAN DEFAULT 0,
-  admin_visible BOOLEAN DEFAULT 0, -- only meaningful when role = 'admin'
+  admin_visible BOOLEAN DEFAULT 0,  -- only meaningful when role = 'admin'
   failed_attempts INTEGER DEFAULT 0,
   locked_until DATETIME,
+  banned_until DATETIME,            -- NULL = not banned; year 2099 = permanent
   created_at DATETIME,
   last_login_at DATETIME
 );
@@ -152,17 +162,21 @@ invites (
   code TEXT PRIMARY KEY,
   created_by INTEGER REFERENCES users(id),
   uses_remaining INTEGER,
-  expires_at DATETIME
+  expires_at DATETIME               -- year 2099 = no expiry
 );
 ```
+
+Schema migrations run automatically at startup using `ALTER TABLE ADD COLUMN` (additive only, idempotent).
 
 ---
 
 ## v1 command set (lobby)
 
-`HELP`, `WHO`, `FINGER <user>`, `PHONE` (first app), `SET` (plan text, color opt-in, admin visibility), `PASSWORD`, `LOGOUT`, `NEW` (registration).
+**User commands:** `HELP`, `WHO` / `SHOW USERS`, `FINGER <user>` / `SHOW USER <user>`, `TIME` / `SHOW TIME`, `PHONE` / `PHONE <user>` / `DIAL <user>`, `PASSWORD`, `LOGOUT`.
 
-Admin-only: `APPROVE`, `REJECT`, `KICK`, `BAN`, `UNLOCK`, `INVITE CREATE`.
+**Admin-only commands:** `LIST PENDING`, `LIST USERS`, `LIST INVITES`, `APPROVE <user>`, `REJECT USER <user>`, `DELETE USER <user>`, `KICK <user>`, `BAN <user> <duration>`, `UNBAN <user>`, `UNLOCK <user>`, `INVITE CREATE [N] [duration]`, `PURGE PENDING`.
+
+**Planned user commands:** `SET PLAN` (FINGER blurb), `SET KEY` (SSH public key), `SET COLOR` (opt-in color), `SET VISIBLE` (admin visibility opt-in).
 
 **Nice-to-have, low effort:** VAX/VMS-style command abbreviation — typing the shortest unambiguous prefix of a command works, just like classic DCL.
 
@@ -172,6 +186,7 @@ Admin-only: `APPROVE`, `REJECT`, `KICK`, `BAN`, `UNLOCK`, `INVITE CREATE`.
 
 - Verbs mirror the original: `DIAL`, `ANSWER`, `HANGUP`, `ADD` (multi-party).
 - Split-pane, character-echo live chat — robust to terminal resize via Bubble Tea's `WindowSizeMsg`.
+- Multi-party from the start: `ADD <username>` adds participants to an active call; viewport layout divides screen height among N participants.
 - **Color/emphasis (future, not v1):** opt-in on both ends — renders only if the sender opted in to send it *and* the receiver opted in to receive it. Never breaks the experience of someone who hasn't opted in.
 
 ---
@@ -192,7 +207,8 @@ Admin-only: `APPROVE`, `REJECT`, `KICK`, `BAN`, `UNLOCK`, `INVITE CREATE`.
 - ASCII color/emphasis terminal options (see PHONE section above — opt-in both ends, always optional)
 - External notification hooks (webhook/ntfy-style "X is online" pings) — subscribe model, opt-in; reserve the hook point in the login/presence code path now even though not built
 - CIDR-based admin IP allowlist, as a documented complement/alternative to the dual-listener split
+- SSH public key auth (`SET KEY`) — schema column exists, auth path not yet wired
 
 ---
 
-*See the companion notes doc for open questions, unresolved details, and stretch-goal scoping not yet locked in.*
+*See `docs/open-questions.md` for implementation notes, hard-won discoveries, and the running build log. See `docs/admin-guide.md` for operator documentation.*

@@ -4,7 +4,8 @@ A modern, self-hosted, retro VAX/VMS-style multi-user shell, built on
 `wish` + `bubbletea` + `lipgloss` over SSH. See `docs/design-doc.md` and
 `docs/open-questions.md` for the full architecture and decision history —
 keep those up to date as design decisions get made; this README is just
-the "how do I run this" doc.
+the "how do I run this" doc. For operating a live instance, see
+`docs/admin-guide.md`.
 
 ## What this is (and isn't)
 
@@ -27,17 +28,19 @@ Per the build order in `docs/open-questions.md`:
 
 - [x] Project scaffolding
 - [x] Lobby shell / command dispatcher
-- [ ] Account & auth
+- [x] Account & auth
   - [x] SQLite schema + argon2id password hashing
   - [x] Closed-mode (admin-created) accounts + real `wish` login auth
-  - [ ] Registration modes (invite-only / open-with-approval)
+  - [x] Registration modes (invite-only / open-with-approval)
   - [x] Account lockout
   - [x] Per-IP rate limiting
 - [x] Dual-listener split (public / admin)
-- [ ] `WHO` / `FINGER`
+- [x] `WHO` / `FINGER`
   - [x] `WHO` (registry-backed, with alias `SHOW USERS`)
   - [x] `FINGER <user>`
-- [ ] PHONE app
+- [x] PHONE app — v1 complete
+- [x] Admin commands (APPROVE, REJECT, KICK, BAN, UNBAN, UNLOCK, DELETE USER, LIST USERS, LIST PENDING, INVITE CREATE)
+- [ ] SET PLAN
 - [ ] Docker packaging
 
 ## ⚠️ Security status — read before running anywhere but your laptop
@@ -53,9 +56,12 @@ interface) and forward `SSH_PORT` to the internet. Set `ADMIN_HOST` to a
 VPN interface address (WireGuard/Tailscale) and **never** forward
 `ADMIN_PORT` to the internet — the VPN is the gate.
 
+See `docs/admin-guide.md` for the full security hardening checklist and
+deployment guidance.
+
 ## Running it
 
-First, create at least one account:
+For `closed` mode (default), create accounts with `cmd/adduser` first:
 
 ```bash
 # Regular user account
@@ -81,10 +87,15 @@ ssh -p 2222 alice@localhost
 ssh -p 2223 sysop@localhost
 ```
 
-Try `HELP`, `WHO`, `SHOW USERS`, `FINGER <username>`, `TIME`, `SHOW TIME`, `LOGOUT`. Resize
-your terminal mid-session — Bubble Tea picks up `WindowSizeMsg` natively,
-which is the original VAX/VMS terminal-resize problem, solved for free
-by the stack.
+Try `HELP`, `WHO`, `SHOW USERS`, `FINGER <username>`, `TIME`, `SHOW TIME`,
+`PHONE <username>`, `LOGOUT`. Resize your terminal mid-session — Bubble Tea
+picks up `WindowSizeMsg` natively, which is the original VAX/VMS
+terminal-resize problem, solved for free by the stack.
+
+For `invite-only` or `open-with-approval` modes, users SSH in as the
+special username `new` (any password) and are walked through a
+registration TUI. See `docs/admin-guide.md` for full registration mode
+documentation.
 
 The SSH host key is generated on first run at `data/ssh_host_ed25519`
 (0600 permissions, directory created at 0700), and the account database
@@ -105,11 +116,14 @@ defaults for local development:
 | `RATELIMIT_PER_MINUTE` | `1` | New connections per minute per IP |
 | `RATELIMIT_BURST` | `5` | Burst allowance before rate kicks in |
 | `RATELIMIT_MAX_IPS` | `1000` | Number of IPs to track simultaneously |
+| `AUTH_TIMEOUT_SECONDS` | `120` | Seconds before unauthenticated connections are closed (0 to disable) |
+| `REGISTRATION_MODE` | `closed` | Account registration: `closed`, `invite-only`, or `open-with-approval` |
+| `PENDING_EXPIRY_DAYS` | `7` | Days before unreviewed pending accounts are auto-deleted (0 to disable) |
 
 The burst default of 5 is intentional — concurrent sessions from one
-account (e.g. PHONE in one window, mail in another) are a core feature,
-and opening a few sessions in quick succession shouldn't trigger the
-limiter for a legitimate user.
+account (e.g. PHONE in one window, checking WHO in another) are a core
+feature, and opening a few sessions in quick succession shouldn't trigger
+the limiter for a legitimate user.
 
 ## Module path
 
@@ -135,12 +149,14 @@ not yet done.
 ## Project layout
 
 ```
-cmd/server/        — entrypoint: dual SSH listeners, middleware chain, auth wiring
-cmd/adduser/        — CLI tool to seed admin-created accounts (closed registration mode)
-internal/lobby/     — the command-loop shell (Bubble Tea model + dispatch)
-internal/app/       — the modular app interface future apps (PHONE, mail) implement
-internal/auth/       — argon2id password hashing
-internal/registry/  — session registry for WHO (and future PHONE routing)
-internal/store/     — SQLite-backed account persistence
-docs/                — design doc + open questions, copied in for git history
+cmd/server/            — entrypoint: dual SSH listeners, middleware chain, auth wiring
+cmd/adduser/           — CLI tool to seed admin-created accounts (closed registration mode)
+internal/lobby/        — the command-loop shell (Bubble Tea model + dispatch)
+internal/app/          — the modular app interface future apps (PHONE, mail) implement
+internal/auth/         — argon2id password hashing
+internal/phone/        — PHONE app (app.go, call.go, layout.go)
+internal/registration/ — self-service registration TUI (invite-only / open-with-approval)
+internal/registry/     — session registry for WHO and PHONE routing
+internal/store/        — SQLite-backed account and invite persistence
+docs/                  — design doc, open questions, admin guide
 ```

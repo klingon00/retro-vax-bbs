@@ -10,13 +10,11 @@ Companion to the main design doc. This is the "still soft" stuff — things ackn
 - **External notifications** — hook point reserved in the login/presence path, but the actual mechanism (webhook vs. ntfy-style push vs. something else), subscription command syntax, and notification rate-limiting are all undesigned.
 - **Unraid Community Apps template** — not started. XML template, icon, port-mapping documentation, README for the listing: all pending.
 - **CIDR-based admin allowlist** — documented as an alternative/complement to the dual-listener split, not implemented, not required (the listener split is the primary mechanism).
-- **Multi-session `WHO` display** — implemented: concurrent sessions show as "alice  (2 sessions)". Display format confirmed working.
 - **VAX/VMS-style command abbreviation** — agreed as a nice-to-have (shortest unambiguous prefix), not yet scoped into v1 build order.
 - **Argon2id tuning** — rough starting params given (~64MB memory, 3 iterations) but not benchmarked against actual deployment hardware.
 - **Third-party notices file** — license is MIT, all current and planned dependencies are MIT/BSD-3-Clause, but a proper notices file listing each dependency's license hasn't been created yet. Good practice before public/Unraid release.
 - **Lobby HELP expansion** — the lobby HELP command lists commands but gives no usage details. PHONE now has a full in-viewport HELP display; the lobby prompt should get similar treatment eventually.
 - **SET PLAN** — FINGER currently always shows "(no plan set)". Simple one-command addition.
-- **Admin commands** — APPROVE/REJECT/KICK/BAN/UNLOCK are designed but not implemented. Needed for registration modes to be usable.
 - **PHONE: Ctrl-G sender self-bell** — when a user presses Ctrl-G, the bell broadcasts to all *other* participants but the sender doesn't hear their own. One-liner fix: return `tea.Batch(m.ringBellCmd(), ...)` from the Ctrl-G handler. Deferred as minor.
 - **PHONE: mute / do-not-disturb** — bell suppression for ring notifications and Ctrl-G. Future config flag; deferred.
 
@@ -37,10 +35,10 @@ These came up but were intentionally pushed past v1 — don't reopen them withou
 
 - [x] Project scaffolding
 - [x] Lobby shell / command dispatcher
-- [ ] Account & auth
+- [x] Account & auth
   - [x] SQLite schema + argon2id password hashing
   - [x] Closed-mode (admin-created) accounts + real `wish` login auth
-  - [ ] Registration modes (invite-only / open-with-approval)
+  - [x] Registration modes (invite-only / open-with-approval)
   - [x] Account lockout
   - [x] Per-IP rate limiting
 - [x] Dual-listener split (public / admin)
@@ -48,6 +46,8 @@ These came up but were intentionally pushed past v1 — don't reopen them withou
   - [x] `WHO` (real implementation — session registry-backed)
   - [x] `FINGER <user>`
 - [x] PHONE app — **v1 complete** (see implementation notes below)
+- [x] Admin commands — **complete** (see implementation notes below)
+- [ ] SET PLAN
 - [ ] Docker packaging
 
 ---
@@ -118,11 +118,11 @@ Implementation decisions made along the way, worth keeping on record:
   runs (no wasted compute, no counter extension past threshold — extending
   the lock on each attempt past threshold would let an attacker
   permanently lock a real user's account). Counter resets to 0 on
-  successful login. Admin `UNLOCK` command (future) calls
-  `ClearFailedAttempts` to release early. Tested with in-memory SQLite
-  in `internal/store/store_test.go`. Live end-to-end test confirmed:
-  lock triggered at 5th attempt, correct password rejected during lock
-  window, access restored after 15 minutes with counter reset confirmed.
+  successful login. Admin `UNLOCK` command calls `ClearFailedAttempts` to
+  release early. Tested with in-memory SQLite in `internal/store/store_test.go`.
+  Live end-to-end test confirmed: lock triggered at 5th attempt, correct
+  password rejected during lock window, access restored after 15 minutes
+  with counter reset confirmed.
 - **OpenSSH client behavior:** default 3-attempts-per-connection means a
   5-attempt lockout triggers across ~2 SSH invocations, not 5 separate
   connections. Worth knowing for UX reasoning around the lockout
@@ -188,8 +188,8 @@ Implementation decisions made along the way, worth keeping on record:
 - **Argument dispatch added to dispatch().** A prefix-match table
   (`argCommands`) is checked before the exact-match `commands` map.
   `FINGER <username>` and `SHOW USER <username>` are the first entries.
-  Future admin commands (`APPROVE <user>`, `REJECT <user>`, etc.) will
-  use the same mechanism. The `commandHandler` signature is unchanged for
+  Admin commands (`APPROVE <user>`, `REJECT USER <user>`, etc.) use the
+  same mechanism. The `commandHandler` signature is unchanged for
   no-argument commands.
 - **Pre-auth connection timeout implemented** via `ConnCallback` — a
   goroutine races a timer against an "auth done" signal per connection.
@@ -301,19 +301,81 @@ full-screen app launched via the lobby delegation pattern:
   on receipt. Both are handled in `charArrivedMsg` before falling through
   to normal character routing.
 
-## Next concrete steps (as of 2026-06-26)
+## Registration modes — complete (2026-06-27)
 
-Suggested order based on design doc priorities and dependencies:
+- **Three modes** controlled by `REGISTRATION_MODE` env var (default: `closed`).
+  `closed` is unchanged from before. The two new modes share a common
+  entry point: SSHing as the special username `new` (any password) routes
+  the connection to `internal/registration/` instead of the lobby.
 
-1. **Registration modes** — invite-only and open-with-approval. Schema
-   (`invites` table) and config knob already designed. Requires admin
-   commands (APPROVE/REJECT) to be useful. Largest remaining auth feature.
-2. **Admin commands** — APPROVE/REJECT/KICK/BAN/UNLOCK. Blocked on
-   registration modes being meaningful without them.
-3. **SET PLAN** — one command, lets users set their FINGER blurb.
-4. **Lobby HELP expansion** — per-command usage text, modeled on PHONE's
+- **Registration TUI** runs inline (no alt screen), avoiding the
+  sacrifice-line rendering bug. State machine: username → email (optional,
+  open-with-approval only) → email confirm (if email provided) → invite
+  code (invite-only only) → password → password confirm → done. Password
+  fields mask input with `*`. Email is asked twice when provided to catch
+  typos; a mismatch sends the user back to re-enter both copies.
+
+- **invite-only flow:** valid invite code activates the account immediately
+  — no admin approval step. Password is set during registration.
+
+- **open-with-approval flow:** account sits in `pending` status until an
+  admin runs `APPROVE <username>`. The user logs in with the password they
+  chose during registration; there is no "set password on first login" step.
+
+- **Username squatting protection** for open-with-approval: pending accounts
+  auto-expire after `PENDING_EXPIRY_DAYS` (default 7, 0=never). Two
+  mechanisms: `CreatePendingAccount` pre-deletes expired pending accounts
+  with the same username before inserting; `PurgeExpiredPendingAccounts`
+  runs at startup and every 6 hours via a background goroutine. Both use
+  the same expiry window from config.
+
+- **Invite codes** are generated as `adjective-noun-NN` (e.g. `swift-oak-42`)
+  using `crypto/rand` against curated 40-word adjective and noun lists plus
+  a two-digit suffix (10–89), giving ~144,000 possible codes. Format is
+  short and safe to communicate verbally or in a message.
+
+- **Admin notifications:** connected admin lobby sessions receive an
+  `EventAdminNotify` ring event (one-time, no repeat) when a new pending
+  registration arrives. Admin login banner shows pending count if > 0.
+
+## Admin commands — complete (2026-06-27)
+
+All admin commands enforce role via a check inside each handler (not just
+at the dispatch level) and are only reachable on the admin listener anyway.
+All actions are logged with the admin's username.
+
+Commands implemented: `APPROVE <user>`, `REJECT USER <user>`,
+`DELETE USER <user>`, `LIST PENDING`, `LIST USERS`, `UNLOCK <user>`,
+`KICK <user>`, `BAN <user> <duration>`, `UNBAN <user>`,
+`INVITE CREATE [N] [duration]`, `LIST INVITES`, `PURGE PENDING`.
+
+Key implementation notes:
+
+- **KICK** stores a `func()` (calling `s.Exit(0)`) per session in the
+  registry at connect time. `reg.Kick(username)` calls it; the session
+  goroutine sees the connection close and tears down cleanly.
+- **BAN** stores `banned_until` as a datetime. Permanent bans use a
+  sentinel of year 2099 (`NeverExpires()`). Timed bans auto-lift on the
+  user's next login attempt via `CheckAndLiftExpiredBan` in the auth
+  handler — no admin action required for expiry.
+- **DELETE USER** kicks the session first (if online), then hard-deletes
+  the row. Distinct from BAN: the account is gone, the username is free.
+  Self-delete is blocked.
+- **LIST USERS** shows all accounts (pending, active, suspended/banned,
+  locked) with role, effective status, and last login date. "Effective
+  status" derives from the combination of `status`, `banned_until`, and
+  `locked_until` fields so admins see the real picture at a glance.
+- **PURGE PENDING** runs `PurgeExpiredPendingAccounts` on demand using
+  the same expiry window as the background goroutine. Reports the count
+  purged or notes if expiry is disabled.
+
+## Next concrete steps (as of 2026-06-27)
+
+1. **SET PLAN** — one command, lets users set their FINGER blurb. Simple
+   store update + lobby command; no new architecture needed.
+2. **Lobby HELP expansion** — per-command usage text, modeled on PHONE's
    in-viewport HELP display.
-5. **VAX/VMS command abbreviation** — shortest unambiguous prefix (DCL
+3. **VAX/VMS command abbreviation** — shortest unambiguous prefix (DCL
    style). Nice-to-have, non-blocking.
-6. **Docker packaging** — straightforward given the single-binary build.
+4. **Docker packaging** — straightforward given the single-binary build.
    Required before any Unraid Community Apps work.
