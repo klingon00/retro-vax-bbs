@@ -12,6 +12,7 @@ import (
 
 	"github.com/klingon00/retro-vax-bbs/internal/app"
 	"github.com/klingon00/retro-vax-bbs/internal/phone"
+	"github.com/klingon00/retro-vax-bbs/internal/setplan"
 	"github.com/klingon00/retro-vax-bbs/internal/store"
 )
 
@@ -47,6 +48,8 @@ var helpEntries = []struct{ display string }{
 	{"ANSWER                      — answer an incoming call"},
 	{"REJECT                      — decline an incoming call"},
 	{"FINGER <username>           (or: SHOW USER <username>)"},
+	{"SET PLAN                    — edit your FINGER blurb (Ctrl+S to save, Esc to cancel)"},
+	{"SET PLAN CLEAR              — remove your FINGER blurb immediately"},
 	{"HELP"},
 	{"LOGOUT"},
 	{"TIME                        (or: SHOW TIME)"},
@@ -71,6 +74,9 @@ func init() {
 		// DIAL alone shows usage (you must specify a username to dial).
 		"PHONE": phoneOpenCommand,
 		"DIAL":  dialUsage,
+		// SET PLAN commands.
+		"SET PLAN":       setPlanCommand,
+		"SET PLAN CLEAR": setPlanClearCommand,
 		// Admin commands (enforced by role check inside each handler).
 		"LIST PENDING":  listPendingCommand,
 		"LIST USERS":    listUsersCommand,
@@ -269,14 +275,42 @@ func fingerByName(m Model, username string) (string, tea.Cmd) {
 
 	b.WriteString("\nPlan:\n")
 	if user.PlanText.Valid && strings.TrimSpace(user.PlanText.String) != "" {
-		b.WriteString("  ")
-		b.WriteString(user.PlanText.String)
+		cleaned := store.StripANSI(user.PlanText.String)
+		// Indent every line of a multi-line plan, not just the first.
+		indented := "  " + strings.ReplaceAll(cleaned, "\n", "\n  ")
+		b.WriteString(indented)
 		b.WriteString("\n")
 	} else {
 		b.WriteString("  (no plan set)\n")
 	}
 
 	return b.String(), nil
+}
+
+// ---- SET PLAN -----------------------------------------------------------
+
+// setPlanCommand launches the inline SET PLAN editor.
+func setPlanCommand(m Model) (string, tea.Cmd) {
+	if m.db == nil {
+		return "%VAX-BBS-E-NODB, database unavailable.", nil
+	}
+	currentPlan, err := m.db.GetPlan(m.username)
+	if err != nil {
+		return fmt.Sprintf("%%VAX-BBS-E-DBFAIL, could not retrieve plan: %v", err), nil
+	}
+	editor := setplan.NewApp(m.db, m.username, currentPlan, m.width)
+	return "", launchAppCmd(editor)
+}
+
+// setPlanClearCommand removes the user's plan text immediately (no editor).
+func setPlanClearCommand(m Model) (string, tea.Cmd) {
+	if m.db == nil {
+		return "%VAX-BBS-E-NODB, database unavailable.", nil
+	}
+	if err := m.db.ClearPlan(m.username); err != nil {
+		return fmt.Sprintf("%%VAX-BBS-E-DBFAIL, could not clear plan: %v", err), nil
+	}
+	return "%VAX-BBS-S-PLANCLR, Plan cleared.", nil
 }
 
 // phoneUsage handles DIAL or PHONE typed without a username.

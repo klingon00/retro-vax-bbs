@@ -40,7 +40,7 @@ Per the build order in `docs/open-questions.md`:
   - [x] `FINGER <user>`
 - [x] PHONE app — v1 complete
 - [x] Admin commands (APPROVE, REJECT, KICK, BAN, UNBAN, UNLOCK, DELETE USER, LIST USERS, LIST PENDING, INVITE CREATE)
-- [ ] SET PLAN
+- [x] SET PLAN / SET PLAN CLEAR
 - [ ] Docker packaging
 
 ## ⚠️ Security status — read before running anywhere but your laptop
@@ -88,9 +88,9 @@ ssh -p 2223 sysop@localhost
 ```
 
 Try `HELP`, `WHO`, `SHOW USERS`, `FINGER <username>`, `TIME`, `SHOW TIME`,
-`PHONE <username>`, `LOGOUT`. Resize your terminal mid-session — Bubble Tea
-picks up `WindowSizeMsg` natively, which is the original VAX/VMS
-terminal-resize problem, solved for free by the stack.
+`PHONE <username>`, `SET PLAN`, `LOGOUT`. Resize your terminal mid-session
+— Bubble Tea picks up `WindowSizeMsg` natively, which is the original
+VAX/VMS terminal-resize problem, solved for free by the stack.
 
 For `invite-only` or `open-with-approval` modes, users SSH in as the
 special username `new` (any password) and are walked through a
@@ -140,11 +140,11 @@ go build ./...
 ## License
 
 MIT — see `LICENSE`. All current dependencies (Charm's `wish` /
-`bubbletea` / `lipgloss` / `log` / `keygen`, Go's own `golang.org/x/*`
-packages, and `modernc.org/sqlite`) are MIT or BSD-3-Clause; none impose
-any additional obligations. Before public release, consider adding a
-third-party notices file listing dependency licenses — good practice,
-not yet done.
+`bubbletea` / `lipgloss` / `log` / `keygen` / `bubbles`, Go's own
+`golang.org/x/*` packages, and `modernc.org/sqlite`) are MIT or
+BSD-3-Clause; none impose any additional obligations. Before public
+release, consider adding a third-party notices file listing dependency
+licenses — good practice, not yet done.
 
 ## Project layout
 
@@ -157,6 +157,24 @@ internal/auth/         — argon2id password hashing
 internal/phone/        — PHONE app (app.go, call.go, layout.go)
 internal/registration/ — self-service registration TUI (invite-only / open-with-approval)
 internal/registry/     — session registry for WHO and PHONE routing
+internal/setplan/      — SET PLAN inline textarea editor (setplan.go, app.go)
 internal/store/        — SQLite-backed account and invite persistence
 docs/                  — design doc, open questions, admin guide
 ```
+
+## Build convention
+
+All code drops from Claude are applied from the repo root. Zips are built
+with `cd staging-dir && zip -r ../output.zip .` so the archive root
+mirrors the repo root exactly. Apply with:
+
+```bash
+cd ~/code/retro-vax-bbs
+unzip -o ~/Downloads/filename.zip -d .
+go build ./... && go vet ./... && gofmt -l .
+```
+
+For single files: `cp ~/Downloads/filename.go internal/path/filename.go`
+then the same build line. `gofmt -l .` output should be empty; if not,
+run `gofmt -w .` to fix. Claude verifies zip structure with `unzip -l`
+before delivering.

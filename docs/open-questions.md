@@ -14,7 +14,6 @@ Companion to the main design doc. This is the "still soft" stuff — things ackn
 - **Argon2id tuning** — rough starting params given (~64MB memory, 3 iterations) but not benchmarked against actual deployment hardware.
 - **Third-party notices file** — license is MIT, all current and planned dependencies are MIT/BSD-3-Clause, but a proper notices file listing each dependency's license hasn't been created yet. Good practice before public/Unraid release.
 - **Lobby HELP expansion** — the lobby HELP command lists commands but gives no usage details. PHONE now has a full in-viewport HELP display; the lobby prompt should get similar treatment eventually.
-- **SET PLAN** — FINGER currently always shows "(no plan set)". Simple one-command addition.
 - **PHONE: Ctrl-G sender self-bell** — when a user presses Ctrl-G, the bell broadcasts to all *other* participants but the sender doesn't hear their own. One-liner fix: return `tea.Batch(m.ringBellCmd(), ...)` from the Ctrl-G handler. Deferred as minor.
 - **PHONE: mute / do-not-disturb** — bell suppression for ring notifications and Ctrl-G. Future config flag; deferred.
 
@@ -47,7 +46,7 @@ These came up but were intentionally pushed past v1 — don't reopen them withou
   - [x] `FINGER <user>`
 - [x] PHONE app — **v1 complete** (see implementation notes below)
 - [x] Admin commands — **complete** (see implementation notes below)
-- [ ] SET PLAN
+- [x] SET PLAN / SET PLAN CLEAR — **complete** (2026-06-28)
 - [ ] Docker packaging
 
 ---
@@ -182,9 +181,9 @@ Implementation decisions made along the way, worth keeping on record:
 - **FINGER <username> implemented** (also: SHOW USER <username>). Applies the
   same visibility rules as WHO — invisible admins appear nonexistent to
   non-admin viewers. Shows: current connection status (with app and session
-  count from the registry), last login time, and plan text (always "(no plan
-  set)" until SET PLAN is implemented). The store is now passed into
-  `lobby.New()` via `globalDB` for commands that need DB access.
+  count from the registry), last login time, and plan text. The store is
+  now passed into `lobby.New()` via `globalDB` for commands that need DB
+  access.
 - **Argument dispatch added to dispatch().** A prefix-match table
   (`argCommands`) is checked before the exact-match `commands` map.
   `FINGER <username>` and `SHOW USER <username>` are the first entries.
@@ -273,6 +272,9 @@ full-screen app launched via the lobby delegation pattern:
   adding filler blank lines at the bottom of the viewport area to pad to
   exactly `termHeight+1`. See `internal/phone/layout.go` and the filler
   loop in `View()`.
+  **Note for inline apps (SET PLAN, future mail compose):** the sacrifice
+  blank is still needed, but the full-screen height compensation is not —
+  the textarea has a fixed height and doesn't fill the terminal.
 
 - **BubbleTea v1.x cellbuf renderer strips `\a` (BEL).** `\a` embedded
   in the View string is processed as a C0 control by the ANSI parser in
@@ -300,6 +302,15 @@ full-screen app launched via the lobby delegation pattern:
   simultaneously. Similarly, `\f` (form feed) clears the entire viewport
   on receipt. Both are handled in `charArrivedMsg` before falling through
   to normal character routing.
+
+- **textarea.Focus() must be called before storing in the Model struct.**
+  `Focus()` sets an internal `focus bool` field on the textarea value. If
+  called via a method on an already-stored field (e.g. in `Init()`), it
+  mutates a copy and the stored textarea remains unfocused — input is
+  silently dropped. Fix: call `_ = ta.Focus()` on the local variable in
+  `New()` before assigning it into the Model. The returned `tea.Cmd` is
+  only a cursor-blink starter and can be safely discarded; `Init()`
+  covers blinking with `textarea.Blink`.
 
 ## Registration modes — complete (2026-06-27)
 
@@ -369,13 +380,40 @@ Key implementation notes:
   the same expiry window as the background goroutine. Reports the count
   purged or notes if expiry is disabled.
 
-## Next concrete steps (as of 2026-06-27)
+## SET PLAN — complete (2026-06-28)
 
-1. **SET PLAN** — one command, lets users set their FINGER blurb. Simple
-   store update + lobby command; no new architecture needed.
-2. **Lobby HELP expansion** — per-command usage text, modeled on PHONE's
+- **`SET PLAN`** launches an inline `bubbles/textarea` editor. The user
+  edits their FINGER blurb; Ctrl+S saves, Esc or Ctrl+C cancels. The
+  editor runs inline (no alt screen) via the same `activeApp` delegation
+  mechanism as PHONE, using an `AppAdapter` wrapper in `internal/setplan/`
+  to satisfy the `app.App` interface without coupling the setplan package
+  to the app interface directly.
+
+- **`SET PLAN CLEAR`** removes plan text immediately without opening the
+  editor — useful for a quick wipe.
+
+- **Character limit:** 512 runes, enforced by both the textarea widget
+  (`CharLimit`) and `store.SetPlan` (returns `ErrPlanTooLong`). A live
+  counter (`N/512`) is shown in the editor.
+
+- **Security:** ANSI escape sequences are stripped at both storage time
+  (`store.SetPlan` calls `store.StripANSI`) and display time (FINGER
+  calls `store.StripANSI` before rendering). Belt and suspenders — even
+  data that predates the sanitization is safe to display.
+
+- **New dependency:** `github.com/charmbracelet/bubbles v0.21.0` —
+  provides the `textarea` component. Added with `go get
+  github.com/charmbracelet/bubbles@v0.21.0`.
+
+- **New packages:** `internal/setplan/setplan.go` (Model + editor logic),
+  `internal/setplan/app.go` (AppAdapter satisfying app.App),
+  `internal/store/plan.go` (SetPlan, ClearPlan, GetPlan, StripANSI).
+
+## Next concrete steps (as of 2026-06-28)
+
+1. **Lobby HELP expansion** — per-command usage text, modeled on PHONE's
    in-viewport HELP display.
-3. **VAX/VMS command abbreviation** — shortest unambiguous prefix (DCL
+2. **VAX/VMS command abbreviation** — shortest unambiguous prefix (DCL
    style). Nice-to-have, non-blocking.
-4. **Docker packaging** — straightforward given the single-binary build.
+3. **Docker packaging** — straightforward given the single-binary build.
    Required before any Unraid Community Apps work.

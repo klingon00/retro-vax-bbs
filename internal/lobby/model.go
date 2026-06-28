@@ -16,6 +16,7 @@ import (
 	"github.com/klingon00/retro-vax-bbs/internal/app"
 	"github.com/klingon00/retro-vax-bbs/internal/phone"
 	"github.com/klingon00/retro-vax-bbs/internal/registry"
+	"github.com/klingon00/retro-vax-bbs/internal/setplan"
 	"github.com/klingon00/retro-vax-bbs/internal/store"
 )
 
@@ -120,6 +121,12 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		if updatedApp, ok := updated.(app.App); ok {
 			m.activeApp = updatedApp
 			if m.activeApp.Done() {
+				// Capture SET PLAN status message before clearing activeApp.
+				if sp, ok := m.activeApp.(*setplan.AppAdapter); ok {
+					if sp.StatusMsg() != "" {
+						m.history = append(m.history, sp.StatusMsg())
+					}
+				}
 				m.activeApp = nil
 				// When the phone app exits because of an event (not the
 				// user's own hangup), show context in the lobby history.

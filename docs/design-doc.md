@@ -19,7 +19,7 @@ Designed with eventual public/community release in mind (stretch goal: Unraid Co
 
 ## Tech stack
 
-- **Go**, using Charm's **`wish`** (SSH application framework) + **`bubbletea`** (TUI) + **`lipgloss`** (styling).
+- **Go**, using Charm's **`wish`** (SSH application framework) + **`bubbletea`** (TUI) + **`lipgloss`** (styling) + **`bubbles`** (UI components).
 - **SQLite** for persistence (accounts, invites) — single-binary friendly, no external DB dependency.
 
 **Why this stack:**
@@ -41,6 +41,7 @@ flowchart TD
     AL -->|"refuses non-admin accounts"| L
     L --> WF["WHO / FINGER"]
     L --> PH["PHONE (v1 app)"]
+    L --> SP["SET PLAN (inline editor)"]
     L --> FT["Mail / games (planned)"]
     L --> DB[("SQLite: accounts, invites")]
 ```
@@ -67,17 +68,28 @@ flowchart TD
     Pend -->|"admin APPROVE"| Active
     Auth --> C["Lobby shell (command loop)"]
     Active --> Auth
-    C -->|"WHO, FINGER, PHONE, etc. all return here"| C
+    C -->|"WHO, FINGER, PHONE, SET PLAN, etc. all return here"| C
     C --> D["Logout"]
 ```
 
-The lobby is a closed loop. Every command — including launching an "app" like PHONE — runs and then returns control to the lobby. Nothing exits sideways into a real shell.
+The lobby is a closed loop. Every command — including launching an "app" like PHONE or the SET PLAN editor — runs and then returns control to the lobby. Nothing exits sideways into a real shell.
 
 ---
 
 ## Modular app interface
 
 Apps (PHONE first, mail and a text game planned) implement a common lifecycle contract, mirroring Bubble Tea's own model interface (init / update / render). The lobby pushes an app onto the screen when its command is typed; the app owns the screen until it exits; control returns to the lobby. Getting this interface contract right early matters more than how many apps exist on day one — it's what makes future apps cheap to add without touching lobby code.
+
+The `app.App` interface extends `tea.Model` with a `Done() bool` method:
+
+```go
+type App interface {
+    tea.Model // Init() tea.Cmd, Update(tea.Msg) (tea.Model, tea.Cmd), View() string
+    Done() bool
+}
+```
+
+Apps whose internal Update returns a concrete type (e.g. `setplan.Model`) use a thin `AppAdapter` wrapper to satisfy the interface without coupling packages — see `internal/setplan/app.go`.
 
 ---
 
@@ -148,7 +160,7 @@ users (
   email TEXT,                       -- optional; used for open-with-approval
   status TEXT NOT NULL,             -- pending | active | suspended
   role TEXT NOT NULL DEFAULT 'user',
-  plan_text TEXT,                   -- FINGER profile blurb
+  plan_text TEXT,                   -- FINGER profile blurb; set via SET PLAN
   color_opt_in BOOLEAN DEFAULT 0,
   admin_visible BOOLEAN DEFAULT 0,  -- only meaningful when role = 'admin'
   failed_attempts INTEGER DEFAULT 0,
@@ -172,11 +184,11 @@ Schema migrations run automatically at startup using `ALTER TABLE ADD COLUMN` (a
 
 ## v1 command set (lobby)
 
-**User commands:** `HELP`, `WHO` / `SHOW USERS`, `FINGER <user>` / `SHOW USER <user>`, `TIME` / `SHOW TIME`, `PHONE` / `PHONE <user>` / `DIAL <user>`, `PASSWORD`, `LOGOUT`.
+**User commands:** `HELP`, `WHO` / `SHOW USERS`, `FINGER <user>` / `SHOW USER <user>`, `TIME` / `SHOW TIME`, `PHONE` / `PHONE <user>` / `DIAL <user>`, `SET PLAN`, `SET PLAN CLEAR`, `LOGOUT`.
 
 **Admin-only commands:** `LIST PENDING`, `LIST USERS`, `LIST INVITES`, `APPROVE <user>`, `REJECT USER <user>`, `DELETE USER <user>`, `KICK <user>`, `BAN <user> <duration>`, `UNBAN <user>`, `UNLOCK <user>`, `INVITE CREATE [N] [duration]`, `PURGE PENDING`.
 
-**Planned user commands:** `SET PLAN` (FINGER blurb), `SET KEY` (SSH public key), `SET COLOR` (opt-in color), `SET VISIBLE` (admin visibility opt-in).
+**Planned user commands:** `SET KEY` (SSH public key), `SET COLOR` (opt-in color), `SET VISIBLE` (admin visibility opt-in).
 
 **Nice-to-have, low effort:** VAX/VMS-style command abbreviation — typing the shortest unambiguous prefix of a command works, just like classic DCL.
 
@@ -188,6 +200,19 @@ Schema migrations run automatically at startup using `ALTER TABLE ADD COLUMN` (a
 - Split-pane, character-echo live chat — robust to terminal resize via Bubble Tea's `WindowSizeMsg`.
 - Multi-party from the start: `ADD <username>` adds participants to an active call; viewport layout divides screen height among N participants.
 - **Color/emphasis (future, not v1):** opt-in on both ends — renders only if the sender opted in to send it *and* the receiver opted in to receive it. Never breaks the experience of someone who hasn't opted in.
+
+---
+
+## SET PLAN — inline profile editor
+
+Users set their FINGER blurb with `SET PLAN`, which launches an inline
+`bubbles/textarea` editor (Ctrl+S to save, Esc to cancel). `SET PLAN CLEAR`
+removes the blurb immediately without opening the editor.
+
+Plan text is stored in the `plan_text` column and displayed by `FINGER`.
+ANSI escape sequences are stripped at both storage and display time —
+structural protection against terminal injection, not a runtime filter.
+Character limit: 512 runes.
 
 ---
 
