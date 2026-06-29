@@ -44,10 +44,11 @@ type Model struct {
 	activeApp     app.App // non-nil when inside PHONE (or future apps)
 	pendingCallID string  // call-id of the most recent incoming ring, if any
 
-	input   string
-	history []string
-	width   int
-	height  int
+	input        string
+	history      []string
+	scrollOffset int // lines scrolled back from the bottom; 0 = live/bottom
+	width        int
+	height       int
 }
 
 // New returns a fresh lobby Model for the authenticated session.
@@ -93,26 +94,16 @@ func (m Model) ringBellCmd() tea.Cmd {
 }
 
 func (m Model) Init() tea.Cmd {
-	// Poll for incoming PHONE events (ring notifications) even at the
-	// lobby prompt. The Cmd blocks on the session's notify channel and
-	// fires a phoneRingMsg when an event arrives.
 	return waitForPhoneEvent(m.reg.Events(m.username))
 }
 
 func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
-	// If an app is active, delegate to it. Phone events that arrive via
-	// the lobby's waitForPhoneEvent goroutine are converted to the
-	// phone.PhoneEventMsg type that the app understands, since the lobby
-	// owns the notify channel exclusively (the app does not subscribe
-	// directly — that was the source of a race condition).
+	// If an app is active, delegate to it.
 	if m.activeApp != nil {
 		actualMsg := tea.Msg(msg)
 		var resubscribeCmd tea.Cmd
 
 		if ring, ok := msg.(phoneRingMsg); ok {
-			// Lobby's goroutine consumed an event from the channel.
-			// Convert it for the app and restart our goroutine so we
-			// keep consuming future events while the app is running.
 			actualMsg = phone.PhoneEventMsg{Event: ring.event}
 			resubscribeCmd = waitForPhoneEvent(m.reg.Events(m.username))
 		}
@@ -121,15 +112,12 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		if updatedApp, ok := updated.(app.App); ok {
 			m.activeApp = updatedApp
 			if m.activeApp.Done() {
-				// Capture SET PLAN status message before clearing activeApp.
 				if sp, ok := m.activeApp.(*setplan.AppAdapter); ok {
 					if sp.StatusMsg() != "" {
 						m.history = append(m.history, sp.StatusMsg())
 					}
 				}
 				m.activeApp = nil
-				// When the phone app exits because of an event (not the
-				// user's own hangup), show context in the lobby history.
 				if ring, ok := msg.(phoneRingMsg); ok {
 					switch ring.event.Type {
 					case registry.EventReject:
@@ -137,7 +125,6 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 							fmt.Sprintf("%%VAX-BBS-I-PHONE, %s rejected your call.", ring.event.Callee))
 					case registry.EventHangup:
 						if ring.event.Callee != "" {
-							// Pending call cancelled by caller before we answered.
 							m.history = append(m.history,
 								fmt.Sprintf("%%VAX-BBS-I-PHONE, %s cancelled the call.", ring.event.Caller))
 						}
@@ -157,18 +144,15 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 
 	case launchAppMsg:
 		m.activeApp = msg.app
-		m.pendingCallID = "" // answered or dialed — no longer pending
+		m.pendingCallID = ""
 		return m, m.activeApp.Init()
 
 	case phoneRingMsg:
-		// Someone is calling us at the lobby.
 		var bellCmd tea.Cmd
 		m, bellCmd = m.handleRing(msg.event)
 		return m, tea.Batch(bellCmd, waitForPhoneEvent(m.reg.Events(m.username)))
 
 	case clearLobbyBellMsg:
-		// No-op: bellPending approach was replaced by direct writer; kept to
-		// drain any in-flight msgs from a previous session.
 		return m, nil
 
 	case tea.KeyMsg:
@@ -176,9 +160,37 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		case tea.KeyCtrlC:
 			return m, tea.Quit
 
+		case tea.KeyPgUp:
+			// Scroll back one screenful (leaving one line of overlap for context).
+			m.scrollOffset = m.scrollOffset + m.viewportHeight() - 1
+			// Clamp to available history.
+			flat := flattenHistory(m.history)
+			maxOffset := len(flat) - m.viewportHeight()
+			if maxOffset < 0 {
+				maxOffset = 0
+			}
+			if m.scrollOffset > maxOffset {
+				m.scrollOffset = maxOffset
+			}
+			return m, nil
+
+		case tea.KeyPgDown:
+			// Scroll forward one screenful.
+			m.scrollOffset -= m.viewportHeight() - 1
+			if m.scrollOffset < 0 {
+				m.scrollOffset = 0
+			}
+			return m, nil
+
+		case tea.KeyEnd:
+			// Jump to bottom (most recent output).
+			m.scrollOffset = 0
+			return m, nil
+
 		case tea.KeyEnter:
 			line := m.input
 			m.input = ""
+			m.scrollOffset = 0 // new command output always jumps to bottom
 			if strings.TrimSpace(line) == "" {
 				return m, nil
 			}
@@ -208,7 +220,6 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 }
 
 // handleRing displays an incoming call notification at the lobby.
-// Returns the updated model and a tea.Cmd (ringBellCmd when a bell is needed).
 func (m Model) handleRing(event registry.PhoneEvent) (Model, tea.Cmd) {
 	switch event.Type {
 	case registry.EventRing:
@@ -226,7 +237,6 @@ func (m Model) handleRing(event registry.PhoneEvent) (Model, tea.Cmd) {
 		m.history = append(m.history,
 			fmt.Sprintf("%%VAX-BBS-I-PHONE, %s cancelled the call.", event.Caller))
 	case registry.EventAdminNotify:
-		// One-shot notification to admin sessions about a new registration.
 		if m.role == "admin" {
 			m.history = append(m.history,
 				fmt.Sprintf("%%VAX-BBS-I-REG, %s has requested an account.", event.Caller),
@@ -239,7 +249,32 @@ func (m Model) handleRing(event registry.PhoneEvent) (Model, tea.Cmd) {
 // clearLobbyBellMsg is no longer used — keeping type for any pending msgs in flight.
 type clearLobbyBellMsg struct{}
 
-var promptStyle = lipgloss.NewStyle().Bold(true)
+var (
+	promptStyle    = lipgloss.NewStyle().Bold(true)
+	scrollBarStyle = lipgloss.NewStyle().Faint(true)
+)
+
+// viewportHeight returns the number of lines available for history output.
+// Reserves 1 line for the prompt and 1 for the scroll indicator (when shown).
+func (m Model) viewportHeight() int {
+	h := m.height - 1 // always reserve prompt line
+	if h < 4 {
+		h = 4
+	}
+	return h
+}
+
+// flattenHistory expands history entries (which may contain embedded \n
+// from multi-line command output) into individual display lines.
+// This ensures scroll math is based on rendered line count, not entry count.
+func flattenHistory(history []string) []string {
+	var lines []string
+	for _, entry := range history {
+		parts := strings.Split(entry, "\n")
+		lines = append(lines, parts...)
+	}
+	return lines
+}
 
 func (m Model) View() string {
 	// Delegate to active app if one is running.
@@ -247,12 +282,54 @@ func (m Model) View() string {
 		return m.activeApp.View()
 	}
 
+	flat := flattenHistory(m.history)
+	vh := m.viewportHeight()
+
+	// When scrolled back, reserve one extra line for the scroll indicator.
+	indicatorLine := ""
+	if m.scrollOffset > 0 {
+		vh-- // shrink viewport to make room for indicator at top
+		remaining := len(flat) - vh - m.scrollOffset
+		if remaining < 0 {
+			remaining = 0
+		}
+		indicatorLine = scrollBarStyle.Render(
+			fmt.Sprintf("── scrolled back (%d lines above) ── PgDn / End to return ──", remaining),
+		)
+	}
+
+	// Calculate the window of lines to show.
+	// scrollOffset=0 → show the last vh lines (bottom/live).
+	// scrollOffset=N → show vh lines ending N lines before the bottom.
+	total := len(flat)
+	end := total - m.scrollOffset
+	if end > total {
+		end = total
+	}
+	start := end - vh
+	if start < 0 {
+		start = 0
+	}
+
 	var b strings.Builder
-	for _, line := range m.history {
+
+	if indicatorLine != "" {
+		b.WriteString(indicatorLine)
+		b.WriteString("\n")
+	}
+
+	for _, line := range flat[start:end] {
 		b.WriteString(line)
 		b.WriteString("\n")
 	}
-	b.WriteString(promptStyle.Render("LOBBY>") + " " + m.input + "█")
+
+	// Show prompt only when at the bottom (not scrolled back).
+	if m.scrollOffset == 0 {
+		b.WriteString(promptStyle.Render("LOBBY>") + " " + m.input + "█")
+	} else {
+		b.WriteString(scrollBarStyle.Render("── (scrolling — press End to return to prompt) ──"))
+	}
+
 	return b.String()
 }
 

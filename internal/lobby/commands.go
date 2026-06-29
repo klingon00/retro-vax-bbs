@@ -119,9 +119,9 @@ var adminHelpTopics = []helpTopic{
 		admin: true,
 	},
 	{
-		cmd:   "REJECT USER <username>",
-		usage: "REJECT USER <username>",
-		desc:  "Delete a pending account request; frees the username.",
+		cmd:   "DENY <username>",
+		usage: "DENY <username>",
+		desc:  "Deny a pending account request; frees the username.",
 		admin: true,
 	},
 	{
@@ -295,7 +295,7 @@ func init() {
 		"INVITE":        inviteUsage,
 		"INVITE CREATE": inviteCreateCommand,
 		"APPROVE":       approveUsage,
-		"REJECT USER":   rejectUserUsage,
+		"DENY":          denyUsage,
 		"DELETE USER":   deleteUserUsage,
 		"UNLOCK":        unlockUsage,
 		"KICK":          kickUsage,
@@ -316,7 +316,7 @@ func init() {
 		{"DIAL", phoneDialCommand},
 		// Admin argument commands.
 		{"APPROVE", approveCommand},
-		{"REJECT USER", rejectUserCommand},
+		{"DENY", denyCommand},
 		{"DELETE USER", deleteUserCommand},
 		{"UNLOCK", unlockCommand},
 		{"KICK", kickCommand},
@@ -427,7 +427,7 @@ func helpByTopic(m Model, arg string) (string, tea.Cmd) {
 	}
 
 	// Also check topicDetails keys that belong to admin topics.
-	adminDetailKeys := map[string]bool{"BAN": true, "INVITE": true}
+	adminDetailKeys := map[string]bool{"BAN": true, "INVITE": true, "DENY": true}
 	if adminDetailKeys[upper] {
 		isAdminTopic = true
 	}
@@ -733,13 +733,13 @@ func requireAdmin(m Model) string {
 	return ""
 }
 
-// ---- APPROVE / REJECT USER ----------------------------------------------
+// ---- APPROVE / DENY -----------------------------------------------------
 
 func approveUsage(m Model) (string, tea.Cmd) {
 	return "Usage: APPROVE <username>", nil
 }
-func rejectUserUsage(m Model) (string, tea.Cmd) {
-	return "Usage: REJECT USER <username>", nil
+func denyUsage(m Model) (string, tea.Cmd) {
+	return "Usage: DENY <username>", nil
 }
 
 func approveCommand(m Model, username string) (string, tea.Cmd) {
@@ -755,7 +755,7 @@ func approveCommand(m Model, username string) (string, tea.Cmd) {
 	return fmt.Sprintf("Account '%s' approved. The user may now log in.", username), nil
 }
 
-func rejectUserCommand(m Model, username string) (string, tea.Cmd) {
+func denyCommand(m Model, username string) (string, tea.Cmd) {
 	if e := requireAdmin(m); e != "" {
 		return e, nil
 	}
@@ -763,9 +763,9 @@ func rejectUserCommand(m Model, username string) (string, tea.Cmd) {
 		return "%VAX-BBS-E-NODB, database unavailable.", nil
 	}
 	if err := m.db.RejectPendingAccount(username); err != nil {
-		return fmt.Sprintf("%%VAX-BBS-E-REJECT, %v", err), nil
+		return fmt.Sprintf("%%VAX-BBS-E-DENY, %v", err), nil
 	}
-	return fmt.Sprintf("Account request for '%s' rejected and removed.", username), nil
+	return fmt.Sprintf("Account request for '%s' denied and removed.", username), nil
 }
 
 // ---- LIST PENDING -------------------------------------------------------
@@ -795,7 +795,7 @@ func listPendingCommand(m Model) (string, tea.Cmd) {
 		sb.WriteString(fmt.Sprintf("\n  %-20s  %-30s  %s",
 			u.Username, email, u.CreatedAt.Format("02-Jan-2006 15:04")))
 	}
-	sb.WriteString(fmt.Sprintf("\n\n  %d pending. Use APPROVE <user> or REJECT USER <user>.", len(users)))
+	sb.WriteString(fmt.Sprintf("\n\n  %d pending. Use APPROVE <user> or DENY <user>.", len(users)))
 	return sb.String(), nil
 }
 

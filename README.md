@@ -39,9 +39,10 @@ Per the build order in `docs/open-questions.md`:
   - [x] `WHO` (registry-backed, with alias `SHOW USERS`)
   - [x] `FINGER <user>`
 - [x] PHONE app — v1 complete
-- [x] Admin commands (APPROVE, REJECT, KICK, BAN, UNBAN, UNLOCK, DELETE USER, LIST USERS, LIST PENDING, INVITE CREATE)
+- [x] Admin commands (APPROVE, DENY, KICK, BAN, UNBAN, UNLOCK, DELETE USER, LIST USERS, LIST PENDING, INVITE CREATE)
 - [x] SET PLAN / SET PLAN CLEAR
 - [x] Lobby HELP expansion
+- [x] Lobby scrollback (PgUp / PgDn / End)
 - [ ] Docker packaging
 
 ## ⚠️ Security status — read before running anywhere but your laptop
@@ -162,20 +163,3 @@ internal/setplan/      — SET PLAN inline textarea editor (setplan.go, app.go)
 internal/store/        — SQLite-backed account and invite persistence
 docs/                  — design doc, open questions, admin guide
 ```
-
-## Build convention
-
-All code drops from Claude are applied from the repo root. Zips are built
-with `cd staging-dir && zip -r ../output.zip .` so the archive root
-mirrors the repo root exactly. Apply with:
-
-```bash
-cd ~/code/retro-vax-bbs
-unzip -o ~/Downloads/filename.zip -d .
-go build ./... && go vet ./... && gofmt -l .
-```
-
-For single files: `cp ~/Downloads/filename.go internal/path/filename.go`
-then the same build line. `gofmt -l .` output should be empty; if not,
-run `gofmt -w .` to fix. Claude verifies zip structure with `unzip -l`
-before delivering.
