@@ -41,20 +41,231 @@ var argCommands []struct {
 	handler argCommandHandler
 }
 
-// helpEntries drives the HELP output display. Separate from the dispatch
-var helpEntries = []struct{ display string }{
-	{"PHONE                       — enter phone facility (or: PHONE <username> to dial directly)"},
-	{"DIAL <username>             — place a call (or: PHONE <username>)"},
-	{"ANSWER                      — answer an incoming call"},
-	{"REJECT                      — decline an incoming call"},
-	{"FINGER <username>           (or: SHOW USER <username>)"},
-	{"SET PLAN                    — edit your FINGER blurb (Ctrl+S to save, Esc to cancel)"},
-	{"SET PLAN CLEAR              — remove your FINGER blurb immediately"},
-	{"HELP"},
-	{"LOGOUT"},
-	{"TIME                        (or: SHOW TIME)"},
-	{"WHO                         (or: SHOW USERS)"},
-	{"SHOW <keyword>              (SHOW USER <username>, SHOW USERS, SHOW TIME)"},
+// helpTopic holds usage and description for one command or group.
+type helpTopic struct {
+	cmd   string // canonical command name shown in HELP output
+	usage string // full usage line (empty if cmd is self-describing)
+	desc  string // one-line description
+	admin bool   // true = only shown to admin-role users
+}
+
+// userHelpTopics is the ordered list of user-facing commands shown by HELP.
+var userHelpTopics = []helpTopic{
+	{
+		cmd:   "WHO",
+		usage: "WHO  (or: SHOW USERS)",
+		desc:  "List connected users and their current app.",
+	},
+	{
+		cmd:   "FINGER <username>",
+		usage: "FINGER <username>  (or: SHOW USER <username>)",
+		desc:  "Show a user's status, last login, and plan.",
+	},
+	{
+		cmd:   "TIME",
+		usage: "TIME  (or: SHOW TIME)",
+		desc:  "Display the current server time.",
+	},
+	{
+		cmd:   "PHONE",
+		usage: "PHONE  or  PHONE <username>  or  DIAL <username>",
+		desc:  "Enter the PHONE facility, or dial a user directly. Type HELP inside PHONE for full command list.",
+	},
+	{
+		cmd:   "ANSWER",
+		usage: "ANSWER",
+		desc:  "Answer an incoming call.",
+	},
+	{
+		cmd:   "REJECT",
+		usage: "REJECT",
+		desc:  "Decline an incoming call.",
+	},
+	{
+		cmd:   "SET PLAN",
+		usage: "SET PLAN",
+		desc:  "Open an inline editor to write your FINGER blurb. Ctrl+S saves, Esc cancels.",
+	},
+	{
+		cmd:   "SET PLAN CLEAR",
+		usage: "SET PLAN CLEAR",
+		desc:  "Remove your FINGER blurb immediately without opening the editor.",
+	},
+	{
+		cmd:   "HELP",
+		usage: "HELP  or  HELP <command>",
+		desc:  "Show this list, or detailed usage for a specific command.",
+	},
+	{
+		cmd:   "LOGOUT",
+		usage: "LOGOUT",
+		desc:  "End your session.",
+	},
+}
+
+// adminHelpTopics is the ordered list of admin-only commands shown by HELP
+// when the requesting user has the admin role.
+var adminHelpTopics = []helpTopic{
+	{
+		cmd:   "LIST PENDING",
+		usage: "LIST PENDING",
+		desc:  "Show accounts awaiting approval (open-with-approval mode).",
+		admin: true,
+	},
+	{
+		cmd:   "APPROVE <username>",
+		usage: "APPROVE <username>",
+		desc:  "Activate a pending account.",
+		admin: true,
+	},
+	{
+		cmd:   "REJECT USER <username>",
+		usage: "REJECT USER <username>",
+		desc:  "Delete a pending account request; frees the username.",
+		admin: true,
+	},
+	{
+		cmd:   "LIST USERS",
+		usage: "LIST USERS",
+		desc:  "Show all accounts with role, status, and last login.",
+		admin: true,
+	},
+	{
+		cmd:   "DELETE USER <username>",
+		usage: "DELETE USER <username>",
+		desc:  "Permanently remove an account and free the username.",
+		admin: true,
+	},
+	{
+		cmd:   "KICK <username>",
+		usage: "KICK <username>",
+		desc:  "Disconnect a user's active session immediately. They can reconnect.",
+		admin: true,
+	},
+	{
+		cmd:   "BAN <username> <duration>",
+		usage: "BAN <username> <duration>",
+		desc:  "Suspend an account. Duration: 30s, 15m, 2h, 7d, 2w, perm. Type HELP BAN for details.",
+		admin: true,
+	},
+	{
+		cmd:   "UNBAN <username>",
+		usage: "UNBAN <username>",
+		desc:  "Lift a ban and restore the account to active.",
+		admin: true,
+	},
+	{
+		cmd:   "UNLOCK <username>",
+		usage: "UNLOCK <username>",
+		desc:  "Clear a login lockout (triggered after 5 failed password attempts).",
+		admin: true,
+	},
+	{
+		cmd:   "INVITE CREATE",
+		usage: "INVITE CREATE [uses] [duration]",
+		desc:  "Generate an invite code. e.g. INVITE CREATE 5 7d. Type HELP INVITE for details.",
+		admin: true,
+	},
+	{
+		cmd:   "LIST INVITES",
+		usage: "LIST INVITES",
+		desc:  "Show all invite codes with remaining uses and expiry.",
+		admin: true,
+	},
+	{
+		cmd:   "PURGE PENDING",
+		usage: "PURGE PENDING",
+		desc:  "Immediately purge expired pending accounts (also runs automatically).",
+		admin: true,
+	},
+}
+
+// topicDetails holds extended help text shown by HELP <command>.
+// Keys are uppercased canonical names; values are multi-line detail strings.
+var topicDetails = map[string]string{
+	"BAN": `BAN <username> <duration>
+
+  Suspends an account for the given duration. The user is disconnected
+  immediately if currently online. Timed bans lift automatically on the
+  user's next login attempt after expiry — no admin action needed.
+
+  Duration formats:
+    30s    30 seconds
+    15m    15 minutes
+    2h     2 hours
+    7d     7 days
+    2w     2 weeks
+    perm   Permanent (until UNBAN is run)
+
+  Examples:
+    BAN alice 24h
+    BAN troublemaker perm`,
+
+	"INVITE": `INVITE CREATE [uses] [duration]
+
+  Generates an invite code in the format word-word-NN (e.g. swift-oak-42).
+  Codes are short and safe to share verbally or by message.
+
+  Arguments (both optional):
+    uses      Number of times the code can be used (default: 1)
+    duration  How long until the code expires (same format as BAN)
+
+  Examples:
+    INVITE CREATE              — 1 use, no expiry
+    INVITE CREATE 5            — 5 uses, no expiry
+    INVITE CREATE 3 7d         — 3 uses, expires in 7 days
+    INVITE CREATE 1 24h        — 1 use, expires in 24 hours
+    LIST INVITES               — show all codes and remaining uses`,
+
+	"FINGER": `FINGER <username>  (or: SHOW USER <username>)
+
+  Displays a user's profile:
+    - Current connection status and active app
+    - Last login time
+    - Plan text (set with SET PLAN)
+
+  Invisible admin accounts appear as "no information available" to
+  regular users — same rule as WHO.`,
+
+	"SET PLAN": `SET PLAN
+
+  Opens an inline editor for your FINGER blurb. The editor supports
+  full cursor movement, word navigation, and paste.
+
+    Ctrl+S    Save and return to the lobby
+    Esc       Cancel without saving
+    Ctrl+C    Cancel without saving
+
+  Character limit: 512. A live counter is shown in the editor.
+  Use SET PLAN CLEAR to remove your blurb without opening the editor.`,
+
+	"PHONE": `PHONE  or  PHONE <username>  or  DIAL <username>
+
+  Enters the VAX-BBS PHONE facility.
+
+    PHONE              Open PHONE in idle mode
+    PHONE <username>   Dial a user directly
+    DIAL <username>    Same as PHONE <username>
+
+  Inside PHONE, type HELP for the full command and keyboard reference.
+  The switch-hook character % enters command mode during an active call.`,
+
+	"WHO": `WHO  (or: SHOW USERS)
+
+  Lists all connected users and their current app (LOBBY, PHONE, etc.).
+  Admin accounts are hidden from regular users unless the admin has
+  opted in to visibility with SET VISIBLE.`,
+
+	"HELP": `HELP  or  HELP <command>
+
+  HELP alone lists all available commands with a one-line description.
+  Admin commands are shown only to users with the admin role.
+
+  HELP <command> shows detailed usage for that command. Examples:
+    HELP FINGER
+    HELP SET PLAN
+    HELP PHONE
+    HELP WHO`,
 }
 
 func init() {
@@ -97,6 +308,7 @@ func init() {
 		prefix  string
 		handler argCommandHandler
 	}{
+		{"HELP", helpByTopic},
 		{"SHOW USER", fingerByName},
 		{"FINGER", fingerByName},
 		// PHONE <user> and DIAL <user> both dial directly.
@@ -153,13 +365,96 @@ func dispatch(line string, m Model) (output string, cmd tea.Cmd) {
 
 func helpCommand(m Model) (string, tea.Cmd) {
 	var b strings.Builder
-	b.WriteString("Available commands:\n")
-	for _, e := range helpEntries {
+	b.WriteString("Available commands:\n\n")
+
+	b.WriteString("  User commands:\n")
+	for _, t := range userHelpTopics {
 		b.WriteString("  ")
-		b.WriteString(e.display)
+		b.WriteString(t.usage)
+		b.WriteString("\n      ")
+		b.WriteString(t.desc)
 		b.WriteString("\n")
 	}
+
+	if m.role == "admin" {
+		b.WriteString("\n  Admin commands:\n")
+		for _, t := range adminHelpTopics {
+			b.WriteString("  ")
+			b.WriteString(t.usage)
+			b.WriteString("\n      ")
+			b.WriteString(t.desc)
+			b.WriteString("\n")
+		}
+	}
+
+	b.WriteString("\n  Type HELP <command> for detailed usage, e.g. HELP BAN or HELP INVITE.")
 	return b.String(), nil
+}
+
+// helpByTopic handles HELP <command> — shows extended detail for one command.
+// Admin-only topics are hidden from non-admin users, same as HELP itself.
+func helpByTopic(m Model, arg string) (string, tea.Cmd) {
+	if arg == "" {
+		return helpCommand(m)
+	}
+	upper := strings.ToUpper(strings.TrimSpace(arg))
+
+	// Determine whether the requested topic is admin-only by checking
+	// adminHelpTopics first. If it is and the caller is not admin, treat
+	// it as unknown — don't confirm the command exists.
+	isAdminTopic := false
+	for _, t := range adminHelpTopics {
+		topicUpper := strings.ToUpper(t.cmd)
+		// Strip trailing argument placeholder (e.g. "<username>") for matching.
+		topicKey := strings.ToUpper(strings.Fields(t.usage)[0])
+		if len(strings.Fields(t.usage)) > 1 {
+			// Rebuild just the verb portion (everything before first <arg>).
+			parts := strings.Fields(topicUpper)
+			verbs := []string{}
+			for _, p := range parts {
+				if strings.HasPrefix(p, "<") {
+					break
+				}
+				verbs = append(verbs, p)
+			}
+			topicKey = strings.Join(verbs, " ")
+		}
+		if upper == topicKey || upper == topicUpper ||
+			strings.HasPrefix(topicUpper, upper+" ") {
+			isAdminTopic = true
+			break
+		}
+	}
+
+	// Also check topicDetails keys that belong to admin topics.
+	adminDetailKeys := map[string]bool{"BAN": true, "INVITE": true}
+	if adminDetailKeys[upper] {
+		isAdminTopic = true
+	}
+
+	if isAdminTopic && m.role != "admin" {
+		return fmt.Sprintf("No help available for %q. Type HELP for the full command list.", arg), nil
+	}
+
+	// Check topicDetails for extended text.
+	if detail, ok := topicDetails[upper]; ok {
+		return detail, nil
+	}
+
+	// Fall back: match against user topic list.
+	for _, t := range userHelpTopics {
+		if strings.ToUpper(t.cmd) == upper || strings.HasPrefix(strings.ToUpper(t.cmd), upper+" ") {
+			return t.usage + "\n    " + t.desc, nil
+		}
+	}
+	// Admin topics (role already verified above).
+	for _, t := range adminHelpTopics {
+		if strings.ToUpper(t.cmd) == upper || strings.HasPrefix(strings.ToUpper(t.cmd), upper+" ") {
+			return t.usage + "\n    " + t.desc, nil
+		}
+	}
+
+	return fmt.Sprintf("No help available for %q. Type HELP for the full command list.", arg), nil
 }
 
 func logoutCommand(m Model) (string, tea.Cmd) {

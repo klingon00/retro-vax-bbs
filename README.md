@@ -41,6 +41,7 @@ Per the build order in `docs/open-questions.md`:
 - [x] PHONE app — v1 complete
 - [x] Admin commands (APPROVE, REJECT, KICK, BAN, UNBAN, UNLOCK, DELETE USER, LIST USERS, LIST PENDING, INVITE CREATE)
 - [x] SET PLAN / SET PLAN CLEAR
+- [x] Lobby HELP expansion
 - [ ] Docker packaging
 
 ## ⚠️ Security status — read before running anywhere but your laptop

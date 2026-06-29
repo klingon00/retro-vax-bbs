@@ -13,7 +13,6 @@ Companion to the main design doc. This is the "still soft" stuff — things ackn
 - **VAX/VMS-style command abbreviation** — agreed as a nice-to-have (shortest unambiguous prefix), not yet scoped into v1 build order.
 - **Argon2id tuning** — rough starting params given (~64MB memory, 3 iterations) but not benchmarked against actual deployment hardware.
 - **Third-party notices file** — license is MIT, all current and planned dependencies are MIT/BSD-3-Clause, but a proper notices file listing each dependency's license hasn't been created yet. Good practice before public/Unraid release.
-- **Lobby HELP expansion** — the lobby HELP command lists commands but gives no usage details. PHONE now has a full in-viewport HELP display; the lobby prompt should get similar treatment eventually.
 - **PHONE: Ctrl-G sender self-bell** — when a user presses Ctrl-G, the bell broadcasts to all *other* participants but the sender doesn't hear their own. One-liner fix: return `tea.Batch(m.ringBellCmd(), ...)` from the Ctrl-G handler. Deferred as minor.
 - **PHONE: mute / do-not-disturb** — bell suppression for ring notifications and Ctrl-G. Future config flag; deferred.
 
@@ -47,6 +46,7 @@ These came up but were intentionally pushed past v1 — don't reopen them withou
 - [x] PHONE app — **v1 complete** (see implementation notes below)
 - [x] Admin commands — **complete** (see implementation notes below)
 - [x] SET PLAN / SET PLAN CLEAR — **complete** (2026-06-28)
+- [x] Lobby HELP expansion — **complete** (2026-06-28)
 - [ ] Docker packaging
 
 ---
@@ -409,11 +409,31 @@ Key implementation notes:
   `internal/setplan/app.go` (AppAdapter satisfying app.App),
   `internal/store/plan.go` (SetPlan, ClearPlan, GetPlan, StripANSI).
 
+## Lobby HELP expansion — complete (2026-06-28)
+
+- **`HELP`** now shows two role-aware sections: User commands and Admin
+  commands. Admin commands are only shown to admin-role sessions — regular
+  users see only user commands. Each command shows a usage line and a
+  one-line description. Footer prompts `HELP <command>` for details.
+
+- **`HELP <command>`** returns extended detail for a specific command.
+  Currently detailed topics: `BAN` (full duration format table with
+  examples), `INVITE` (full syntax with examples), `FINGER`, `SET PLAN`,
+  `PHONE`, `WHO`, `HELP`. Admin-only topics (`BAN`, `INVITE`, etc.) return
+  "no help available" to non-admin users — same as if the command doesn't
+  exist, to avoid leaking command names.
+
+- **Implementation:** `helpTopic` struct drives both sections; `topicDetails`
+  map holds extended raw-string help text. `helpByTopic` is an
+  `argCommandHandler` registered as the `HELP` prefix in `argCommands`,
+  checked before the exact-match `HELP` entry so `HELP BAN` routes to
+  `helpByTopic` and bare `HELP` routes to `helpCommand`. Admin topic gating
+  uses an `adminDetailKeys` map cross-checked against `adminHelpTopics` so
+  the gate stays consistent as topics are added.
+
 ## Next concrete steps (as of 2026-06-28)
 
-1. **Lobby HELP expansion** — per-command usage text, modeled on PHONE's
-   in-viewport HELP display.
-2. **VAX/VMS command abbreviation** — shortest unambiguous prefix (DCL
+1. **VAX/VMS command abbreviation** — shortest unambiguous prefix (DCL
    style). Nice-to-have, non-blocking.
-3. **Docker packaging** — straightforward given the single-binary build.
+2. **Docker packaging** — straightforward given the single-binary build.
    Required before any Unraid Community Apps work.
