@@ -462,8 +462,10 @@ func (m Model) handleConvKey(msg tea.KeyMsg) (Model, tea.Cmd) {
 	switch msg.Type {
 	case tea.KeyCtrlG:
 		// Broadcast BEL to all participants — rings their terminal bell.
+		// Also ring the sender's own bell; BroadcastChar skips the sender
+		// by design, so we add it explicitly here.
 		m.calls.BroadcastChar(m.callID, m.username, '\a')
-		return m, nil
+		return m, m.ringBellCmd()
 
 	case tea.KeyTab:
 		// Insert a tab stop (~5 spaces) into the conversation.
@@ -660,7 +662,10 @@ func (m Model) doDial(target string) (Model, tea.Cmd) {
 	m.myChars = callerP.IncomingChar
 	m.status = fmt.Sprintf("Ringing %s...  (Press any key to cancel call and continue.)", target)
 	m.msg = ""
-	return m, waitForChar(m.myChars)
+	// Ring the caller's own bell so they hear confirmation that the call
+	// is being placed — the callee hears a bell via EventRing, but the
+	// caller's side was previously silent.
+	return m, tea.Batch(waitForChar(m.myChars), m.ringBellCmd())
 }
 
 // doAddToCall invites a user into the current active call (conference).
