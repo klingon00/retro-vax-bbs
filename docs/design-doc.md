@@ -138,9 +138,9 @@ flowchart TD
 - **Admin accounts are invisible by default** in both `WHO` (the browsable list) and `FINGER <user>` (a direct, targeted lookup) — hiding only from `WHO` and not `FINGER` would leak existence the moment someone guesses/knows the username, so both are covered.
   - **Exception:** admins are always visible to other admins.
   - **Opt-in:** an individual admin account can run `SET VISIBLE` to be discoverable (e.g., a sysop who wants people to know they're around to help). Not the typical case.
-- **All state-changing admin actions are logged** with the real account name — `APPROVE`, `DENY`, `KICK`, `BAN`, `UNBAN`, `UNLOCK`, `DELETE USER`, `CREATE USER`, `INVITE CREATE`, `PURGE PENDING` — regardless of that account's visibility setting. Invisibility is about presence-browsing for regular users, not about accountability. Read-only admin commands (`LIST PENDING`, `LIST USERS`, `LIST INVITES`) are gated but not logged — no state changes, nothing to audit.
+- **All state-changing admin actions are logged** with the real account name — `APPROVE`, `DENY`, `KICK`, `BAN`, `UNBAN`, `UNLOCK`, `DELETE USER`, `CREATE USER`, `RESET PASSWORD`, `EXPIRE PASSWORD`, `INVITE CREATE`, `PURGE PENDING` — regardless of that account's visibility setting. Invisibility is about presence-browsing for regular users, not about accountability. Read-only admin commands (`LIST PENDING`, `LIST USERS`, `LIST INVITES`) are gated but not logged — no state changes, nothing to audit.
   - **Where it's enforced:** `internal/lobby/commands.go`'s `requireAdminLogged` helper, called by every mutating admin handler in place of the plain `requireAdmin` gate. It's the same chokepoint each handler already needs for the security check itself, so the audit line can't be skipped without also skipping the access check. It logs the *attempt* (admin ran command X with these arguments), not a confirmed-successful mutation — several handlers return plain English on success with no machine-checkable marker, so "an admin ran this" is the reliable signal, same spirit as logging auth failures rather than only auth successes.
-  - **Exception:** `CREATE USER` is two-phase — the command only launches a masked password prompt (`internal/createuser`); the admin can still cancel it. `requireAdminLogged` logs that the command was invoked, and `createuser.Model.finalise()`/its cancel path logs the actual outcome (created / cancelled / failed) once known.
+  - **Exception:** `CREATE USER` and `RESET PASSWORD` are two-phase — each only launches a masked password prompt (`internal/createuser`, `internal/setpassword`); the admin can still cancel it. `requireAdminLogged` logs that the command was invoked, and the sub-app's `finalise()`/cancel path logs the actual outcome (created or set / cancelled / failed) once known.
 - **Admin commands are invisible to non-admins, not just access-denied.** A regular user typing `BAN`, `BAN alice 1h`, or `LIST PENDING` gets the exact same `"BAN" is not a recognized command` response a typo would get — not a distinct "access denied" message, and not the command's usage text (several admin commands used to show usage with no role check at all when typed with no arguments). `dispatch()` checks a role-gated set of canonical command keys, derived from `adminHelpTopics`, before ever calling a handler — same single-source-of-truth pattern as `requireAdminLogged` above, so a new admin command added to `adminHelpTopics` is automatically hidden from non-admins without a second list to maintain. This sits in front of, not instead of, each handler's own `requireAdmin`/`requireAdminLogged` check. Lower-stakes than the auth/account-visibility enumeration protections above, since the source is headed for eventual public release (see Deployment model) and command names aren't secret — this is about not tipping your hand in the terminal, not about hiding what the codebase does.
 
 ---
@@ -169,6 +169,7 @@ users (
   failed_attempts INTEGER DEFAULT 0,
   locked_until DATETIME,
   banned_until DATETIME,            -- NULL = not banned; year 2099 = permanent
+  must_change_password BOOLEAN DEFAULT 0, -- set by admin EXPIRE PASSWORD
   created_at DATETIME,
   last_login_at DATETIME
 );
@@ -187,9 +188,9 @@ Schema migrations run automatically at startup using `ALTER TABLE ADD COLUMN` (a
 
 ## v1 command set (lobby)
 
-**User commands:** `HELP`, `WHO` / `SHOW USERS`, `FINGER <user>` / `SHOW USER <user>`, `TIME` / `SHOW TIME`, `PHONE` / `PHONE <user>` / `DIAL <user>`, `SET PLAN`, `SET PLAN CLEAR`, `LOGOUT`.
+**User commands:** `HELP`, `WHO` / `SHOW USERS`, `FINGER <user>` / `SHOW USER <user>`, `TIME` / `SHOW TIME`, `PHONE` / `PHONE <user>` / `DIAL <user>`, `SET PLAN`, `SET PLAN CLEAR`, `SET PASSWORD`, `LOGOUT`.
 
-**Admin-only commands:** `LIST PENDING`, `LIST USERS`, `LIST INVITES`, `APPROVE <user>`, `DENY <user>`, `DELETE USER <user>`, `CREATE USER <username> [role]`, `KICK <user>`, `BAN <user> <duration>`, `UNBAN <user>`, `UNLOCK <user>`, `INVITE CREATE [N] [duration]`, `PURGE PENDING`.
+**Admin-only commands:** `LIST PENDING`, `LIST USERS`, `LIST INVITES`, `APPROVE <user>`, `DENY <user>`, `DELETE USER <user>`, `CREATE USER <username> [role]`, `KICK <user>`, `BAN <user> <duration>`, `UNBAN <user>`, `UNLOCK <user>`, `RESET PASSWORD <user>`, `EXPIRE PASSWORD <user>`, `INVITE CREATE [N] [duration]`, `PURGE PENDING`.
 
 **Planned user commands:** `SET KEY` (SSH public key), `SET COLOR` (opt-in color), `SET VISIBLE` (admin visibility opt-in).
 
@@ -234,6 +235,52 @@ clients echo typed input in the clear unless the application itself masks
 it. `cmd/adduser` remains the only way to create the very first account
 (there's no admin session yet to run a lobby command from) and is still
 useful for scripted/headless provisioning.
+
+---
+
+## SET PASSWORD / RESET PASSWORD / EXPIRE PASSWORD — password management
+
+Three commands, one shared flow (`internal/setpassword`), covering the
+self-service, admin-assisted, and admin-forced cases:
+
+- **`SET PASSWORD`** (any user, self-service) asks for the caller's
+  *current* password before the new one — protection against an
+  unattended SSH session being used to lock out the real account owner.
+  A wrong current password counts against the same 5-attempt lockout
+  counter as login (`RecordFailedAttempt`/`ClearFailedAttempts`), so it
+  has real teeth rather than being an unlimited-guess side channel.
+- **`RESET PASSWORD <username>`** (admin) sets a user's password
+  directly — the normal path for password-reset requests or recovering a
+  forgotten admin password, superseding the old raw-SQL emergency
+  procedure. No current-password check (the admin doesn't know it).
+  Two-phase audit logging, same pattern as `CREATE USER`: dispatch logs
+  the invocation, the sub-app's `finalise()` logs the outcome, since the
+  admin can still cancel the password prompt.
+- **`EXPIRE PASSWORD <username>`** (admin) sets `must_change_password`;
+  the user's current password still works for their *next* login, but
+  that session is routed straight into a mandatory password-change
+  screen before the lobby loads — not a dismissable nag. Esc does
+  nothing there; only Ctrl+C disconnects, leaving the flag set for next
+  time.
+
+**Why `RESET PASSWORD` and not `SET PASSWORD <username>`:** the lobby's
+admin-visibility gate (`dispatch()`'s `adminCommandKeys`, see Admin model
+above) hides admin commands from non-admins by checking the dispatch key
+itself — for a prefix command like `SET PASSWORD <username>`, that key
+would be the literal string `"SET PASSWORD"`, identical to the bare
+self-service command's own dispatch key. Gating one would gate both,
+hiding self-service password change from everyone. Using a distinct verb
+for the admin-targeted case avoids the collision without teaching the one
+security chokepoint the whole admin-visibility model relies on being
+uniform to special-case a single command.
+
+**Why `EXPIRE PASSWORD` ends in "reconnect," not a seamless hand-off:**
+this codebase builds exactly one `tea.Program` per SSH session
+(`cmd/server/main.go`'s `teaHandler`, via wish's `bm.Middleware`); there's
+no mechanism to swap the root Bubble Tea model mid-session.
+`internal/registration` hits the identical constraint for a freshly
+activated account, and follows the same precedent: show a success
+message, then quit and require a fresh connection.
 
 ---
 

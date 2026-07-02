@@ -38,6 +38,7 @@ import (
 	"github.com/klingon00/retro-vax-bbs/internal/phone"
 	"github.com/klingon00/retro-vax-bbs/internal/registration"
 	"github.com/klingon00/retro-vax-bbs/internal/registry"
+	"github.com/klingon00/retro-vax-bbs/internal/setpassword"
 	"github.com/klingon00/retro-vax-bbs/internal/store"
 )
 
@@ -54,9 +55,10 @@ const (
 type contextKey string
 
 const (
-	roleKey     contextKey = "role"
-	authDoneKey contextKey = "authDone"
-	regModeKey  contextKey = "regMode" // set when username=="new"
+	roleKey               contextKey = "role"
+	authDoneKey           contextKey = "authDone"
+	regModeKey            contextKey = "regMode"            // set when username=="new"
+	mustChangePasswordKey contextKey = "mustChangePassword" // set when EXPIRE PASSWORD is pending
 )
 
 type config struct {
@@ -268,6 +270,7 @@ func sessionMiddleware(db *store.Store, reg *registry.Registry) wish.Middleware 
 				return
 			}
 			s.Context().SetValue(roleKey, user.Role)
+			s.Context().SetValue(mustChangePasswordKey, user.MustChangePassword)
 
 			reg.Register(s.User(), user.Role, user.AdminVisible, "LOBBY")
 			// Store a kick function so admin KICK command can close this session.
@@ -293,6 +296,16 @@ func teaHandler(s ssh.Session) (tea.Model, []tea.ProgramOption) {
 	// prompt form and avoids the BubbleTea v1.x sacrifice-line issue.
 	if regMode, ok := s.Context().Value(regModeKey).(string); ok && regMode != "" {
 		m := registration.New(regMode, globalDB, globalReg, globalPendingExpiry)
+		return m, nil
+	}
+
+	// Mandatory password change (admin ran EXPIRE PASSWORD): same
+	// inline-rendering, no-alt-screen treatment as registration, and for
+	// the same reason — this codebase has no way to swap the root model
+	// mid-session, so once the password is changed the user is told to
+	// reconnect rather than handed off into the lobby inline.
+	if mustChange, ok := s.Context().Value(mustChangePasswordKey).(bool); ok && mustChange {
+		m := setpassword.NewForced(globalDB, s.User())
 		return m, nil
 	}
 

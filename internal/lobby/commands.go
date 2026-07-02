@@ -15,6 +15,7 @@ import (
 	"github.com/klingon00/retro-vax-bbs/internal/app"
 	"github.com/klingon00/retro-vax-bbs/internal/createuser"
 	"github.com/klingon00/retro-vax-bbs/internal/phone"
+	"github.com/klingon00/retro-vax-bbs/internal/setpassword"
 	"github.com/klingon00/retro-vax-bbs/internal/setplan"
 	"github.com/klingon00/retro-vax-bbs/internal/store"
 )
@@ -95,6 +96,11 @@ var userHelpTopics = []helpTopic{
 		desc:  "Remove your FINGER blurb immediately without opening the editor.",
 	},
 	{
+		cmd:   "SET PASSWORD",
+		usage: "SET PASSWORD",
+		desc:  "Change your own password. Asks for your current password first.",
+	},
+	{
 		cmd:   "HELP",
 		usage: "HELP  or  HELP <command>",
 		desc:  "Show this list, or detailed usage for a specific command.",
@@ -167,6 +173,18 @@ var adminHelpTopics = []helpTopic{
 		cmd:   "UNLOCK <username>",
 		usage: "UNLOCK <username>",
 		desc:  "Clear a login lockout (triggered after 5 failed password attempts).",
+		admin: true,
+	},
+	{
+		cmd:   "RESET PASSWORD <username>",
+		usage: "RESET PASSWORD <username>",
+		desc:  "Set a user's password directly. Prompts for a masked new password.",
+		admin: true,
+	},
+	{
+		cmd:   "EXPIRE PASSWORD <username>",
+		usage: "EXPIRE PASSWORD <username>",
+		desc:  "Force a mandatory password change on the user's next login.",
 		admin: true,
 	},
 	{
@@ -309,6 +327,37 @@ var topicDetails = map[string]string{
   Inside PHONE, type HELP for the full command and keyboard reference.
   The switch-hook character % enters command mode during an active call.`,
 
+	"SET PASSWORD": `SET PASSWORD
+
+  Change your own password. Asks for your current password first — this
+  protects an unattended session from being used to lock out the real
+  account owner — then a new password and confirmation.
+
+    Esc / Ctrl+C   Cancel without changing anything
+
+  Five wrong current-password attempts locks the account the same as a
+  failed login attempt; contact an admin to UNLOCK it early.`,
+
+	"RESET PASSWORD": `RESET PASSWORD <username>
+
+  Sets a user's password directly — for password-reset requests or
+  recovering a forgotten admin password. No current-password check (the
+  admin doesn't know it). Prompts for a masked new password and
+  confirmation.
+
+  Example:
+    RESET PASSWORD alice`,
+
+	"EXPIRE PASSWORD": `EXPIRE PASSWORD <username>
+
+  Forces a mandatory password change on the user's next login. Their
+  current password still works for that one login, but the session goes
+  straight into a password-change screen before the lobby loads — it
+  cannot be skipped or dismissed.
+
+  Example:
+    EXPIRE PASSWORD alice`,
+
 	"WHO": `WHO  (or: SHOW USERS)
 
   Lists all connected users and their current app (LOBBY, PHONE, etc.).
@@ -347,21 +396,26 @@ func init() {
 		// SET PLAN commands.
 		"SET PLAN":       setPlanCommand,
 		"SET PLAN CLEAR": setPlanClearCommand,
+		// SET PASSWORD — self-service, available to everyone; not
+		// admin-gated (see adminHelpTopics/adminCommandKeys note below).
+		"SET PASSWORD": setPasswordCommand,
 		// Admin commands (enforced by role check inside each handler).
-		"LIST PENDING":  listPendingCommand,
-		"LIST USERS":    listUsersCommand,
-		"LIST INVITES":  listInvitesCommand,
-		"INVITE":        inviteUsage,
-		"INVITE CREATE": inviteCreateCommand,
-		"APPROVE":       approveUsage,
-		"DENY":          denyUsage,
-		"DELETE USER":   deleteUserUsage,
-		"CREATE USER":   createUserUsage,
-		"UNLOCK":        unlockUsage,
-		"KICK":          kickUsage,
-		"BAN":           banUsage,
-		"UNBAN":         unbanUsage,
-		"PURGE PENDING": purgePendingCommand,
+		"LIST PENDING":    listPendingCommand,
+		"LIST USERS":      listUsersCommand,
+		"LIST INVITES":    listInvitesCommand,
+		"INVITE":          inviteUsage,
+		"INVITE CREATE":   inviteCreateCommand,
+		"APPROVE":         approveUsage,
+		"DENY":            denyUsage,
+		"DELETE USER":     deleteUserUsage,
+		"CREATE USER":     createUserUsage,
+		"UNLOCK":          unlockUsage,
+		"RESET PASSWORD":  resetPasswordUsage,
+		"EXPIRE PASSWORD": expirePasswordUsage,
+		"KICK":            kickUsage,
+		"BAN":             banUsage,
+		"UNBAN":           unbanUsage,
+		"PURGE PENDING":   purgePendingCommand,
 	}
 
 	argCommands = []struct {
@@ -380,6 +434,8 @@ func init() {
 		{"DELETE USER", deleteUserCommand},
 		{"CREATE USER", createUserCommand},
 		{"UNLOCK", unlockCommand},
+		{"RESET PASSWORD", resetPasswordCommand},
+		{"EXPIRE PASSWORD", expirePasswordCommand},
 		{"KICK", kickCommand},
 		{"BAN", banCommand},
 		{"UNBAN", unbanCommand},
@@ -1313,6 +1369,75 @@ func validateNewUsername(s string) error {
 		}
 	}
 	return nil
+}
+
+// ---- SET PASSWORD / RESET PASSWORD / EXPIRE PASSWORD --------------------
+
+// setPasswordCommand launches the self-service password-change flow.
+// Available to every authenticated user — deliberately not admin-gated,
+// which is also why it's registered in userHelpTopics rather than
+// adminHelpTopics: an adminHelpTopics entry would derive an
+// adminCommandKeys["SET PASSWORD"] gate that collides with this exact
+// dispatch key and would incorrectly hide it from non-admins too.
+func setPasswordCommand(m Model) (string, tea.Cmd) {
+	if m.db == nil {
+		return "%VAX-BBS-E-NODB, database unavailable.", nil
+	}
+	editor := setpassword.NewSelfApp(m.db, m.username)
+	return "", launchAppCmd(editor)
+}
+
+func resetPasswordUsage(m Model) (string, tea.Cmd) {
+	return "Usage: RESET PASSWORD <username>", nil
+}
+
+// resetPasswordCommand validates the target exists, then launches the
+// setpassword app to collect a masked new password. The password isn't
+// changed until that prompt completes — see internal/setpassword.
+func resetPasswordCommand(m Model, username string) (string, tea.Cmd) {
+	if e := requireAdminLogged(m, "RESET PASSWORD", username); e != "" {
+		return e, nil
+	}
+	if m.db == nil {
+		return "%VAX-BBS-E-NODB, database unavailable.", nil
+	}
+	if username == "" {
+		return resetPasswordUsage(m)
+	}
+	if _, err := m.db.GetUserByUsername(username); err != nil {
+		if errors.Is(err, store.ErrNotFound) {
+			return fmt.Sprintf("%%VAX-BBS-E-NOUSER, User '%s' not found.", username), nil
+		}
+		return fmt.Sprintf("%%VAX-BBS-E-RESET, %v", err), nil
+	}
+	editor := setpassword.NewAdminApp(m.db, m.username, username)
+	return "", launchAppCmd(editor)
+}
+
+func expirePasswordUsage(m Model) (string, tea.Cmd) {
+	return "Usage: EXPIRE PASSWORD <username>  — force a password change on next login", nil
+}
+
+// expirePasswordCommand is a single-phase mutation (no sub-app), so
+// requireAdminLogged alone covers the audit trail — unlike RESET PASSWORD
+// and CREATE USER, there's no follow-up prompt the admin could cancel.
+func expirePasswordCommand(m Model, username string) (string, tea.Cmd) {
+	if e := requireAdminLogged(m, "EXPIRE PASSWORD", username); e != "" {
+		return e, nil
+	}
+	if m.db == nil {
+		return "%VAX-BBS-E-NODB, database unavailable.", nil
+	}
+	if username == "" {
+		return expirePasswordUsage(m)
+	}
+	if err := m.db.ExpirePassword(username); err != nil {
+		if errors.Is(err, store.ErrNotFound) {
+			return fmt.Sprintf("%%VAX-BBS-E-NOUSER, User '%s' not found.", username), nil
+		}
+		return fmt.Sprintf("%%VAX-BBS-E-EXPIRE, %v", err), nil
+	}
+	return fmt.Sprintf("%%VAX-BBS-S-EXPIRE, '%s' must set a new password on next login.", username), nil
 }
 
 // ---- PURGE PENDING ------------------------------------------------------

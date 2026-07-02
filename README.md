@@ -39,8 +39,9 @@ Per the build order in `docs/open-questions.md`:
   - [x] `WHO` (registry-backed, with alias `SHOW USERS`)
   - [x] `FINGER <user>`
 - [x] PHONE app — v1 complete
-- [x] Admin commands (APPROVE, DENY, KICK, BAN, UNBAN, UNLOCK, DELETE USER, LIST USERS, LIST PENDING, INVITE CREATE)
+- [x] Admin commands (APPROVE, DENY, KICK, BAN, UNBAN, UNLOCK, DELETE USER, RESET PASSWORD, EXPIRE PASSWORD, LIST USERS, LIST PENDING, INVITE CREATE)
 - [x] SET PLAN / SET PLAN CLEAR
+- [x] SET PASSWORD (self-service password change)
 - [x] Lobby HELP expansion
 - [x] Lobby scrollback (PgUp / PgDn / End)
 - [ ] Docker packaging
@@ -90,7 +91,7 @@ ssh -p 2223 sysop@localhost
 ```
 
 Try `HELP`, `WHO`, `SHOW USERS`, `FINGER <username>`, `TIME`, `SHOW TIME`,
-`PHONE <username>`, `SET PLAN`, `LOGOUT`. Resize your terminal mid-session
+`PHONE <username>`, `SET PLAN`, `SET PASSWORD`, `LOGOUT`. Resize your terminal mid-session
 — Bubble Tea picks up `WindowSizeMsg` natively, which is the original
 VAX/VMS terminal-resize problem, solved for free by the stack.
 
@@ -160,6 +161,7 @@ internal/phone/        — PHONE app (app.go, call.go, layout.go)
 internal/registration/ — self-service registration TUI (invite-only / open-with-approval)
 internal/registry/     — session registry for WHO and PHONE routing
 internal/setplan/      — SET PLAN inline textarea editor (setplan.go, app.go)
+internal/setpassword/  — SET PASSWORD / RESET PASSWORD / EXPIRE PASSWORD flows
 internal/store/        — SQLite-backed account and invite persistence
 docs/                  — design doc, open questions, admin guide
 ```

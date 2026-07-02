@@ -13,7 +13,6 @@ Companion to the main design doc. This is the "still soft" stuff — things ackn
 - **VAX/VMS-style command abbreviation** — agreed as a nice-to-have (shortest unambiguous prefix), not yet scoped into v1 build order.
 - **Argon2id tuning** — rough starting params given (~64MB memory, 3 iterations) but not benchmarked against actual deployment hardware.
 - **Third-party notices file** — license is MIT, all current and planned dependencies are MIT/BSD-3-Clause, but a proper notices file listing each dependency's license hasn't been created yet. Good practice before public/Unraid release.
-- **PHONE: Ctrl-G sender self-bell** — when a user presses Ctrl-G, the bell broadcasts to all *other* participants but the sender doesn't hear their own. One-liner fix: return `tea.Batch(m.ringBellCmd(), ...)` from the Ctrl-G handler. Deferred as minor.
 - **PHONE: mute / do-not-disturb** — bell suppression for ring notifications and Ctrl-G. Future config flag; deferred.
 
 ## Decisions explicitly deferred on purpose
@@ -47,6 +46,7 @@ These came up but were intentionally pushed past v1 — don't reopen them withou
 - [x] Admin commands — **complete** (see implementation notes below)
 - [x] SET PLAN / SET PLAN CLEAR — **complete** (2026-06-28)
 - [x] Lobby HELP expansion — **complete** (2026-06-28)
+- [x] SET PASSWORD / RESET PASSWORD / EXPIRE PASSWORD — **complete** (2026-07-02)
 - [ ] Docker packaging
 
 ---
@@ -430,6 +430,65 @@ Key implementation notes:
   `helpByTopic` and bare `HELP` routes to `helpCommand`. Admin topic gating
   uses an `adminDetailKeys` map cross-checked against `adminHelpTopics` so
   the gate stays consistent as topics are added.
+
+## Password management — complete (2026-07-02)
+
+Three commands (`SET PASSWORD`, `RESET PASSWORD <user>`,
+`EXPIRE PASSWORD <user>`) sharing one flow in the new
+`internal/setpassword` package. Replaces the raw-SQL hash-copy hack that
+was the only way to reset a password before this (see the "Forgot an
+admin password" emergency procedure in `docs/admin-guide.md` — that
+section's "a cleaner `cmd/resetpw` tool is planned" line is now obsolete
+and was removed; `RESET PASSWORD` is that tool).
+
+Two gotchas worth remembering for future work in this area:
+
+- **`SET PASSWORD` and the admin variant couldn't share a verb.** The
+  request as originally phrased was `SET PASSWORD <username>` for the
+  admin case too. But `dispatch()`'s admin-visibility gate
+  (`adminCommandKeys`, built from `adminHelpTopics`) keys on the command
+  verb itself — for a prefix command, `SET PASSWORD <username>` and bare
+  `SET PASSWORD` derive the *same* key (`"SET PASSWORD"`). Registering
+  the admin form in `adminHelpTopics` would have gated the self-service
+  bare form too, hiding it from everyone. Renamed the admin command to
+  `RESET PASSWORD <username>` instead of teaching the one
+  admin-visibility chokepoint to special-case this command — worth
+  checking for the same collision risk before reusing a verb across a
+  self-service/admin pair again.
+- **No mechanism exists to swap the root Bubble Tea model mid-session.**
+  `EXPIRE PASSWORD`'s forced flow needed to intercept *before* the lobby
+  loads. `cmd/server/main.go`'s `teaHandler` builds exactly one
+  `tea.Program` per SSH session (same constraint `internal/registration`
+  already lives under for a freshly activated account) — there's no API
+  to hand off to a second model once the first one's `Update` loop
+  starts. `setpassword.ForcedModel` follows registration's existing
+  precedent: change the password, show a success message, then `tea.Quit`
+  and require the user to reconnect. Wired into `teaHandler` via a new
+  `mustChangePasswordKey` context value, set in `sessionMiddleware`
+  alongside the existing `roleKey`/`regModeKey` — same pattern, not a new
+  one.
+
+Other implementation notes:
+
+- The self-service current-password check reuses the existing lockout
+  counter (`RecordFailedAttempt`/`ClearFailedAttempts`, same 5-attempt
+  threshold as login) so it can't be brute-forced from an unattended
+  session.
+- `RESET PASSWORD` is two-phase logged, same pattern as `CREATE USER`:
+  `requireAdminLogged` logs the invocation at dispatch time, the
+  sub-app's `finalise()` logs the actual outcome, since the admin can
+  still cancel the masked-password prompt. `EXPIRE PASSWORD` is a single
+  atomic mutation with no sub-app, so `requireAdminLogged` alone covers
+  it.
+- New schema column: `must_change_password BOOLEAN DEFAULT 0`, additive
+  migration, cleared automatically by `SetPassword` regardless of who
+  changed the password (self-service, admin reset, or the forced flow
+  itself).
+- New packages/files: `internal/setpassword/setpassword.go` (shared
+  state machine), `internal/setpassword/app.go` (`AppAdapter` for the two
+  lobby-launched cases), `internal/setpassword/forced.go` (top-level
+  model for the forced case), `internal/store/password.go` (`SetPassword`,
+  `ExpirePassword`), `internal/store/password_test.go`.
 
 ## Next concrete steps (as of 2026-06-28)
 

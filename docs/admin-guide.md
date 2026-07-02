@@ -181,6 +181,17 @@ logged. See **Logging** below for the exact format.
 | `DELETE USER <username>` | Permanently remove an account and free the username. Cannot be used on your own account. |
 | `UNLOCK <username>` | Clear a login lockout (triggered after 5 consecutive failed password attempts; normally lifts after 15 minutes). |
 
+### Password management
+
+| Command | Description |
+|---|---|
+| `RESET PASSWORD <username>` | Set a user's password directly. Prompts for a masked new password and confirmation — no current-password check needed, since the admin is setting it, not verifying it. |
+| `EXPIRE PASSWORD <username>` | Force a mandatory password change on the user's next login. Their current password still works for that one login, but the session goes straight into a password-change screen before the lobby loads — it cannot be skipped. |
+
+Users can also change their own password at any time with `SET PASSWORD`
+(asks for the current password first) — see the main command reference,
+not admin-only.
+
 ### Moderation
 
 | Command | Description |
@@ -293,9 +304,10 @@ Restart the server afterward.
 ### Forgot an admin password
 
 **If another admin account is still usable:** log in as that admin and run
-`DELETE USER <name>` followed by `CREATE USER <name> admin` to recreate the
-account under the same username with a new password. No shell or SQLite
-access needed.
+`RESET PASSWORD <name>` — prompts for a masked new password and
+confirmation, no shell or SQLite access needed. (Recreating the account
+via `DELETE USER` + `CREATE USER` still works too, but `RESET PASSWORD`
+is simpler and doesn't require freeing and recreating the username.)
 
 **If you're completely locked out** (no working admin account at all),
 create a new one from the CLI:
@@ -316,8 +328,6 @@ UPDATE users SET password_hash = (SELECT password_hash FROM users WHERE username
 DELETE FROM users WHERE username = 'tmp_pw_reset';
 SQL
 ```
-
-A cleaner `cmd/resetpw` tool is planned for a future release.
 
 ### Database corruption
 
@@ -355,16 +365,21 @@ admin action: sysop BAN troublemaker 24h
 admin action: sysop UNBAN troublemaker
 admin action: sysop UNLOCK alice
 admin action: sysop DELETE USER bob
+admin action: sysop EXPIRE PASSWORD alice
 admin action: sysop INVITE CREATE 5 7d
 admin action: sysop PURGE PENDING
 ```
 
-`CREATE USER` logs twice: once when the command is run (the admin may
-still cancel the password prompt), and once with the actual outcome:
+`CREATE USER` and `RESET PASSWORD` each log twice: once when the command
+is run (the admin may still cancel the password prompt), and once with
+the actual outcome:
 
 ```
 admin action: sysop CREATE USER alice
 admin action: sysop CREATE USER alice (role=user) created
+
+admin action: sysop RESET PASSWORD alice
+admin action: sysop RESET PASSWORD alice (password updated)
 ```
 
 or, if cancelled:

@@ -31,21 +31,22 @@ var ErrNotFound = errors.New("not found")
 // are now fully active (see RecordFailedAttempt / ClearFailedAttempts).
 // Email and BannedUntil were added in the registration-modes milestone.
 type User struct {
-	ID             int64
-	Username       string
-	PasswordHash   sql.NullString
-	SSHPubkey      sql.NullString
-	Status         string // pending | active | suspended
-	Role           string // user | admin
-	PlanText       sql.NullString
-	ColorOptIn     bool
-	AdminVisible   bool
-	FailedAttempts int
-	LockedUntil    sql.NullTime
-	CreatedAt      time.Time
-	LastLoginAt    sql.NullTime
-	Email          sql.NullString // optional; used for open-with-approval notifications
-	BannedUntil    sql.NullTime   // nil = not banned or permanent ban
+	ID                 int64
+	Username           string
+	PasswordHash       sql.NullString
+	SSHPubkey          sql.NullString
+	Status             string // pending | active | suspended
+	Role               string // user | admin
+	PlanText           sql.NullString
+	ColorOptIn         bool
+	AdminVisible       bool
+	FailedAttempts     int
+	LockedUntil        sql.NullTime
+	CreatedAt          time.Time
+	LastLoginAt        sql.NullTime
+	Email              sql.NullString // optional; used for open-with-approval notifications
+	BannedUntil        sql.NullTime   // nil = not banned or permanent ban
+	MustChangePassword bool           // true after admin EXPIRE PASSWORD; cleared by SetPassword
 }
 
 // Store wraps a database/sql connection pool to the SQLite file.
@@ -122,6 +123,7 @@ func (s *Store) migrate() error {
 	for _, ddl := range []string{
 		`ALTER TABLE users ADD COLUMN email TEXT`,
 		`ALTER TABLE users ADD COLUMN banned_until DATETIME`,
+		`ALTER TABLE users ADD COLUMN must_change_password BOOLEAN NOT NULL DEFAULT 0`,
 	} {
 		if _, err := s.db.Exec(ddl); err != nil {
 			if !strings.Contains(err.Error(), "duplicate column name") {
@@ -191,7 +193,7 @@ func (s *Store) GetUserByUsername(username string) (*User, error) {
 		        plan_text, color_opt_in, admin_visible, failed_attempts,
 		        locked_until, created_at, last_login_at,
 		        COALESCE(email, '') as email,
-		        banned_until
+		        banned_until, must_change_password
 		 FROM users WHERE username = ?`,
 		username,
 	)
@@ -205,7 +207,7 @@ func (s *Store) GetUserByID(id int64) (*User, error) {
 		        plan_text, color_opt_in, admin_visible, failed_attempts,
 		        locked_until, created_at, last_login_at,
 		        COALESCE(email, '') as email,
-		        banned_until
+		        banned_until, must_change_password
 		 FROM users WHERE id = ?`,
 		id,
 	)
@@ -270,7 +272,7 @@ func scanUser(row *sql.Row) (*User, error) {
 		&u.ID, &u.Username, &u.PasswordHash, &u.SSHPubkey, &u.Status, &u.Role,
 		&u.PlanText, &u.ColorOptIn, &u.AdminVisible, &u.FailedAttempts,
 		&u.LockedUntil, &u.CreatedAt, &u.LastLoginAt,
-		&u.Email, &u.BannedUntil,
+		&u.Email, &u.BannedUntil, &u.MustChangePassword,
 	)
 	if errors.Is(err, sql.ErrNoRows) {
 		return nil, ErrNotFound
