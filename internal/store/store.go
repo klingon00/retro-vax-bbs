@@ -171,6 +171,9 @@ func (s *Store) CreateUser(username, passwordHash, role string) (*User, error) {
 		username, passwordHash, role,
 	)
 	if err != nil {
+		if strings.Contains(err.Error(), "UNIQUE constraint failed") {
+			return nil, ErrUsernameTaken
+		}
 		return nil, fmt.Errorf("inserting user: %w", err)
 	}
 	id, err := res.LastInsertId()

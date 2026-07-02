@@ -16,9 +16,16 @@ import (
 	"github.com/klingon00/retro-vax-bbs/internal/app"
 	"github.com/klingon00/retro-vax-bbs/internal/phone"
 	"github.com/klingon00/retro-vax-bbs/internal/registry"
-	"github.com/klingon00/retro-vax-bbs/internal/setplan"
 	"github.com/klingon00/retro-vax-bbs/internal/store"
 )
+
+// statusReporter is implemented by inline apps (SET PLAN, CREATE USER, ...)
+// whose AppAdapter exposes a one-shot result string for the lobby to show
+// once the app finishes. Checked by interface rather than a per-app type
+// switch so adding a new inline app doesn't require touching this file.
+type statusReporter interface {
+	StatusMsg() string
+}
 
 // phoneRingMsg fires when the registry delivers a PhoneEvent for this
 // session — specifically a ring event while at the lobby prompt.
@@ -112,9 +119,9 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		if updatedApp, ok := updated.(app.App); ok {
 			m.activeApp = updatedApp
 			if m.activeApp.Done() {
-				if sp, ok := m.activeApp.(*setplan.AppAdapter); ok {
-					if sp.StatusMsg() != "" {
-						m.history = append(m.history, sp.StatusMsg())
+				if sr, ok := m.activeApp.(statusReporter); ok {
+					if msg := sr.StatusMsg(); msg != "" {
+						m.history = append(m.history, msg)
 					}
 				}
 				m.activeApp = nil

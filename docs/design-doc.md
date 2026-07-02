@@ -89,14 +89,14 @@ type App interface {
 }
 ```
 
-Apps whose internal Update returns a concrete type (e.g. `setplan.Model`) use a thin `AppAdapter` wrapper to satisfy the interface without coupling packages — see `internal/setplan/app.go`.
+Apps whose internal Update returns a concrete type (e.g. `setplan.Model`, `createuser.Model`) use a thin `AppAdapter` wrapper to satisfy the interface without coupling packages — see `internal/setplan/app.go` and `internal/createuser/app.go`. The lobby recognizes an app's one-shot result message via a small `statusReporter` interface (`StatusMsg() string`), rather than a type switch per app — so adding a new inline app doesn't require touching lobby code.
 
 ---
 
 ## Account & registration
 
 **Registration mode is a deploy-time config choice** (`REGISTRATION_MODE` env var), not hardcoded — supports different operator risk tolerances:
-- `closed` (default) — admin creates every account directly via `cmd/adduser`; no self-service at all
+- `closed` (default) — no self-service at all. The admin provisions every account directly, either in-lobby via `CREATE USER <username> [role]` (masked password prompt, no plaintext ever touches the command line or scrollback) or, for the very first account / scripted setup, via the `cmd/adduser` CLI.
 - `invite-only` — user SSHs in as `new`, enters a username, invite code, and password; account activates immediately
 - `open-with-approval` — user SSHs in as `new`, submits a request (username, optional email, password); admin manually approves
 
@@ -110,12 +110,12 @@ flowchart TD
     C -->|"valid code"| Active["Account active — log in now"]
     D --> Pend["Pending: admin reviews via LIST PENDING"]
     Pend -->|"APPROVE username"| Active
-    Pend -->|"REJECT USER username"| Gone["Request deleted"]
+    Pend -->|"DENY username"| Gone["Request deleted"]
 ```
 
 - **Invite codes:** short and human-typeable (`adjective-noun-NN` format, e.g. `swift-oak-42`), generated with `crypto/rand`, multi-use, optionally expiring. Generated via `INVITE CREATE [N] [duration]`; listed via `LIST INVITES`.
-- **Password set during registration**, not deferred to first login.
-- **Pending accounts auto-expire** after `PENDING_EXPIRY_DAYS` (default 7 days) to prevent username squatting. Admins can also `REJECT USER` or `DELETE USER` immediately to free a name.
+- **Password set during registration**, not deferred to first login. Same rule for admin-created accounts (`CREATE USER`) — the password is captured through a masked prompt at creation time, never as a plaintext command argument.
+- **Pending accounts auto-expire** after `PENDING_EXPIRY_DAYS` (default 7 days) to prevent username squatting. Admins can also `DENY` or `DELETE USER` immediately to free a name.
 - Existing account → password (argon2id) or registered SSH public key.
 - **SSH key upgrade (optional, opt-in):** `SET KEY` registers a public key against an account; future connections skip the password prompt entirely if the key matches. Off by default, available to anyone who wants it.
 
@@ -138,7 +138,9 @@ flowchart TD
 - **Admin accounts are invisible by default** in both `WHO` (the browsable list) and `FINGER <user>` (a direct, targeted lookup) — hiding only from `WHO` and not `FINGER` would leak existence the moment someone guesses/knows the username, so both are covered.
   - **Exception:** admins are always visible to other admins.
   - **Opt-in:** an individual admin account can run `SET VISIBLE` to be discoverable (e.g., a sysop who wants people to know they're around to help). Not the typical case.
-- **All admin actions are always logged** with the real account name — `APPROVE`, `REJECT`, `KICK`, `BAN`, `UNLOCK`, `DELETE USER` — regardless of that account's visibility setting. Invisibility is about presence-browsing for regular users, not about accountability.
+- **All state-changing admin actions are logged** with the real account name — `APPROVE`, `DENY`, `KICK`, `BAN`, `UNBAN`, `UNLOCK`, `DELETE USER`, `CREATE USER`, `INVITE CREATE`, `PURGE PENDING` — regardless of that account's visibility setting. Invisibility is about presence-browsing for regular users, not about accountability. Read-only admin commands (`LIST PENDING`, `LIST USERS`, `LIST INVITES`) are gated but not logged — no state changes, nothing to audit.
+  - **Where it's enforced:** `internal/lobby/commands.go`'s `requireAdminLogged` helper, called by every mutating admin handler in place of the plain `requireAdmin` gate. It's the same chokepoint each handler already needs for the security check itself, so the audit line can't be skipped without also skipping the access check. It logs the *attempt* (admin ran command X with these arguments), not a confirmed-successful mutation — several handlers return plain English on success with no machine-checkable marker, so "an admin ran this" is the reliable signal, same spirit as logging auth failures rather than only auth successes.
+  - **Exception:** `CREATE USER` is two-phase — the command only launches a masked password prompt (`internal/createuser`); the admin can still cancel it. `requireAdminLogged` logs that the command was invoked, and `createuser.Model.finalise()`/its cancel path logs the actual outcome (created / cancelled / failed) once known.
 
 ---
 
@@ -186,7 +188,7 @@ Schema migrations run automatically at startup using `ALTER TABLE ADD COLUMN` (a
 
 **User commands:** `HELP`, `WHO` / `SHOW USERS`, `FINGER <user>` / `SHOW USER <user>`, `TIME` / `SHOW TIME`, `PHONE` / `PHONE <user>` / `DIAL <user>`, `SET PLAN`, `SET PLAN CLEAR`, `LOGOUT`.
 
-**Admin-only commands:** `LIST PENDING`, `LIST USERS`, `LIST INVITES`, `APPROVE <user>`, `REJECT USER <user>`, `DELETE USER <user>`, `KICK <user>`, `BAN <user> <duration>`, `UNBAN <user>`, `UNLOCK <user>`, `INVITE CREATE [N] [duration]`, `PURGE PENDING`.
+**Admin-only commands:** `LIST PENDING`, `LIST USERS`, `LIST INVITES`, `APPROVE <user>`, `DENY <user>`, `DELETE USER <user>`, `CREATE USER <username> [role]`, `KICK <user>`, `BAN <user> <duration>`, `UNBAN <user>`, `UNLOCK <user>`, `INVITE CREATE [N] [duration]`, `PURGE PENDING`.
 
 **Planned user commands:** `SET KEY` (SSH public key), `SET COLOR` (opt-in color), `SET VISIBLE` (admin visibility opt-in).
 
@@ -213,6 +215,24 @@ Plan text is stored in the `plan_text` column and displayed by `FINGER`.
 ANSI escape sequences are stripped at both storage and display time —
 structural protection against terminal injection, not a runtime filter.
 Character limit: 512 runes.
+
+---
+
+## CREATE USER — in-lobby account provisioning
+
+Admins create accounts directly from the lobby with `CREATE USER <username>
+[role]` (role defaults to `user`), instead of dropping to a shell for
+`cmd/adduser`. Username and role are validated and checked for uniqueness
+immediately; the command then launches a small inline app (same pattern as
+SET PLAN) that prompts for a masked password and confirmation.
+
+The password never appears as a command-line argument and is never written
+to the lobby's scrollback history — both because lobby command lines are
+echoed verbatim into `history` for `PgUp`/`PgDn` scrollback, and because SSH
+clients echo typed input in the clear unless the application itself masks
+it. `cmd/adduser` remains the only way to create the very first account
+(there's no admin session yet to run a lobby command from) and is still
+useful for scripted/headless provisioning.
 
 ---
 

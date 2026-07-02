@@ -4,13 +4,16 @@ import (
 	crand "crypto/rand"
 	"errors"
 	"fmt"
+	"log"
 	"strconv"
 	"strings"
 	"time"
+	"unicode"
 
 	tea "github.com/charmbracelet/bubbletea"
 
 	"github.com/klingon00/retro-vax-bbs/internal/app"
+	"github.com/klingon00/retro-vax-bbs/internal/createuser"
 	"github.com/klingon00/retro-vax-bbs/internal/phone"
 	"github.com/klingon00/retro-vax-bbs/internal/setplan"
 	"github.com/klingon00/retro-vax-bbs/internal/store"
@@ -137,6 +140,12 @@ var adminHelpTopics = []helpTopic{
 		admin: true,
 	},
 	{
+		cmd:   "CREATE USER <username> [role]",
+		usage: "CREATE USER <username> [role]",
+		desc:  "Create an account directly (closed-mode utility). Prompts for a masked password.",
+		admin: true,
+	},
+	{
 		cmd:   "KICK <username>",
 		usage: "KICK <username>",
 		desc:  "Disconnect a user's active session immediately. They can reconnect.",
@@ -216,6 +225,19 @@ var topicDetails = map[string]string{
     INVITE CREATE 3 7d         — 3 uses, expires in 7 days
     INVITE CREATE 1 24h        — 1 use, expires in 24 hours
     LIST INVITES               — show all codes and remaining uses`,
+
+	"CREATE USER": `CREATE USER <username> [role]
+
+  Creates a new account directly — the in-lobby equivalent of the
+  cmd/adduser CLI tool, for closed-mode admin use. Opens a masked
+  password prompt; the password is never typed on the command line
+  or shown in scrollback history.
+
+    role   'user' (default) or 'admin'
+
+  Examples:
+    CREATE USER alice
+    CREATE USER sysop2 admin`,
 
 	"FINGER": `FINGER <username>  (or: SHOW USER <username>)
 
@@ -297,6 +319,7 @@ func init() {
 		"APPROVE":       approveUsage,
 		"DENY":          denyUsage,
 		"DELETE USER":   deleteUserUsage,
+		"CREATE USER":   createUserUsage,
 		"UNLOCK":        unlockUsage,
 		"KICK":          kickUsage,
 		"BAN":           banUsage,
@@ -318,6 +341,7 @@ func init() {
 		{"APPROVE", approveCommand},
 		{"DENY", denyCommand},
 		{"DELETE USER", deleteUserCommand},
+		{"CREATE USER", createUserCommand},
 		{"UNLOCK", unlockCommand},
 		{"KICK", kickCommand},
 		{"BAN", banCommand},
@@ -726,9 +750,34 @@ type launchAppMsg struct {
 // ---- Admin guard --------------------------------------------------------
 
 // requireAdmin returns an error string if m.role != "admin", or "" if ok.
+// Use for read-only admin commands (LIST PENDING, LIST USERS, LIST
+// INVITES) that don't change any state and so don't need an audit trail.
 func requireAdmin(m Model) string {
 	if m.role != "admin" {
 		return "%VAX-BBS-E-NOACCESS, you do not have administrative access."
+	}
+	return ""
+}
+
+// requireAdminLogged is requireAdmin plus an audit log line on success.
+// Use for every admin command that changes state (APPROVE, DENY, KICK,
+// BAN, UNBAN, UNLOCK, DELETE USER, CREATE USER, INVITE CREATE, PURGE
+// PENDING). It's the single chokepoint all of those pass through before
+// doing anything, so logging here — rather than in each handler body —
+// means a future mutating admin command can't skip the audit trail without
+// also skipping its own security gate. This logs the attempt, not a
+// confirmed successful mutation: several handlers return plain English on
+// success with no machine-checkable marker, so "admin ran this command
+// with these arguments" is the reliable signal, same spirit as logging
+// auth failures rather than only auth successes.
+func requireAdminLogged(m Model, action, detail string) string {
+	if m.role != "admin" {
+		return "%VAX-BBS-E-NOACCESS, you do not have administrative access."
+	}
+	if detail != "" {
+		log.Printf("admin action: %s %s %s", m.username, action, detail)
+	} else {
+		log.Printf("admin action: %s %s", m.username, action)
 	}
 	return ""
 }
@@ -743,7 +792,7 @@ func denyUsage(m Model) (string, tea.Cmd) {
 }
 
 func approveCommand(m Model, username string) (string, tea.Cmd) {
-	if e := requireAdmin(m); e != "" {
+	if e := requireAdminLogged(m, "APPROVE", username); e != "" {
 		return e, nil
 	}
 	if m.db == nil {
@@ -756,7 +805,7 @@ func approveCommand(m Model, username string) (string, tea.Cmd) {
 }
 
 func denyCommand(m Model, username string) (string, tea.Cmd) {
-	if e := requireAdmin(m); e != "" {
+	if e := requireAdminLogged(m, "DENY", username); e != "" {
 		return e, nil
 	}
 	if m.db == nil {
@@ -806,7 +855,7 @@ func unlockUsage(m Model) (string, tea.Cmd) {
 }
 
 func unlockCommand(m Model, username string) (string, tea.Cmd) {
-	if e := requireAdmin(m); e != "" {
+	if e := requireAdminLogged(m, "UNLOCK", username); e != "" {
 		return e, nil
 	}
 	if m.db == nil {
@@ -829,7 +878,7 @@ func kickUsage(m Model) (string, tea.Cmd) {
 }
 
 func kickCommand(m Model, username string) (string, tea.Cmd) {
-	if e := requireAdmin(m); e != "" {
+	if e := requireAdminLogged(m, "KICK", username); e != "" {
 		return e, nil
 	}
 	if m.reg.Kick(username) {
@@ -848,7 +897,7 @@ func unbanUsage(m Model) (string, tea.Cmd) {
 }
 
 func banCommand(m Model, args string) (string, tea.Cmd) {
-	if e := requireAdmin(m); e != "" {
+	if e := requireAdminLogged(m, "BAN", args); e != "" {
 		return e, nil
 	}
 	if m.db == nil {
@@ -873,7 +922,7 @@ func banCommand(m Model, args string) (string, tea.Cmd) {
 }
 
 func unbanCommand(m Model, username string) (string, tea.Cmd) {
-	if e := requireAdmin(m); e != "" {
+	if e := requireAdminLogged(m, "UNBAN", username); e != "" {
 		return e, nil
 	}
 	if m.db == nil {
@@ -933,7 +982,11 @@ func inviteCreateCommand(m Model) (string, tea.Cmd) {
 
 // inviteCreateArgCommand handles "INVITE CREATE [args]".
 func inviteCreateArgCommand(m Model, args string) (string, tea.Cmd) {
-	if e := requireAdmin(m); e != "" {
+	detail := args
+	if detail == "" {
+		detail = "(default: 1 use, no expiry)"
+	}
+	if e := requireAdminLogged(m, "INVITE CREATE", detail); e != "" {
 		return e, nil
 	}
 	if m.db == nil {
@@ -1075,8 +1128,8 @@ func generateInviteCode() string {
 // ---- LIST USERS ---------------------------------------------------------
 
 func listUsersCommand(m Model) (string, tea.Cmd) {
-	if m.role != "admin" {
-		return "%VAX-BBS-F-PRIV, Insufficient privilege for LIST USERS.", nil
+	if e := requireAdmin(m); e != "" {
+		return e, nil
 	}
 	users, err := m.db.ListAllUsers()
 	if err != nil {
@@ -1118,8 +1171,8 @@ func deleteUserUsage(m Model) (string, tea.Cmd) {
 }
 
 func deleteUserCommand(m Model, username string) (string, tea.Cmd) {
-	if m.role != "admin" {
-		return "%VAX-BBS-F-PRIV, Insufficient privilege for DELETE USER.", nil
+	if e := requireAdminLogged(m, "DELETE USER", username); e != "" {
+		return e, nil
 	}
 	if username == "" {
 		return deleteUserUsage(m)
@@ -1139,11 +1192,76 @@ func deleteUserCommand(m Model, username string) (string, tea.Cmd) {
 	return fmt.Sprintf("%%VAX-BBS-S-DELETED, Account '%s' has been permanently deleted.", username), nil
 }
 
+// ---- CREATE USER ---------------------------------------------------------
+
+func createUserUsage(m Model) (string, tea.Cmd) {
+	return "Usage: CREATE USER <username> [role]  (role: user (default) or admin)", nil
+}
+
+// createUserCommand validates the requested username and role, then
+// launches the createuser app to collect a masked password. The account
+// isn't created until the password prompt completes — see
+// internal/createuser for that flow.
+func createUserCommand(m Model, args string) (string, tea.Cmd) {
+	if e := requireAdminLogged(m, "CREATE USER", args); e != "" {
+		return e, nil
+	}
+	if m.db == nil {
+		return "%VAX-BBS-E-NODB, database unavailable.", nil
+	}
+
+	parts := strings.Fields(args)
+	if len(parts) < 1 {
+		return createUserUsage(m)
+	}
+	username := parts[0]
+
+	role := "user"
+	if len(parts) >= 2 {
+		role = strings.ToLower(parts[1])
+		if role != "user" && role != "admin" {
+			return fmt.Sprintf("%%VAX-BBS-E-CREATE, invalid role %q; must be 'user' or 'admin'.", parts[1]), nil
+		}
+	}
+
+	if err := validateNewUsername(username); err != nil {
+		return fmt.Sprintf("%%VAX-BBS-E-CREATE, %v", err), nil
+	}
+	if _, err := m.db.GetUserByUsername(username); err == nil {
+		return fmt.Sprintf("%%VAX-BBS-E-CREATE, username %q is already taken.", username), nil
+	} else if !errors.Is(err, store.ErrNotFound) {
+		return fmt.Sprintf("%%VAX-BBS-E-CREATE, %v", err), nil
+	}
+
+	editor := createuser.NewApp(m.db, m.username, username, role)
+	return "", launchAppCmd(editor)
+}
+
+// validateNewUsername applies the same format rules as self-service
+// registration (3-20 chars, letters/digits/underscore) but skips the
+// reserved-word block — an admin creating accounts directly may
+// legitimately want a name like "sysop", which self-registration blocks
+// to stop impersonation attempts.
+func validateNewUsername(s string) error {
+	if len(s) < 3 {
+		return fmt.Errorf("username must be at least 3 characters")
+	}
+	if len(s) > 20 {
+		return fmt.Errorf("username must be 20 characters or fewer")
+	}
+	for _, c := range s {
+		if !unicode.IsLetter(c) && !unicode.IsDigit(c) && c != '_' {
+			return fmt.Errorf("username may only contain letters, numbers, and underscores")
+		}
+	}
+	return nil
+}
+
 // ---- PURGE PENDING ------------------------------------------------------
 
 func purgePendingCommand(m Model) (string, tea.Cmd) {
-	if m.role != "admin" {
-		return "%VAX-BBS-F-PRIV, Insufficient privilege for PURGE PENDING.", nil
+	if e := requireAdminLogged(m, "PURGE PENDING", ""); e != "" {
+		return e, nil
 	}
 	n, err := m.db.PurgeExpiredPendingAccounts(m.pendingExpiry)
 	if err != nil {

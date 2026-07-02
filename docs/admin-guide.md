@@ -12,10 +12,11 @@ implementation notes and known issues, see `open-questions.md`.
 ## Quick-start checklist
 
 1. Build the binary: `go build ./cmd/server`
-2. Create at least one admin account: `go run ./cmd/adduser -username sysop -password '<strong-password>' -role admin`
+2. Create your first admin account: `go run ./cmd/adduser -username sysop -password '<strong-password>' -role admin`
 3. Set environment variables for your deployment (see Configuration below)
 4. Run the server: `go run ./cmd/server` (or the compiled binary)
 5. Connect to the admin listener to verify: `ssh -p 2223 sysop@localhost`
+6. From here on, create additional accounts in-lobby with `CREATE USER` — see below. `cmd/adduser` is only needed again for this first-account bootstrap, or scripted/headless provisioning.
 
 ---
 
@@ -77,9 +78,26 @@ development are built in; set these for any public-facing deployment.
 
 ### `closed` (default)
 
-Only the admin creates accounts using `cmd/adduser`. No self-service
-registration. Correct for private systems where you know every user
-personally and will hand them credentials directly.
+No self-service registration. The admin provisions every account directly.
+Correct for private systems where you know every user personally and will
+hand them credentials directly.
+
+The normal path is the in-lobby `CREATE USER` command, run from an admin
+session on the admin listener:
+
+```
+CREATE USER alice              — creates a regular user account
+CREATE USER sysop2 admin       — creates another admin account
+```
+
+`CREATE USER` prompts for the password with a masked input (like a login
+prompt) rather than taking it as a command argument — the password never
+appears in the command line or in the lobby's scrollback history. See
+**Admin command reference** below.
+
+`cmd/adduser` still exists as a CLI alternative, and is the *only* option
+for the very first account (there's no admin session yet to run a lobby
+command from) or for scripted/headless provisioning:
 
 ```bash
 # Create a regular user account
@@ -129,14 +147,24 @@ to join" on many platforms.
 **Squatting protection:** Pending accounts are automatically deleted after
 `PENDING_EXPIRY_DAYS` (default 7) days if not reviewed. This prevents
 malicious actors from squatting usernames indefinitely. Admins can also
-`REJECT USER <username>` immediately to free a name.
+`DENY <username>` immediately to free a name.
 
 ---
 
 ## Admin command reference
 
-Admin commands are only available on the admin listener. All admin actions
-are logged with the admin's username regardless of visibility settings.
+Admin commands are only available on the admin listener. Every command
+that changes state — creation, deletion, ban/unban, kick, approve/deny,
+invite creation, pending purge — is written to the server log with the
+admin's real username, regardless of that admin's `SET VISIBLE` setting.
+Read-only commands (`LIST PENDING`, `LIST USERS`, `LIST INVITES`) are not
+logged. See **Logging** below for the exact format.
+
+### Account creation
+
+| Command | Description |
+|---|---|
+| `CREATE USER <username> [role]` | Create an account directly. `role` is `user` (default) or `admin`. Opens a masked password prompt — see **Registration modes → closed** above. |
 
 ### Account approval
 
@@ -144,12 +172,13 @@ are logged with the admin's username regardless of visibility settings.
 |---|---|
 | `LIST PENDING` | Show all pending account requests with username, email, and submission date. |
 | `APPROVE <username>` | Activate a pending account. The user can log in immediately with the password they set during registration. |
-| `REJECT USER <username>` | Delete a pending account request. The username becomes available again. |
+| `DENY <username>` | Delete a pending account request. The username becomes available again. |
 
 ### Account maintenance
 
 | Command | Description |
 |---|---|
+| `DELETE USER <username>` | Permanently remove an account and free the username. Cannot be used on your own account. |
 | `UNLOCK <username>` | Clear a login lockout (triggered after 5 consecutive failed password attempts; normally lifts after 15 minutes). |
 
 ### Moderation
@@ -263,21 +292,29 @@ Restart the server afterward.
 
 ### Forgot an admin password
 
-Use `cmd/adduser` to create a new admin account:
+**If another admin account is still usable:** log in as that admin and run
+`DELETE USER <name>` followed by `CREATE USER <name> admin` to recreate the
+account under the same username with a new password. No shell or SQLite
+access needed.
+
+**If you're completely locked out** (no working admin account at all),
+create a new one from the CLI:
 
 ```bash
 go run ./cmd/adduser -username newadmin -password 'new-password' -role admin
 ```
 
-Or reset an existing account's password directly:
+Or reset an existing account's password directly. `cmd/adduser` refuses to
+overwrite an existing username, so mint the hash under a throwaway name and
+copy it over with SQL:
 
 ```bash
-# Get the argon2id hash of the new password
-go run ./cmd/adduser -username existingadmin -password 'new-password'
-# This will fail with "duplicate username" but prints the hash it would
-# have stored; use that hash in a manual UPDATE:
-sqlite3 data/retro-vax-bbs.db \
-  "UPDATE users SET password_hash='<hash>' WHERE username='existingadmin'"
+go run ./cmd/adduser -username tmp_pw_reset -password 'new-password'
+sqlite3 data/retro-vax-bbs.db <<'SQL'
+UPDATE users SET password_hash = (SELECT password_hash FROM users WHERE username = 'tmp_pw_reset')
+  WHERE username = 'existingadmin';
+DELETE FROM users WHERE username = 'tmp_pw_reset';
+SQL
 ```
 
 A cleaner `cmd/resetpw` tool is planned for a future release.
@@ -305,3 +342,39 @@ public auth failure: admin account "sysop" rejected on public listener from 1.2.
 
 For fail2ban integration, write a filter matching `auth failure` in the
 server's log output and point it at `SSH_PORT`.
+
+**Admin command audit log.** Every state-changing admin command logs a
+line with the real admin username, regardless of that admin's visibility
+setting:
+
+```
+admin action: sysop APPROVE alice
+admin action: sysop DENY bob
+admin action: sysop KICK troublemaker
+admin action: sysop BAN troublemaker 24h
+admin action: sysop UNBAN troublemaker
+admin action: sysop UNLOCK alice
+admin action: sysop DELETE USER bob
+admin action: sysop INVITE CREATE 5 7d
+admin action: sysop PURGE PENDING
+```
+
+`CREATE USER` logs twice: once when the command is run (the admin may
+still cancel the password prompt), and once with the actual outcome:
+
+```
+admin action: sysop CREATE USER alice
+admin action: sysop CREATE USER alice (role=user) created
+```
+
+or, if cancelled:
+
+```
+admin action: sysop CREATE USER alice
+admin action: sysop CREATE USER alice (role=user) cancelled, no account created
+```
+
+These log the *attempt* (the command the admin ran, with its arguments),
+not a guaranteed-successful mutation — e.g. `BAN` against a nonexistent
+username still logs the attempt. Read-only commands (`LIST PENDING`,
+`LIST USERS`, `LIST INVITES`) are not logged.
