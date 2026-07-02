@@ -189,6 +189,43 @@ var adminHelpTopics = []helpTopic{
 	},
 }
 
+// adminCommandKeys is the set of canonical command keys (matching the
+// commands-map keys and argCommands prefixes verbatim) that require the
+// admin role. Derived from adminHelpTopics — the same declarative table
+// that already drives what HELP shows — so a new admin command only has
+// to be added there to also be hidden from non-admins in dispatch(): no
+// second list to keep in sync by hand.
+var adminCommandKeys = buildAdminCommandKeys()
+
+func buildAdminCommandKeys() map[string]bool {
+	keys := map[string]bool{
+		// INVITE (bare, no args) shares an admin-only parent with
+		// INVITE CREATE but has no adminHelpTopics entry of its own —
+		// it's the "Usage: INVITE CREATE ..." fallback, registered
+		// separately in the commands map.
+		"INVITE": true,
+	}
+	for _, t := range adminHelpTopics {
+		keys[adminTopicVerb(t.cmd)] = true
+	}
+	return keys
+}
+
+// adminTopicVerb extracts the command verb from a helpTopic.cmd string,
+// e.g. "DELETE USER <username>" -> "DELETE USER", stopping at the first
+// "<...>" or "[...]" placeholder token.
+func adminTopicVerb(cmd string) string {
+	parts := strings.Fields(strings.ToUpper(cmd))
+	verbs := make([]string, 0, len(parts))
+	for _, p := range parts {
+		if strings.HasPrefix(p, "<") || strings.HasPrefix(p, "[") {
+			break
+		}
+		verbs = append(verbs, p)
+	}
+	return strings.Join(verbs, " ")
+}
+
 // topicDetails holds extended help text shown by HELP <command>.
 // Keys are uppercased canonical names; values are multi-line detail strings.
 var topicDetails = map[string]string{
@@ -358,6 +395,13 @@ func init() {
 // uppercased input, and the remainder (the argument) is extracted from
 // the original line to preserve case. Exact-match commands (everything
 // else) are looked up after prefix matching finds nothing.
+//
+// Non-admins never reach an admin-only handler, not even its no-args
+// usage text: dispatch checks adminCommandKeys before calling anything,
+// and reports admin commands as unrecognized rather than "access denied" —
+// same wording a typo would get, so a regular user typing BAN can't tell
+// it from typing gibberish. This is on top of, not instead of, each
+// admin handler's own requireAdmin/requireAdminLogged check.
 func dispatch(line string, m Model) (output string, cmd tea.Cmd) {
 	defer func() {
 		if r := recover(); r != nil {
@@ -372,6 +416,9 @@ func dispatch(line string, m Model) (output string, cmd tea.Cmd) {
 	for _, ac := range argCommands {
 		pfx := ac.prefix + " "
 		if strings.HasPrefix(upper, pfx) {
+			if m.role != "admin" && adminCommandKeys[ac.prefix] {
+				return unknownCommandMsg(upper), nil
+			}
 			// Extract the argument from the original line (not uppercased)
 			// so usernames are passed through as the user typed them.
 			arg := strings.TrimSpace(line[len(pfx):])
@@ -380,11 +427,18 @@ func dispatch(line string, m Model) (output string, cmd tea.Cmd) {
 	}
 
 	// Exact match for everything else.
+	if m.role != "admin" && adminCommandKeys[upper] {
+		return unknownCommandMsg(upper), nil
+	}
 	handler, ok := commands[upper]
 	if !ok {
-		return fmt.Sprintf("%q is not a recognized command. Type HELP for a list.", upper), nil
+		return unknownCommandMsg(upper), nil
 	}
 	return handler(m)
+}
+
+func unknownCommandMsg(upper string) string {
+	return fmt.Sprintf("%q is not a recognized command. Type HELP for a list.", upper)
 }
 
 func helpCommand(m Model) (string, tea.Cmd) {
@@ -411,7 +465,11 @@ func helpCommand(m Model) (string, tea.Cmd) {
 		}
 	}
 
-	b.WriteString("\n  Type HELP <command> for detailed usage, e.g. HELP BAN or HELP INVITE.")
+	if m.role == "admin" {
+		b.WriteString("\n  Type HELP <command> for detailed usage, e.g. HELP BAN or HELP INVITE.")
+	} else {
+		b.WriteString("\n  Type HELP <command> for detailed usage, e.g. HELP FINGER or HELP PHONE.")
+	}
 	return b.String(), nil
 }
 
