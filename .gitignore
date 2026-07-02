@@ -22,3 +22,8 @@ go.work.sum
 # OS / editor cruft
 .DS_Store
 *.swp
+
+# Claude Code project files — kept locally, backed up separately, not
+# shipped in a repo that may go public.
+CLAUDE.md
+.claude/
