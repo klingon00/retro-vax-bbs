@@ -1,0 +1,23 @@
+# Host SSH key + SQLite db — never let these into a build context/image
+# layer. The host key is a private key, the db holds password hashes.
+data/
+*.db
+*.db-journal
+*.db-wal
+*.db-shm
+
+# Build output
+bin/
+dist/
+vms-server
+*.exe
+*.test
+*.out
+
+# VCS / editor / AI-assistant cruft — irrelevant to the build and just
+# bloats build-context transfer
+.git/
+.idea/
+.vscode/
+.claude/
+CLAUDE.md

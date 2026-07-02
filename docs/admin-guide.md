@@ -12,11 +12,12 @@ implementation notes and known issues, see `open-questions.md`.
 ## Quick-start checklist
 
 1. Build the binary: `go build ./cmd/server`
-2. Create your first admin account: `go run ./cmd/adduser -username sysop -password '<strong-password>' -role admin`
-3. Set environment variables for your deployment (see Configuration below)
-4. Run the server: `go run ./cmd/server` (or the compiled binary)
-5. Connect to the admin listener to verify: `ssh -p 2223 sysop@localhost`
-6. From here on, create additional accounts in-lobby with `CREATE USER` — see below. `cmd/adduser` is only needed again for this first-account bootstrap, or scripted/headless provisioning.
+2. Create the data directory (gitignored, doesn't exist on a fresh clone): `mkdir -p data`
+3. Create your first admin account: `go run ./cmd/adduser -username sysop -password '<strong-password>' -role admin`
+4. Set environment variables for your deployment (see Configuration below)
+5. Run the server: `go run ./cmd/server` (or the compiled binary)
+6. Connect to the admin listener to verify: `ssh -p 2223 sysop@localhost`
+7. From here on, create additional accounts in-lobby with `CREATE USER` — see below. `cmd/adduser` is only needed again for this first-account bootstrap, or scripted/headless provisioning.
 
 ---
 
@@ -34,6 +35,77 @@ The server runs **two SSH listeners** with a symmetric role-based partition:
 forward `SSH_PORT` publicly. The public listener rejects admin accounts
 before even checking the password — right-password-wrong-listener and
 wrong-password produce identical responses.
+
+---
+
+## Docker / Unraid deployment
+
+A `Dockerfile`, `docker-compose.yml`, and an Unraid Community Applications
+template (`unraid-template.xml`) are provided at the repo root. The image
+is a multi-stage build producing a static binary in a minimal, shell-less
+final image — consistent with the app's own "no exec/eval, no path to a
+real shell" design.
+
+**Quick-start:**
+
+```bash
+docker compose up -d
+docker exec -it retro-vax-bbs /adduser -username sysop -password '<strong-password>' -role admin
+ssh -p 2223 sysop@localhost
+```
+
+This is the container-world equivalent of the bare-metal quick-start
+checklist above — `docker exec ... /adduser` replaces `go run
+./cmd/adduser`, since both the running server and the one-shot `adduser`
+binary share the same mounted `/data` volume.
+
+### The `/data` volume is required
+
+The server has no fallback for a missing data directory. If `/data` isn't
+mounted to a real, writable location before first boot, the container
+will crash immediately on startup with:
+
+```
+opening database: enabling foreign keys: unable to open database file (14)
+```
+
+This happens *before* the SSH host key would otherwise be auto-generated,
+so a missing volume never gets a chance to self-heal — mount it or the
+container won't come up. (This corrects an over-optimistic claim earlier
+in this guide, in "Host key and database" below: `data/` is only created
+automatically if the directory chain up to it already exists. On a truly
+fresh boot with nothing mounted, it isn't.)
+
+### Network mode: this is the highest-stakes misconfiguration in this guide
+
+`ADMIN_HOST`'s behavior under Docker depends entirely on which network
+mode the container runs in — get this wrong and you can expose the admin
+listener to the internet.
+
+**Bridge mode (the default):** the container has its own network
+namespace and cannot see host VPN/VLAN interfaces at all. Setting
+`ADMIN_HOST` inside the container does **not** restrict anything in this
+mode — leave it at its default. The actual restriction has to come from
+which host IP you bind the admin port's mapping to:
+
+```bash
+docker run -p 100.x.x.x:2223:2223 -p 2222:2222 ...
+```
+
+(`100.x.x.x` above is an example Tailscale IP — bind to whatever host
+interface your VPN/VLAN presents.) The equivalent in Compose is a
+host-IP-scoped entry in the `ports:` list instead of `"2223:2223"`. If you
+publish the admin port without scoping it to a specific host IP, it is
+reachable on every interface the host has — including a public one.
+
+**Host network mode (opt-in):** the container shares the host's network
+namespace directly, so `ADMIN_HOST` behaves exactly as it does on bare
+metal — set it to your real VPN interface IP. On Unraid, this is a
+network-mode toggle in the container's edit screen (advanced view),
+independent of anything the Community Applications template specifies.
+
+Which mode and which VPN/VLAN to use is entirely your call, same as on
+bare metal — the app has no opinion on it either way.
 
 ---
 
@@ -252,7 +324,13 @@ in-system mail.
 ## Host key and database
 
 Both the SSH host key and the SQLite database live in the `data/`
-directory, which is created automatically on first run:
+directory. The SSH host key's *file* is generated automatically on first
+run, but this requires the `data/` directory itself to already exist —
+there's no fallback that creates the directory chain from scratch if it's
+entirely missing. `data/` is gitignored, so a genuinely fresh clone
+doesn't have one; the quick-start checklist above includes a `mkdir -p
+data` step for exactly this reason. Under Docker, the same requirement
+shows up as the volume-mount rule — see Docker / Unraid deployment above.
 
 ```
 data/

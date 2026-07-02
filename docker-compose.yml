@@ -1,0 +1,29 @@
+services:
+  retro-vax-bbs:
+    build: .
+    image: retro-vax-bbs:latest
+    container_name: retro-vax-bbs
+    restart: unless-stopped
+    ports:
+      - "2222:2222"
+      - "2223:2223"
+    environment:
+      SSH_HOST: "0.0.0.0"
+      # ADMIN_HOST is intentionally left at its container-internal default.
+      # In this default bridge network mode, the admin listener's exposure
+      # is controlled by which host IP the 2223 port mapping above is bound
+      # to (e.g. "100.x.x.x:2223:2223" for a Tailscale IP), NOT by setting
+      # ADMIN_HOST — the container can't see host VPN/VLAN interfaces from
+      # inside its own network namespace. See docs/admin-guide.md's
+      # Docker/Unraid section before exposing this port to anything.
+      REGISTRATION_MODE: "closed"
+    volumes:
+      - bbs-data:/data
+      # Bind-mount alternative, if you want the db/host key directly
+      # browsable on the host. Uncomment and remove the named volume above.
+      # Requires the host directory to be pre-created and writable by
+      # whatever UID the container runs as (root by default).
+      # - ./data:/data
+
+volumes:
+  bbs-data:

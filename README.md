@@ -64,9 +64,13 @@ deployment guidance.
 
 ## Running it
 
-For `closed` mode (default), create accounts with `cmd/adduser` first:
+For `closed` mode (default), create accounts with `cmd/adduser` first.
+On a fresh clone, `data/` doesn't exist yet (it's gitignored) — create it
+before the first run, or `adduser`/`server` will fail to open the database:
 
 ```bash
+mkdir -p data
+
 # Regular user account
 go run ./cmd/adduser -username alice -password 'pick-something-decent'
 
@@ -103,7 +107,8 @@ documentation.
 The SSH host key is generated on first run at `data/ssh_host_ed25519`
 (0600 permissions, directory created at 0700), and the account database
 lives alongside it at `data/retro-vax-bbs.db`. Both are gitignored —
-don't commit either.
+don't commit either. Under Docker, `data/` is the container's `/data`
+mount rather than a bare-metal relative path — see Docker / Unraid below.
 
 ## Configuration
 
@@ -127,6 +132,33 @@ The burst default of 5 is intentional — concurrent sessions from one
 account (e.g. PHONE in one window, checking WHO in another) are a core
 feature, and opening a few sessions in quick succession shouldn't trigger
 the limiter for a legitimate user.
+
+## Docker / Unraid
+
+A `Dockerfile` and `docker-compose.yml` are provided at the repo root, and
+an Unraid Community Applications template is at `unraid-template.xml`.
+This section is a quick-start only — for full deployment and security
+guidance (especially around the admin listener), see the Docker/Unraid
+section of `docs/admin-guide.md` before exposing anything to a real
+network.
+
+```bash
+docker compose up -d
+```
+
+The image bakes in `SSH_HOST=0.0.0.0` so the public listener is reachable
+out of the box. `ADMIN_HOST` is deliberately **not** given a container
+default — how you restrict the admin listener (Tailscale, WireGuard,
+VLAN, Docker host-networking, etc.) is your call, and setting `ADMIN_HOST`
+alone does not restrict anything in Docker's default bridge network mode.
+Read the admin-guide section before forwarding port 2223 anywhere.
+
+Bootstrap the first admin account the same way the bare-metal quick-start
+does, just via `docker exec`:
+
+```bash
+docker exec -it retro-vax-bbs /adduser -username sysop -password '<strong-password>' -role admin
+```
 
 ## Module path
 
