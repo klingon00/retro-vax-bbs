@@ -149,9 +149,14 @@ docker compose up -d
 The image bakes in `SSH_HOST=0.0.0.0` so the public listener is reachable
 out of the box. `ADMIN_HOST` is deliberately **not** given a container
 default — how you restrict the admin listener (Tailscale, WireGuard,
-VLAN, Docker host-networking, etc.) is your call, and setting `ADMIN_HOST`
-alone does not restrict anything in Docker's default bridge network mode.
-Read the admin-guide section before forwarding port 2223 anywhere.
+VLAN, Docker host-networking, etc.) is your call. The provided
+`docker-compose.yml` sets `ADMIN_HOST=0.0.0.0`, which looks unsafe but
+isn't: in Docker's default bridge network mode it's required just for the
+admin listener to be reachable at all (the app's own `localhost` default
+binds to the container's own loopback, unreachable via Docker's port
+forwarding), and it provides no security by itself either way — that
+comes entirely from scoping the admin port's host-IP mapping. Read the
+admin-guide Docker/Unraid section before forwarding port 2223 anywhere.
 
 Bootstrap the first admin account the same way the bare-metal quick-start
 does, just via `docker exec`:

@@ -19,13 +19,28 @@ services:
       # - "100.x.x.x:2223:2223"
     environment:
       SSH_HOST: "0.0.0.0"
-      # ADMIN_HOST is intentionally left at its container-internal default.
-      # In this default bridge network mode, the admin listener's exposure
-      # is controlled entirely by the host-IP scoping of the port mapping
-      # above, NOT by setting ADMIN_HOST — the container can't see host
-      # VPN/VLAN interfaces from inside its own network namespace. See
-      # docs/admin-guide.md's Docker/Unraid section before exposing this
-      # port to anything.
+      # ADMIN_HOST must be 0.0.0.0 here — NOT for security (it provides
+      # none in bridge mode; see below) but for basic connectivity. The
+      # app's own default is "localhost", which inside a container binds
+      # to the container's own loopback interface — a bind Docker's
+      # bridge-mode port forwarding can never reach, since forwarded
+      # traffic always arrives via the container's eth0/bridge IP, never
+      # its loopback. Leaving this at the app default produces a TCP
+      # connection reset on connect (often misreported by SSH clients as
+      # a failed key exchange), not a clean auth rejection.
+      #
+      # The actual security boundary in bridge mode is the host-IP
+      # scoping of the port mapping above (127.0.0.1 or a VPN/VLAN IP) —
+      # ADMIN_HOST=0.0.0.0 here only controls which interface *inside*
+      # the container's own namespace it listens on, which is moot once
+      # nothing outside the scoped host IP can reach the port at all.
+      #
+      # If you switch this container to host network mode instead of
+      # bridge, change this to your real VPN interface IP and drop the
+      # 0.0.0.0 — at that point it behaves exactly like bare metal, and
+      # 0.0.0.0 would then be genuinely unsafe. See docs/admin-guide.md's
+      # Docker/Unraid section.
+      ADMIN_HOST: "0.0.0.0"
       REGISTRATION_MODE: "closed"
     volumes:
       - bbs-data:/data

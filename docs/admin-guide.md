@@ -85,24 +85,39 @@ listener to the internet.
 **Bridge mode (the default):** the container has its own network
 namespace and cannot see host VPN/VLAN interfaces at all. Setting
 `ADMIN_HOST` inside the container does **not** restrict anything in this
-mode — leave it at its default. The actual restriction has to come from
-which host IP you bind the admin port's mapping to:
+mode. However — **`ADMIN_HOST` must be set to `0.0.0.0` in this mode**,
+which sounds backwards given the bare-metal advice below, but is required
+for basic connectivity, not security: the app's own default of
+`localhost` binds to the container's own loopback interface, which
+Docker's bridge-mode port forwarding can never reach (forwarded traffic
+always arrives via the container's `eth0`/bridge IP, never its loopback).
+Leaving `ADMIN_HOST` at the app default doesn't fail closed — it fails
+with a TCP-level connection reset on connect, which SSH clients often
+report confusingly as a failed key exchange rather than a plain
+"connection refused." The actual restriction has to come from which host
+IP you bind the admin port's mapping to:
 
 ```bash
-docker run -p 100.x.x.x:2223:2223 -p 2222:2222 ...
+docker run -e ADMIN_HOST=0.0.0.0 -p 100.x.x.x:2223:2223 -p 2222:2222 ...
 ```
 
 (`100.x.x.x` above is an example Tailscale IP — bind to whatever host
 interface your VPN/VLAN presents.) The equivalent in Compose is a
 host-IP-scoped entry in the `ports:` list instead of `"2223:2223"`. If you
 publish the admin port without scoping it to a specific host IP, it is
-reachable on every interface the host has — including a public one.
+reachable on every interface the host has — including a public one,
+regardless of what `ADMIN_HOST` is set to.
 
 **Host network mode (opt-in):** the container shares the host's network
 namespace directly, so `ADMIN_HOST` behaves exactly as it does on bare
-metal — set it to your real VPN interface IP. On Unraid, this is a
-network-mode toggle in the container's edit screen (advanced view),
-independent of anything the Community Applications template specifies.
+metal — set it to your real VPN interface IP, **not** `0.0.0.0`. If
+you're switching a container from bridge mode to host mode, remember to
+change `ADMIN_HOST` away from the `0.0.0.0` bridge-mode setting above —
+left at `0.0.0.0` in host mode, it really would expose the admin listener
+on every interface the host has, same as the bare-metal warning in the
+Configuration reference below. On Unraid, this is a network-mode toggle
+in the container's edit screen (advanced view), independent of anything
+the Community Applications template specifies.
 
 Which mode and which VPN/VLAN to use is entirely your call, same as on
 bare metal — the app has no opinion on it either way.
