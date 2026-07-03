@@ -44,7 +44,7 @@ Per the build order in `docs/open-questions.md`:
 - [x] SET PASSWORD (self-service password change)
 - [x] Lobby HELP expansion
 - [x] Lobby scrollback (PgUp / PgDn / End)
-- [ ] Docker packaging
+- [x] Docker packaging
 
 ## ⚠️ Security status — read before running anywhere but your laptop
 

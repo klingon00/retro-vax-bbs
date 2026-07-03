@@ -47,7 +47,7 @@ These came up but were intentionally pushed past v1 — don't reopen them withou
 - [x] SET PLAN / SET PLAN CLEAR — **complete** (2026-06-28)
 - [x] Lobby HELP expansion — **complete** (2026-06-28)
 - [x] SET PASSWORD / RESET PASSWORD / EXPIRE PASSWORD — **complete** (2026-07-02)
-- [ ] Docker packaging
+- [x] Docker packaging — **complete** (2026-07-02, see implementation notes below)
 
 ---
 
@@ -490,9 +490,65 @@ Other implementation notes:
   model for the forced case), `internal/store/password.go` (`SetPassword`,
   `ExpirePassword`), `internal/store/password_test.go`.
 
-## Next concrete steps (as of 2026-06-28)
+## Docker / Unraid packaging — complete (2026-07-02)
+
+`Dockerfile` (multi-stage, `golang:1.25-bookworm` builder →
+`gcr.io/distroless/static-debian12` final, both `cmd/server` and
+`cmd/adduser` baked in, static binary via `CGO_ENABLED=0` — no source
+changes needed, the pure-Go `modernc.org/sqlite` choice already made this
+possible), `docker-compose.yml`, and `unraid-template.xml` at the repo
+root. Verified end-to-end on real hardware (build, boot, `docker exec
+adduser` bootstrap, admin login on 2223, regular user + PHONE app), not
+just build-clean.
+
+Two real gotchas found during testing, worth remembering before touching
+this area again:
+
+- **`data/` has no `os.MkdirAll` anywhere in the app**, and is gitignored
+  — a truly fresh clone or fresh container crashes on first run with
+  `unable to open database file (14)` in `store.Open()`, *before* the SSH
+  host-key auto-generation code (which genuinely does `os.MkdirAll`) is
+  ever reached. This affects bare metal too, not just Docker — the
+  quick-start checklists in both README.md and admin-guide.md now include
+  a `mkdir -p data` step. Deliberately fixed at the packaging/docs layer,
+  not by adding `os.MkdirAll` to Go source — see the WORKDIR-equals-mount-
+  point design in the Dockerfile.
+- **`ADMIN_HOST`'s bare-metal-safe default (`localhost`) actively breaks
+  connectivity in containerized bridge-mode Docker**, and this was *not*
+  caught by build/vet/local review — it only surfaced testing a real SSH
+  connection. `localhost` inside a container binds to the container's own
+  loopback interface, which Docker's bridge-mode port forwarding can
+  never reach (forwarded traffic always arrives via the container's
+  `eth0`/bridge IP). Symptom was a TCP-level connection reset that SSH
+  clients reported as a failed key exchange — easy to misdiagnose as an
+  auth or host-key problem instead of a network-layer one. Fix:
+  `docker-compose.yml` and `unraid-template.xml` both explicitly set
+  `ADMIN_HOST=0.0.0.0` for bridge mode — safe there since `ADMIN_HOST`
+  provides zero access restriction in bridge mode regardless of its
+  value (the host-IP-scoped port mapping is the real boundary), but
+  **only** in bridge mode. Anyone switching a container to host network
+  mode must change `ADMIN_HOST` back to a real VPN interface IP, or
+  `0.0.0.0` there really would expose the admin listener on every host
+  interface. The lesson: a config value that's a genuine security
+  guard on bare metal can be a pure no-op with a connectivity trap
+  hiding behind it once containerized — verify both properties
+  independently, don't assume the security reasoning also covers
+  correctness.
+
+Also deliberately **not** done as part of this work, flagged as
+follow-ups: publishing an image to GHCR (`ghcr.io/klingon00/retro-vax-bbs`
+— the Unraid template's `Repository`/`Registry` fields already point
+there, but nothing builds/pushes it yet; needs a GitHub Actions workflow),
+an Unraid CA icon asset, and eventual submission to the Community
+Applications repo for public listing (only needed if this should be
+discoverable by other Unraid users, not for self-hosting via "Template
+URL").
+
+## Next concrete steps (as of 2026-07-02)
 
 1. **VAX/VMS command abbreviation** — shortest unambiguous prefix (DCL
    style). Nice-to-have, non-blocking.
-2. **Docker packaging** — straightforward given the single-binary build.
-   Required before any Unraid Community Apps work.
+2. **GHCR publish workflow** — GitHub Actions to build and push the image
+   on tag/release, so the Unraid template's `Repository` field resolves
+   to something real. Blocks public/remote use of the Unraid template
+   (self-hosting by building the image locally already works today).
