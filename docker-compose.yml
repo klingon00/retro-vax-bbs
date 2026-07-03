@@ -6,16 +6,26 @@ services:
     restart: unless-stopped
     ports:
       - "2222:2222"
-      - "2223:2223"
+      # Admin port (2223) is NOT published by default. Docker's plain
+      # "HOST:CONTAINER" shorthand binds to 0.0.0.0 on the host — every
+      # interface the host has, including a public one — which would undo
+      # the dual-listener security model in one line. Uncomment exactly
+      # one of the two lines below, deliberately:
+      #
+      # Local testing only (loopback, not reachable from your LAN):
+      # - "127.0.0.1:2223:2223"
+      #
+      # Real deployment, scoped to a specific VPN/VLAN interface IP:
+      # - "100.x.x.x:2223:2223"
     environment:
       SSH_HOST: "0.0.0.0"
       # ADMIN_HOST is intentionally left at its container-internal default.
       # In this default bridge network mode, the admin listener's exposure
-      # is controlled by which host IP the 2223 port mapping above is bound
-      # to (e.g. "100.x.x.x:2223:2223" for a Tailscale IP), NOT by setting
-      # ADMIN_HOST — the container can't see host VPN/VLAN interfaces from
-      # inside its own network namespace. See docs/admin-guide.md's
-      # Docker/Unraid section before exposing this port to anything.
+      # is controlled entirely by the host-IP scoping of the port mapping
+      # above, NOT by setting ADMIN_HOST — the container can't see host
+      # VPN/VLAN interfaces from inside its own network namespace. See
+      # docs/admin-guide.md's Docker/Unraid section before exposing this
+      # port to anything.
       REGISTRATION_MODE: "closed"
     volumes:
       - bbs-data:/data
