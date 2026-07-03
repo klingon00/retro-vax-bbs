@@ -544,11 +544,66 @@ Applications repo for public listing (only needed if this should be
 discoverable by other Unraid users, not for self-hosting via "Template
 URL").
 
-## Next concrete steps (as of 2026-07-02)
+## Public release prep + GHCR publish workflow — complete (2026-07-03)
+
+Repo is going fully public (source + GHCR package both), to enable eventual
+Unraid Community Applications submission — a private-repo-plus-public-image
+split was considered and rejected as unusual and trust-undermining for an
+SSH-facing self-hosted service people are vetting before running at home.
+
+Before flipping any visibility switch, audited current tree + full git
+history for anything that shouldn't go public: no secrets/tokens/keys, no
+real full name, no real email beyond the GitHub-linked one, no laptop
+username/hostname leaks. Clean, except for one old placeholder example
+username (a common first name, not a real one — deliberately not spelled
+out here, see below) left in a few files/tests from before an earlier pass
+only caught it in README.md.
+
+- **Fixed the remaining occurrences of the old placeholder** — `"alice"` in
+  `cmd/adduser/main.go` and `internal/phone/app.go`, but **`"carol"`** in
+  `internal/registry/registry_test.go` and **`"BOB"`** in
+  `internal/phone/layout.go`'s ASCII diagram. Both needed a different
+  replacement than the obvious `"alice"` because each file already had its
+  own `"alice"`/`ALICE` example elsewhere — a blind global find-and-replace
+  would have created a duplicate test username (breaking an
+  alphabetical-sort assertion) and a redundant diagram label, respectively.
+  Only caught by reading the files directly, not by grepping for the string
+  and assuming one replacement fits everywhere.
+- **Added `.github/workflows/docker-publish.yml`**: builds and pushes to
+  `ghcr.io/klingon00/retro-vax-bbs` on `v*.*.*` tag push, tags both the
+  version and `latest`, amd64-only (Dockerfile has no `GOARCH` pin and
+  `ubuntu-latest` runners are amd64, so no buildx/multi-arch matrix needed),
+  authenticated via the built-in `GITHUB_TOKEN` — no PAT.
+- **Git history rewrite via `git-filter-repo`** to scrub the old placeholder
+  from all 29 historical commits, since the repo was still private with exactly one
+  clone in existence — the one moment a rewrite is genuinely safe, closing
+  permanently the instant the repo goes public. Two things worth remembering
+  if this comes up again: (1) `git filter-repo`'s `--replace-text` only
+  rewrites blob/file content, **not commit messages** — that needs the
+  separate `--replace-message` flag (same file syntax), run together in one
+  pass; `--replace-text` alone left the string sitting in two commit
+  messages. (2) a same-machine `git clone` without `--no-local` hardlinks
+  objects with the source repo, and `git filter-repo` refuses to run against
+  that — needs a genuinely independent clone. Verified clean afterward via
+  `git log --all -p` (zero hits for the word-boundary pattern, `wrong` still
+  intact as a sanity check that the boundary matching worked), plus a full
+  `go build && go vet && gofmt -l` pass on the rewritten history before the
+  force-push, which happened only after explicit confirmation.
+
+**Still open — manual GitHub UI steps, not automatable from a sandboxed
+Claude session (no `gh` CLI / network access)**:
+1. Verify the rewritten history landed cleanly on GitHub.
+2. Flip the repo to public (Settings → General → Danger Zone).
+3. Push a first version tag to trigger the workflow.
+4. Check/flip the GHCR package's visibility to public after the first
+   successful run (new packages have historically defaulted to private
+   regardless of the linked repo's visibility — needs a live check, not
+   assumed).
+
+## Next concrete steps
 
 1. **VAX/VMS command abbreviation** — shortest unambiguous prefix (DCL
    style). Nice-to-have, non-blocking.
-2. **GHCR publish workflow** — GitHub Actions to build and push the image
-   on tag/release, so the Unraid template's `Repository` field resolves
-   to something real. Blocks public/remote use of the Unraid template
-   (self-hosting by building the image locally already works today).
+2. Unraid Community Applications submission — icon asset, CA repo listing —
+   only after the manual GHCR steps above are confirmed working end-to-end
+   (`docker pull` succeeding anonymously).
