@@ -9,7 +9,7 @@
   <Project>https://github.com/klingon00/retro-vax-bbs</Project>
   <Overview>Self-hosted SSH multi-user BBS with a retro DEC VAX/VMS terminal aesthetic. Runs two separate SSH listeners — one for regular users, one admin-only — so you can safely expose the public listener while keeping the admin listener behind your own VPN/VLAN. See the README and admin-guide (docs/admin-guide.md) in the project repo for full documentation before exposing the admin port to anything.</Overview>
   <Category>Network:Other</Category>
-  <Icon></Icon>
+  <Icon>https://raw.githubusercontent.com/klingon00/retro-vax-bbs/main/icon.png</Icon>
   <Config Name="Public SSH Port" Target="2222" Default="2222" Mode="tcp" Type="Port" Display="always" Required="true" Mask="false">2222</Config>
   <Config Name="Admin SSH Port" Target="2223" Default="2223" Mode="tcp" Type="Port" Display="always" Required="true" Mask="false" Description="Admin listener — admin accounts only, never forward this to the internet. In the default Bridge network mode, restrict who can reach this port by binding its host-side IP here to a VPN/VLAN-only address (e.g. your Tailscale IP) instead of leaving it open on all interfaces — do not rely on the ADMIN_HOST variable below to do this for you in Bridge mode.">2223</Config>
   <Config Name="Data" Target="/data" Default="/mnt/user/appdata/retro-vax-bbs" Mode="rw" Type="Path" Display="always" Required="true" Mask="false" Description="Persistent SQLite database and SSH host key. Required — the container will crash on startup without a writable directory mounted here. Back this up before any image upgrade.">/mnt/user/appdata/retro-vax-bbs</Config>
