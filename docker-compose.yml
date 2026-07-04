@@ -13,7 +13,7 @@ services:
       # one of the two lines below, deliberately:
       #
       # Local testing only (loopback, not reachable from your LAN):
-      # - "127.0.0.1:2223:2223"
+      - "127.0.0.1:2223:2223"
       #
       # Real deployment, scoped to a specific VPN/VLAN interface IP:
       # - "100.x.x.x:2223:2223"
@@ -42,6 +42,16 @@ services:
       # Docker/Unraid section.
       ADMIN_HOST: "0.0.0.0"
       REGISTRATION_MODE: "closed"
+      # Optional: create the first admin account automatically at startup
+      # instead of `docker exec -it retro-vax-bbs /adduser ...`. Mainly for
+      # Unraid's WebUI-driven template flow (see unraid-template.xml) — for
+      # compose, docker exec works fine too. Both must be set together, or
+      # left both unset (the default). Only takes effect while zero accounts
+      # exist — see docs/admin-guide.md's Docker/Unraid section for why
+      # that also makes this a deliberate emergency re-bootstrap lever, and
+      # for the recommendation to clear both vars after first login.
+      # BOOTSTRAP_ADMIN_USERNAME: "sysop"
+      # BOOTSTRAP_ADMIN_PASSWORD: "change-me-strong-password"
     volumes:
       - bbs-data:/data
       # Bind-mount alternative, if you want the db/host key directly

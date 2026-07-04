@@ -46,6 +46,40 @@ func TestCreateAndGetUser(t *testing.T) {
 	}
 }
 
+func TestCountUsers(t *testing.T) {
+	s := openTestStore(t)
+
+	n, err := s.CountUsers()
+	if err != nil {
+		t.Fatalf("CountUsers: %v", err)
+	}
+	if n != 0 {
+		t.Errorf("got %d users on a fresh store, want 0", n)
+	}
+
+	if _, err := s.CreateUser("first", "hash", "admin"); err != nil {
+		t.Fatalf("CreateUser: %v", err)
+	}
+	n, err = s.CountUsers()
+	if err != nil {
+		t.Fatalf("CountUsers: %v", err)
+	}
+	if n != 1 {
+		t.Errorf("got %d users after one CreateUser, want 1", n)
+	}
+
+	if _, err := s.CreateUser("second", "hash", "user"); err != nil {
+		t.Fatalf("CreateUser: %v", err)
+	}
+	n, err = s.CountUsers()
+	if err != nil {
+		t.Fatalf("CountUsers: %v", err)
+	}
+	if n != 2 {
+		t.Errorf("got %d users after two CreateUser calls, want 2", n)
+	}
+}
+
 func TestGetUserByUsername_NotFound(t *testing.T) {
 	s := openTestStore(t)
 

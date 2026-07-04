@@ -167,8 +167,17 @@ forwarding), and it provides no security by itself either way — that
 comes entirely from scoping the admin port's host-IP mapping. Read the
 admin-guide Docker/Unraid section before forwarding port 2223 anywhere.
 
-Bootstrap the first admin account the same way the bare-metal quick-start
-does, just via `docker exec`:
+Bootstrap the first admin account one of two ways:
+
+- **Unraid / WebUI-only setups**: set `BOOTSTRAP_ADMIN_USERNAME` and
+  `BOOTSTRAP_ADMIN_PASSWORD` as container variables (both, or leave both
+  blank) and start the container — it creates the account itself on first
+  boot. This exists specifically because the final image has no shell, so
+  Unraid's WebUI "Console" button can't reach it for a `docker exec`. See
+  `docs/admin-guide.md`'s Docker/Unraid section for the recovery-lever
+  caveat and why you should clear both fields once you've confirmed login.
+- **Compose / terminal access**: the same way the bare-metal quick-start
+  does, just via `docker exec`:
 
 ```bash
 docker exec -it retro-vax-bbs /adduser -username sysop -password '<strong-password>' -role admin

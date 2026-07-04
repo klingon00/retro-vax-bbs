@@ -59,6 +59,44 @@ checklist above — `docker exec ... /adduser` replaces `go run
 ./cmd/adduser`, since both the running server and the one-shot `adduser`
 binary share the same mounted `/data` volume.
 
+### Bootstrapping the first admin account without a shell (Unraid)
+
+The `docker exec ... /adduser` step above requires a real terminal —
+fine for compose users, but Unraid's whole workflow is WebUI-driven, and
+its per-container "Console" button (which normally execs a shell into a
+running container) can't work here at all, since the final image is
+shell-less by design (see above). There's no way to reach `/adduser`
+through Unraid's UI as documented.
+
+Instead, set two container variables — `BOOTSTRAP_ADMIN_USERNAME` and
+`BOOTSTRAP_ADMIN_PASSWORD` (both are exposed as WebUI fields in
+`unraid-template.xml`, the password field masked) — and start the
+container. At startup, if both are set and the database has zero accounts,
+the server creates that account itself, logs the username (never the
+password) on success, and continues starting normally. Leaving both unset
+is the default and changes nothing.
+
+Two things worth understanding before using this:
+
+- **Both vars must be set together, or both left blank.** Setting only one
+  is treated as a misconfiguration and the container fails to start with a
+  clear log message, rather than starting in a half-configured state.
+- **This is also your emergency recovery lever, not just a first-boot
+  convenience.** The check is "does the database currently have zero
+  accounts," not "is this the very first boot ever." If every admin
+  account is later deleted, leaving these variables set means the *next*
+  container restart re-creates the account automatically. The "Forgot an
+  admin password" / "All admin accounts are banned" procedures further
+  below assume bare-metal `sqlite3`/`go run ./cmd/adduser` access, which
+  this shell-less image doesn't have at all — so for Docker/Unraid, this
+  bootstrap mechanism doubles as the only real recovery path if you're
+  ever fully locked out. Decide deliberately: clear both variables once
+  you've confirmed login if you don't want that standing recovery option,
+  or leave them set (understanding the trade-off) if you do. Either way,
+  the password field being masked in Unraid's UI is cosmetic only — the
+  value is still stored in plaintext in the template's saved config and in
+  `docker inspect` output, so don't treat it as real secret storage.
+
 ### The `/data` volume is required
 
 The server has no fallback for a missing data directory. If `/data` isn't
@@ -380,6 +418,17 @@ dual-listener split are all always active regardless of deployment mode.
 ---
 
 ## Emergency procedures
+
+**Docker/Unraid note:** every procedure below assumes bare-metal shell and
+`sqlite3`/`go run ./cmd/adduser` access. None of it reaches the shell-less
+Docker image. `BOOTSTRAP_ADMIN_USERNAME`/`BOOTSTRAP_ADMIN_PASSWORD` (see
+"Bootstrapping the first admin account without a shell" above) is a
+Docker/Unraid recovery option, but only for the "every account has been
+*deleted*" case — it triggers on zero rows in the `users` table, which a
+merely-banned account doesn't produce (a banned row still exists). For the
+"all admin accounts are banned" case just below, there is currently no
+Docker/Unraid-reachable recovery at all — that gap is worth revisiting if
+it comes up in practice.
 
 ### All admin accounts are banned
 

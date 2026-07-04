@@ -431,6 +431,15 @@ func (s *Store) CountPendingAccounts() (int, error) {
 	return n, err
 }
 
+// CountUsers returns the total number of accounts of any status, used to
+// gate the Docker/Unraid bootstrap-admin startup check (see cmd/server) —
+// it only creates an account when this is zero.
+func (s *Store) CountUsers() (int, error) {
+	var n int
+	err := s.db.QueryRow(`SELECT COUNT(*) FROM users`).Scan(&n)
+	return n, err
+}
+
 // ---- Ban / suspend -------------------------------------------------------
 
 // BanUser sets a user's status to 'suspended' and records when the ban

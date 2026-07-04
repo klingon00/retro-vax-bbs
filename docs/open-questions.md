@@ -616,6 +616,51 @@ even though the triggering git tag does — pushing `v0.1.0` publishes as
 up the anonymous-pull test until caught; now documented in README's Docker
 section too.
 
+## Bootstrap admin account via env vars (Docker/Unraid first-run fix)
+
+the operator tested a custom Unraid template against the public image and flagged
+that first-run account creation isn't Unraid-friendly. Root cause: the only
+documented bootstrap path is `docker exec -it retro-vax-bbs /adduser ...`,
+but the final image is `FROM gcr.io/distroless/static-debian12` — no shell.
+Unraid's WebUI "Console" button execs a shell into the container to give an
+operator a terminal; with no shell in the image, that button is simply dead
+here, and Unraid's whole workflow is WebUI-driven, not terminal-driven.
+
+Added two optional env vars, `BOOTSTRAP_ADMIN_USERNAME` and
+`BOOTSTRAP_ADMIN_PASSWORD`. At startup, if both are set and
+`Store.CountUsers()` (new method, mirrors `CountPendingAccounts`) is zero,
+the server creates that admin account itself — same `auth.HashPassword` +
+`db.CreateUser` calls `cmd/adduser` already makes — and logs success (never
+the password). Neither set → no behavior change. Exactly one set, or the
+username case-insensitively equals `"new"` (reserved for self-registration,
+would create an unreachable account) → `log.Fatalln`, fail fast rather than
+start half-configured. See `cmd/server/main.go`'s `bootstrapAdminAccount`
+for the implementation and full rationale in comments.
+
+**Deliberately not a one-time-only mechanism.** Gating on `CountUsers()==0`
+rather than a first-boot marker file means if every account is later
+deleted (`DeleteUser` is an unguarded hard delete, reachable via lobby
+`DELETE USER`), leaving the bootstrap vars set lets the next restart
+re-create the account. This was a genuine design fork — the operator chose to keep
+it as a recovery lever rather than close it off, specifically because
+`docs/admin-guide.md`'s existing "Emergency procedures" assume bare-metal
+shell/`sqlite3` access and don't reach this image at all; without this
+mechanism there'd be no Docker/Unraid recovery path if every account were
+deleted. (It does *not* help the "admin accounts are banned but not
+deleted" case — a banned row still counts toward `CountUsers()` — that gap
+is still open, noted directly in admin-guide.md's Emergency procedures
+section.) Also read the password directly via `os.Getenv` rather than
+threading it through `loadConfig()`'s `config` struct — that struct gets
+dumped wholesale in one `log.Printf` at startup, which would have logged
+the password in plaintext.
+
+Docs updated in `README.md` and `docs/admin-guide.md` (new "Bootstrapping
+the first admin account without a shell" subsection, plus a correction note
+in "Emergency procedures"); `unraid-template.xml` gained two `Config`
+entries (password field `Mask="true"`, noted as cosmetic-only — still
+plaintext in the template file and `docker inspect`); `docker-compose.yml`
+got the same two vars, commented out by default.
+
 ## Next concrete steps
 
 1. **VAX/VMS command abbreviation** — shortest unambiguous prefix (DCL

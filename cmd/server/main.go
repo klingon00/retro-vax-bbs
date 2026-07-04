@@ -159,6 +159,8 @@ func main() {
 		}()
 	}
 
+	bootstrapAdminAccount(db)
+
 	publicLimiter := newLimiter(cfg)
 	adminLimiter := newLimiter(cfg)
 
@@ -545,4 +547,51 @@ func envFloat(key string, fallback float64) float64 {
 		return fallback
 	}
 	return f
+}
+
+// bootstrapAdminAccount lets Docker/Unraid operators create the first admin
+// account via env vars instead of `docker exec ... /adduser` — the final
+// image is distroless (no shell), so Unraid's WebUI "Console" button can't
+// reach it. Read directly via os.Getenv rather than through loadConfig's
+// config struct, since loadConfig logs every field of it and this must
+// never appear in a log line.
+//
+// Gated on zero existing accounts, which also makes this a deliberate
+// emergency-recovery lever: if every admin account is ever deleted, leaving
+// these vars set lets a restart re-bootstrap the account. Docker/Unraid has
+// no other recovery path (docs/admin-guide.md's bare-metal emergency
+// procedures don't reach a shell-less image), so this is intentional, not
+// an oversight — operators should clear both vars after first login only
+// if they're confident they won't need that lever.
+func bootstrapAdminAccount(db *store.Store) {
+	username := os.Getenv("BOOTSTRAP_ADMIN_USERNAME")
+	password := os.Getenv("BOOTSTRAP_ADMIN_PASSWORD")
+
+	if username == "" && password == "" {
+		return
+	}
+	if username == "" || password == "" {
+		log.Fatalln("config: BOOTSTRAP_ADMIN_USERNAME and BOOTSTRAP_ADMIN_PASSWORD must both be set together (or both left unset)")
+	}
+	if strings.EqualFold(username, "new") {
+		log.Fatalln(`config: BOOTSTRAP_ADMIN_USERNAME cannot be "new" — that username is reserved for self-registration and could never log in`)
+	}
+
+	n, err := db.CountUsers()
+	if err != nil {
+		log.Fatalf("bootstrap admin: counting existing users: %v", err)
+	}
+	if n > 0 {
+		log.Printf("bootstrap admin: BOOTSTRAP_ADMIN_USERNAME/PASSWORD set but ignored — %d account(s) already exist", n)
+		return
+	}
+
+	hash, err := auth.HashPassword(password)
+	if err != nil {
+		log.Fatalf("bootstrap admin: hashing password: %v", err)
+	}
+	if _, err := db.CreateUser(username, hash, "admin"); err != nil {
+		log.Fatalf("bootstrap admin: creating account %q: %v", username, err)
+	}
+	log.Printf("bootstrap admin: created initial admin account %q", username)
 }
