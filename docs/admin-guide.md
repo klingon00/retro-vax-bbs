@@ -96,6 +96,28 @@ Two things worth understanding before using this:
   the password field being masked in Unraid's UI is cosmetic only — the
   value is still stored in plaintext in the template's saved config and in
   `docker inspect` output, so don't treat it as real secret storage.
+- **If you're building your own custom template instead of using
+  `unraid-template.xml` as-is**, make sure both of these fields have an
+  empty `Default`. Unraid re-populates a field from its template `Default`
+  on Apply whenever the WebUI field is left blank — so a non-empty default
+  means clearing the field doesn't actually unset it. This was confirmed on
+  real hardware: a non-empty default on the username field alone was enough
+  to trip the "one set, one not" fatal-error guard above even after
+  clearing both boxes in the UI, since the username kept silently
+  reappearing. The same mistake on the password field would be worse — a
+  known fixed password would silently apply instead of failing loud.
+
+### Updating a manually-added container
+
+This project isn't in Unraid's Community Applications catalog yet, so if
+you added it via a custom/manual template rather than through CA, it does
+**not** get Unraid's automatic "update available" badge — that check is
+tied to a container being CA-registered. To actually pull a newer `:latest`
+(or any new version tag), either `docker pull` the image and use Unraid's
+"Force Update," or stop the container and re-Apply its template. A stale
+manually-added container will otherwise sit on whatever image was present
+at creation time indefinitely, with no visible signal that a newer one
+exists.
 
 ### The `/data` volume is required
 

@@ -661,6 +661,38 @@ entries (password field `Mask="true"`, noted as cosmetic-only — still
 plaintext in the template file and `docker inspect`); `docker-compose.yml`
 got the same two vars, commented out by default.
 
+**Real-hardware Unraid verification, 2026-07-04.** the operator tested a custom
+template on real Unraid hardware and found one genuine bug — not in this
+repo's template, but a lesson for anyone building their own: his
+`BOOTSTRAP_ADMIN_USERNAME` field had a non-empty `Default` in the XML.
+Unraid re-populates a field from its `Default` on Apply whenever the WebUI
+field is left blank, so clearing the username field didn't actually unset
+it — it silently reappeared, tripping the "one set, one not" fatal-error
+guard for the wrong reason (a stale default value, not an actual
+misconfiguration). Checked this repo's own `unraid-template.xml`: both
+`BOOTSTRAP_ADMIN_USERNAME` and `BOOTSTRAP_ADMIN_PASSWORD` already had
+`Default=""`, so not affected — added an XML comment directly above both
+entries so a future edit doesn't accidentally introduce an example/
+placeholder default, plus a caution in admin-guide.md for anyone building a
+custom template instead of using this one as-is. Worth remembering: a
+non-empty default on the *password* field specifically would be worse than
+this username case — it'd silently apply a known fixed password rather
+than fail loud.
+
+Also confirmed on the same hardware: manually-added (non-Community-Apps)
+containers don't get Unraid's automatic update-checking — pulling a new
+`:latest` requires an explicit `docker pull` + Force Update, or a
+stop/re-Apply. Not relevant to this repo's own template today (single
+version tag, no updates yet to check for), but will matter the moment a
+second version ships, and is now documented in admin-guide.md's Docker/
+Unraid section for whenever the CA submission (item #2 below) makes this
+automatic for most users.
+
+With this, the bootstrap-admin flow has been verified end-to-end on real
+Unraid hardware, not just this sandbox's Docker: fresh-volume creation,
+restart-is-a-no-op, and correct behavior after actually clearing the vars
+in Unraid's own UI all check out.
+
 ## Next concrete steps
 
 1. **VAX/VMS command abbreviation** — shortest unambiguous prefix (DCL
