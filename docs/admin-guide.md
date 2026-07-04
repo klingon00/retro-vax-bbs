@@ -119,6 +119,29 @@ manually-added container will otherwise sit on whatever image was present
 at creation time indefinitely, with no visible signal that a newer one
 exists.
 
+### Template changes don't affect containers already created from them
+
+Unraid generates a separate `my-<ContainerName>.xml` snapshot the first
+time a container is created from a template, under
+`/boot/config/plugins/dockerMan/templates-user/`. That snapshot — not the
+original template file — is what Unraid reads on every subsequent
+start/restart. Updating `unraid-template.xml` (locally, or by pulling a
+newer version from this repo) has **zero effect** on an already-created
+container, even after a Force Update or a fresh image pull — those only
+refresh the image, not the container's config. This applies to *any*
+template field, not just the icon: a new env var, a corrected `Default`,
+anything.
+
+**The catch that actually bites people**: deleting the container through
+Unraid's UI does **not** delete this snapshot file. If you then recreate a
+container with the same name, Unraid picks the stale snapshot back up
+instead of regenerating it from the (updated) template — so even a full
+remove-and-recreate cycle can silently fail to pick up a template change.
+To actually apply a template edit to an existing container, delete
+*both* the container *and* its `my-<ContainerName>.xml` snapshot before
+recreating. This is a general Unraid behavior, not specific to this
+project, but easy to get bitten by when iterating on template changes.
+
 ### The `/data` volume is required
 
 The server has no fallback for a missing data directory. If `/data` isn't

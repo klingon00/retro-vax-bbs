@@ -693,7 +693,29 @@ Unraid hardware, not just this sandbox's Docker: fresh-volume creation,
 restart-is-a-no-op, and correct behavior after actually clearing the vars
 in Unraid's own UI all check out.
 
-## Next concrete steps
+**Icon didn't show after adding it — root cause found, 2026-07-04.** After
+wiring `icon.png` into `unraid-template.xml`'s `<Icon>` and confirming the
+raw GitHub URL loaded fine, the operator still didn't see it after fully removing
+and recreating the container from the updated template. Root cause, found
+by inspecting the Unraid box directly: Unraid generates a separate
+`my-<ContainerName>.xml` snapshot the first time a container is created
+from a template, under `/boot/config/plugins/dockerMan/templates-user/`.
+That snapshot, not the original template file, is what Unraid reads on
+every subsequent start/restart. The subtlety that actually bit the operator:
+**deleting the container through Unraid's UI does not delete this
+snapshot file** — it lingers on disk, and recreating a container with the
+same name picks the stale snapshot back up instead of regenerating fresh
+from the (now-updated) template. So even his full remove-and-recreate
+cycle didn't pick up the new `<Icon>` value, because the snapshot from the
+container's original creation — before the icon existed — was still there
+and got reused. Editing `unraid-template.xml` (or pulling a fresh copy from
+git) has **zero effect** on a container unless both the container *and*
+its `my-*.xml` snapshot are deleted before recreating. This applies to
+*any* template field change, not just the icon — worth remembering for
+every future template edit, including whatever the CA submission process
+ends up requiring.
+Documented in `docs/admin-guide.md`'s new "Template changes don't affect
+containers already created from them" subsection.
 
 1. **VAX/VMS command abbreviation** — shortest unambiguous prefix (DCL
    style). Nice-to-have, non-blocking.
