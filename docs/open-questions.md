@@ -618,9 +618,10 @@ section too.
 
 ## Bootstrap admin account via env vars (Docker/Unraid first-run fix)
 
-the operator tested a custom Unraid template against the public image and flagged
-that first-run account creation isn't Unraid-friendly. Root cause: the only
-documented bootstrap path is `docker exec -it retro-vax-bbs /adduser ...`,
+Real-hardware testing of a custom Unraid template against the public image
+flagged that first-run account creation isn't Unraid-friendly. Root cause:
+the only documented bootstrap path is `docker exec -it retro-vax-bbs
+/adduser ...`,
 but the final image is `FROM gcr.io/distroless/static-debian12` — no shell.
 Unraid's WebUI "Console" button execs a shell into the container to give an
 operator a terminal; with no shell in the image, that button is simply dead
@@ -641,8 +642,8 @@ for the implementation and full rationale in comments.
 rather than a first-boot marker file means if every account is later
 deleted (`DeleteUser` is an unguarded hard delete, reachable via lobby
 `DELETE USER`), leaving the bootstrap vars set lets the next restart
-re-create the account. This was a genuine design fork — the operator chose to keep
-it as a recovery lever rather than close it off, specifically because
+re-create the account. This was a genuine design fork — the decision was
+to keep it as a recovery lever rather than close it off, specifically because
 `docs/admin-guide.md`'s existing "Emergency procedures" assume bare-metal
 shell/`sqlite3` access and don't reach this image at all; without this
 mechanism there'd be no Docker/Unraid recovery path if every account were
@@ -661,10 +662,11 @@ entries (password field `Mask="true"`, noted as cosmetic-only — still
 plaintext in the template file and `docker inspect`); `docker-compose.yml`
 got the same two vars, commented out by default.
 
-**Real-hardware Unraid verification, 2026-07-04.** the operator tested a custom
-template on real Unraid hardware and found one genuine bug — not in this
-repo's template, but a lesson for anyone building their own: his
-`BOOTSTRAP_ADMIN_USERNAME` field had a non-empty `Default` in the XML.
+**Real-hardware Unraid verification, 2026-07-04.** A custom template was
+tested on real Unraid hardware and found one genuine bug — not in this
+repo's template, but a lesson for anyone building their own: the custom
+template's `BOOTSTRAP_ADMIN_USERNAME` field had a non-empty `Default` in
+the XML.
 Unraid re-populates a field from its `Default` on Apply whenever the WebUI
 field is left blank, so clearing the username field didn't actually unset
 it — it silently reappeared, tripping the "one set, one not" fatal-error
@@ -695,13 +697,14 @@ in Unraid's own UI all check out.
 
 **Icon didn't show after adding it — root cause found, 2026-07-04.** After
 wiring `icon.png` into `unraid-template.xml`'s `<Icon>` and confirming the
-raw GitHub URL loaded fine, the operator still didn't see it after fully removing
-and recreating the container from the updated template. Root cause, found
-by inspecting the Unraid box directly: Unraid generates a separate
-`my-<ContainerName>.xml` snapshot the first time a container is created
-from a template, under `/boot/config/plugins/dockerMan/templates-user/`.
-That snapshot, not the original template file, is what Unraid reads on
-every subsequent start/restart. The subtlety that actually bit the operator:
+raw GitHub URL loaded fine, it still didn't show up even after fully
+removing and recreating the container from the updated template. Root
+cause, found by inspecting the Unraid box directly: Unraid generates a
+separate `my-<ContainerName>.xml` snapshot the first time a container is
+created from a template, under
+`/boot/config/plugins/dockerMan/templates-user/`. That snapshot, not the
+original template file, is what Unraid reads on every subsequent
+start/restart. The subtlety that actually caused this:
 **deleting the container through Unraid's UI does not delete this
 snapshot file** — it lingers on disk, and recreating a container with the
 same name picks the stale snapshot back up instead of regenerating fresh
@@ -729,5 +732,5 @@ containers already created from them" subsection.
    is zero, so it doesn't help when admin accounts still exist but are all
    banned; that scenario currently has no recovery path reachable from the
    shell-less Docker/Unraid image at all (bare-metal's `sqlite3 UPDATE`
-   workaround needs shell access this image doesn't have). the operator flagged
-   this as worth revisiting — no design decided yet.
+   workaround needs shell access this image doesn't have). Flagged as
+   worth revisiting — no design decided yet.
