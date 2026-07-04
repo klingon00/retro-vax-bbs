@@ -220,3 +220,38 @@ internal/setpassword/  — SET PASSWORD / RESET PASSWORD / EXPIRE PASSWORD flows
 internal/store/        — SQLite-backed account and invite persistence
 docs/                  — design doc, open questions, admin guide
 ```
+
+## Contributing
+
+This repo ships two git hooks — `scripts/pre-commit` and
+`scripts/commit-msg` — that block a commit if its staged content, added/
+renamed file paths, or message contain a word from a local blocklist file
+you create yourself. Git hooks aren't tracked, so install them once per
+clone:
+
+```bash
+ln -s ../../scripts/pre-commit .git/hooks/pre-commit
+ln -s ../../scripts/commit-msg .git/hooks/commit-msg
+```
+
+(Symlinking, not copying, matters here — both hooks resolve a shared
+checker script at `scripts/lib/check-blocklist.sh` relative to the repo
+root, and a symlink keeps that resolvable regardless of how `.git/hooks/`
+references it.)
+
+Then create `.git/hooks/pre-commit-blocklist` — one blocked word per line,
+`#` comments allowed — with whatever you personally want kept out of this
+public repo's history. That file is deliberately never tracked: it lives
+entirely under `.git/hooks/`, which `git add` can never touch, and the
+hook scripts themselves contain zero information about what they block —
+not even a hash, since hashing a short/common word is trivially reversible
+and wouldn't actually hide anything. Without this file, both hooks print a
+warning and allow the commit anyway (the correct default for anyone else
+cloning this repo, who has no reason to have this configured).
+
+**Known limitation**: these are client-side hooks. They don't run for
+`git rebase` or `git cherry-pick`, and `pre-commit` specifically doesn't
+run for merge commits at all (only `commit-msg` does, checking the merge
+commit's own message, not the content it merges in) — they're a safety net
+for normal commits, not a substitute for reviewing history-rewriting
+operations by hand.

@@ -720,6 +720,56 @@ ends up requiring.
 Documented in `docs/admin-guide.md`'s new "Template changes don't affect
 containers already created from them" subsection.
 
+## Blocklist-matching git hooks (2026-07-04)
+
+Earlier the same day, some text that shouldn't be in this now-public repo's
+history ended up in several commit messages and doc content, despite the
+project's own history-scrub playbook existing precisely to prevent that.
+Remediated via a `git-filter-repo` rewrite + force-push (also had to catch
+and re-point a `v0.2.0` tag that independently kept the old, un-rewritten
+commit reachable — a branch-only rewrite doesn't touch tags). To prevent
+recurrence regardless of which session/tool is driving, added a
+`pre-commit` + `commit-msg` hook pair (`scripts/pre-commit`,
+`scripts/commit-msg`, shared logic in `scripts/lib/check-blocklist.sh`)
+that blocks any commit whose staged content, added/renamed file paths, or
+message match a word on a local blocklist.
+
+A hash-based approach was considered and rejected: hashing a short,
+guessable string doesn't actually protect it — a dictionary attack against
+a small enough candidate set recovers it almost instantly, so a hash in a
+tracked file would be obscurity, not protection. Instead, the tracked hook
+scripts are fully generic (zero information about what they block) and
+read the actual blocklist from `.git/hooks/pre-commit-blocklist` — a file
+that lives entirely outside git's trackable surface (anything under
+`.git/` is structurally outside what `git add`, even `git add -f`, can
+ever stage), created locally, never committed. Two hooks, not one, because
+`pre-commit` runs before the commit message is even drafted and
+structurally cannot see it — the incident that prompted this specifically
+included message-only instances a diff-only hook would have missed.
+
+Design review (empirically tested against real git behavior, not just
+reasoned about) caught real bugs before implementation: `git rev-parse
+--git-dir` resolves to the wrong place in a linked worktree (fixed via
+`--git-path` instead); a user's own global `color.ui`/`GIT_EXTERNAL_DIFF`
+config can silently corrupt the diff parse (fixed via `--no-color
+--no-ext-diff`); a pure rename with the matched text only in the new
+filename produced zero content-line matches (fixed by also scanning
+`--name-only` output); and git's own auto-generated comment scaffolding in
+the commit-msg file could false-positive before `commit.cleanup` strips it
+(fixed by stripping `^#` lines first). Verified end-to-end in a disposable
+scratch repo (never the real one) with a placeholder test word, covering:
+blocked content, blocked message, blocked rename-only filename, correct
+fail-open-with-warning when the blocklist is missing, and a clean commit
+succeeding normally. Known, documented limitation: these are client-side
+hooks — they don't run for `git rebase` or `git cherry-pick`, and
+`pre-commit` doesn't run for merge commits at all.
+
+Installed locally in this working copy (symlinked into `.git/hooks/`,
+local blocklist populated) and documented in a new README "Contributing"
+section for future clones/worktrees.
+
+## Next concrete steps
+
 1. **VAX/VMS command abbreviation** — shortest unambiguous prefix (DCL
    style). Nice-to-have, non-blocking.
 2. Unraid Community Applications submission — icon asset done (`icon.png`

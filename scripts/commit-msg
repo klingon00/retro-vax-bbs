@@ -1,0 +1,25 @@
+#!/usr/bin/env bash
+#
+# Blocks commits whose message contains a word from a local blocklist
+# (see scripts/lib/check-blocklist.sh). Install by copying or
+# symlinking this file to .git/hooks/commit-msg and making it
+# executable -- git hooks aren't tracked, so this has to be done once
+# per clone. See README's Contributing section.
+#
+# Known limitation: this only checks the commit's own message. It does
+# not run for `git rebase` or `git cherry-pick`, and pre-commit
+# (content/paths) does not run for merge commits at all -- these are
+# client-side hooks, not a substitute for reviewing history-rewriting
+# operations by hand.
+set -euo pipefail
+
+repo_root="$(git rev-parse --show-toplevel)"
+checker="$repo_root/scripts/lib/check-blocklist.sh"
+msg_file="$1"
+
+# Strip git's own auto-generated comment scaffolding (branch name,
+# staged-file status list) first -- it's present in this file before
+# commit.cleanup runs, and can false-positive on boilerplate that was
+# never actually typed. Co-Authored-By trailers are real authored text
+# and are deliberately not stripped.
+grep -v '^#' "$msg_file" | "$checker"

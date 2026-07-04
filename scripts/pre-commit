@@ -1,0 +1,26 @@
+#!/usr/bin/env bash
+#
+# Blocks commits whose staged file content, or added/renamed file
+# paths, contain a word from a local blocklist (see
+# scripts/lib/check-blocklist.sh). Install by copying or symlinking
+# this file to .git/hooks/pre-commit and making it executable -- git
+# hooks aren't tracked, so this has to be done once per clone. See
+# README's Contributing section.
+set -euo pipefail
+
+repo_root="$(git rev-parse --show-toplevel)"
+checker="$repo_root/scripts/lib/check-blocklist.sh"
+
+# --no-color/--no-ext-diff matter here, not just cosmetically: a
+# user's own global color.ui or GIT_EXTERNAL_DIFF/diff.external config
+# can otherwise corrupt or entirely replace this output, breaking the
+# "+"-prefix assumption below silently.
+content="$(git diff --cached --no-color --no-ext-diff | grep -E '^\+' | grep -Ev '^\+\+\+ ' || true)"
+
+# Added/renamed file paths are checked separately: a pure rename (or a
+# new file with identical content elsewhere) produces zero "+" content
+# lines above, which would otherwise let a blocklisted filename through
+# unnoticed.
+paths="$(git diff --cached --no-color --no-ext-diff --name-only || true)"
+
+printf '%s\n%s\n' "$content" "$paths" | "$checker"
