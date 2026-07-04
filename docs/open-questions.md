@@ -590,15 +590,31 @@ only caught it in README.md.
   `go build && go vet && gofmt -l` pass on the rewritten history before the
   force-push, which happened only after explicit confirmation.
 
-**Still open — manual GitHub UI steps, not automatable from a sandboxed
-Claude session (no `gh` CLI / network access)**:
-1. Verify the rewritten history landed cleanly on GitHub.
-2. Flip the repo to public (Settings → General → Danger Zone).
-3. Push a first version tag to trigger the workflow.
-4. Check/flip the GHCR package's visibility to public after the first
-   successful run (new packages have historically defaulted to private
-   regardless of the linked repo's visibility — needs a live check, not
-   assumed).
+**Closed 2026-07-04.** All four manual steps done and verified:
+1. Re-checked GitHub's own UI/code search for the scrubbed string — clean.
+   (Per CLAUDE.md's "History-scrub playbook": this recheck is a confidence
+   signal, not proof — GitHub's search can't see dangling objects, only
+   fail to surface them. Not escalated to a Support-requested purge, since
+   the scrubbed string was a common first name, not a credential — a
+   proportionality call, not an oversight.)
+2. Repo flipped to public (Settings → General → Danger Zone).
+3. `v0.1.0` tag pushed, triggering the publish workflow successfully.
+4. GHCR package visibility confirmed public.
+
+**Anonymous-pull proof, not just dashboard settings**: ran
+`docker pull ghcr.io/klingon00/retro-vax-bbs:0.1.0` from an unauthenticated
+shell — pulled clean, no login required. Booted the pulled image standalone,
+created a test account via `adduser`, logged in over SSH successfully. This
+is the real end-to-end verification the plan called for: repo public,
+package public, image pullable anonymously, and the pulled image actually
+boots and serves SSH correctly — not just correct-looking visibility
+toggles. Docker packaging + public release arc is fully closed.
+
+Note for anyone pulling by tag later: the image tag has **no `v` prefix**
+even though the triggering git tag does — pushing `v0.1.0` publishes as
+`0.1.0` (the workflow strips it via `${GITHUB_REF_NAME#v}`). This tripped
+up the anonymous-pull test until caught; now documented in README's Docker
+section too.
 
 ## Next concrete steps
 
