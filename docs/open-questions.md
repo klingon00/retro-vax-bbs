@@ -697,8 +697,10 @@ in Unraid's own UI all check out.
 
 1. **VAX/VMS command abbreviation** — shortest unambiguous prefix (DCL
    style). Nice-to-have, non-blocking.
-2. Unraid Community Applications submission — icon asset, CA repo listing —
-   only after the manual GHCR steps above are confirmed working end-to-end
+2. Unraid Community Applications submission — icon asset done (`icon.png`
+   at repo root, 256x256 transparent, wired into `unraid-template.xml`'s
+   `<Icon>` as of 2026-07-04); CA repo listing itself still open. Gated on
+   the manual GHCR steps above, which are confirmed working end-to-end
    (`docker pull` succeeding anonymously).
 3. **Docker/Unraid recovery for "all admins banned" (not deleted)** — the
    bootstrap-admin mechanism above only fires when `Store.CountUsers()`
