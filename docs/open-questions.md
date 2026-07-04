@@ -668,3 +668,10 @@ got the same two vars, commented out by default.
 2. Unraid Community Applications submission — icon asset, CA repo listing —
    only after the manual GHCR steps above are confirmed working end-to-end
    (`docker pull` succeeding anonymously).
+3. **Docker/Unraid recovery for "all admins banned" (not deleted)** — the
+   bootstrap-admin mechanism above only fires when `Store.CountUsers()`
+   is zero, so it doesn't help when admin accounts still exist but are all
+   banned; that scenario currently has no recovery path reachable from the
+   shell-less Docker/Unraid image at all (bare-metal's `sqlite3 UPDATE`
+   workaround needs shell access this image doesn't have). the operator flagged
+   this as worth revisiting — no design decided yet.
