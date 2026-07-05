@@ -887,12 +887,18 @@ side and the root cause:
   restarting with the *exact*-case username against that same suspended
   admin still recovers it correctly (password reset, ban lifted), and a
   genuinely fresh, empty database with no matching username under any case
-  still takes the unchanged fresh-create path. Did not drive an actual
-  interactive SSH login in this pass
-  (the BAN-guard behavior was verified instead via the new `internal/lobby`
-  tests above, against the real command-handler code path); worth a
-  follow-up real-terminal pass before calling this fully closed the way the
-  Docker/Unraid packaging work was.
+  still takes the unchanged fresh-create path.
+
+**Real-terminal SSH pass — completed by klingon00, 2026-07-04.** The gap
+noted above (this agent's verification stopped at the compiled-binary/log/
+DB-query level, with the BAN-guard covered instead via `internal/lobby`'s
+tests, not a live session) is now closed: banned a test admin over a real
+SSH session, restarted the server with `BOOTSTRAP_ADMIN_USERNAME`/
+`PASSWORD` set — including a deliberate case-mismatch attempt — and
+confirmed both the fatal refusal (case-mismatch case) and a successful
+recovery (matching exact case) followed by an actual SSH login with the
+new password, live. This closes the recovery path out fully end-to-end,
+the same standard the Docker/Unraid packaging work was held to.
 
 ## Timed-ban and invite-expiry self-heal bug: naive local time stored, compared as UTC (2026-07-04)
 
