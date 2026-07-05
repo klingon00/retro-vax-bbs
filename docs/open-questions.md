@@ -647,10 +647,12 @@ to keep it as a recovery lever rather than close it off, specifically because
 `docs/admin-guide.md`'s existing "Emergency procedures" assume bare-metal
 shell/`sqlite3` access and don't reach this image at all; without this
 mechanism there'd be no Docker/Unraid recovery path if every account were
-deleted. (It does *not* help the "admin accounts are banned but not
-deleted" case — a banned row still counts toward `CountUsers()` — that gap
-is still open, noted directly in admin-guide.md's Emergency procedures
-section.) Also read the password directly via `os.Getenv` rather than
+deleted. (At the time this was written, it did *not* help the "admin
+accounts are banned but not deleted" case — a banned row still counted
+toward `CountUsers()`. That gap is now closed — see the "Banned-admin
+recovery + last-usable-admin guard" entry below, which replaced this gate
+with `CountUsableAdmins()` and added a dedicated recovery path for exactly
+this case.) Also read the password directly via `os.Getenv` rather than
 threading it through `loadConfig()`'s `config` struct — that struct gets
 dumped wholesale in one `log.Printf` at startup, which would have logged
 the password in plaintext.
