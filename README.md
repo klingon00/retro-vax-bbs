@@ -147,13 +147,16 @@ docker compose up -d
 ```
 
 Pre-built images are published to `ghcr.io/klingon00/retro-vax-bbs` on each
-version tag push. Note the tag naming: pushing git tag `v0.1.0` publishes
-the image as `0.1.0` — **no `v` prefix** (the publish workflow strips it via
+version tag push. Note the tag naming: pushing git tag `v0.3.0` publishes
+the image as `0.3.0` — **no `v` prefix** (the publish workflow strips it via
 `${GITHUB_REF_NAME#v}`). Pull by the bare version, not the git tag:
 
 ```bash
-docker pull ghcr.io/klingon00/retro-vax-bbs:0.1.0
+docker pull ghcr.io/klingon00/retro-vax-bbs:0.3.0
 ```
+
+See [GitHub Releases](https://github.com/klingon00/retro-vax-bbs/releases)
+for version history and upgrade notes before pulling an older tag.
 
 The image bakes in `SSH_HOST=0.0.0.0` so the public listener is reachable
 out of the box. `ADMIN_HOST` is deliberately **not** given a container
