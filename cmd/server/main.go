@@ -556,13 +556,16 @@ func envFloat(key string, fallback float64) float64 {
 // config struct, since loadConfig logs every field of it and this must
 // never appear in a log line.
 //
-// Gated on zero existing accounts, which also makes this a deliberate
-// emergency-recovery lever: if every admin account is ever deleted, leaving
-// these vars set lets a restart re-bootstrap the account. Docker/Unraid has
-// no other recovery path (docs/admin-guide.md's bare-metal emergency
-// procedures don't reach a shell-less image), so this is intentional, not
-// an oversight — operators should clear both vars after first login only
-// if they're confident they won't need that lever.
+// Gated on zero *usable* admins (CountUsableAdmins), not zero accounts,
+// which also makes this a deliberate emergency-recovery lever covering two
+// distinct scenarios: every admin account deleted (fresh CreateUser path
+// below), or every admin account banned but still present (the recovery
+// path below — resets the matching account's password and lifts its ban).
+// Docker/Unraid has no other recovery path for either case (docs/admin-
+// guide.md's bare-metal emergency procedures don't reach a shell-less
+// image), so this is intentional, not an oversight — operators should
+// clear both vars after first login only if they're confident they won't
+// need that lever.
 func bootstrapAdminAccount(db *store.Store) {
 	username := os.Getenv("BOOTSTRAP_ADMIN_USERNAME")
 	password := os.Getenv("BOOTSTRAP_ADMIN_PASSWORD")
@@ -577,21 +580,64 @@ func bootstrapAdminAccount(db *store.Store) {
 		log.Fatalln(`config: BOOTSTRAP_ADMIN_USERNAME cannot be "new" — that username is reserved for self-registration and could never log in`)
 	}
 
-	n, err := db.CountUsers()
+	usable, err := db.CountUsableAdmins()
 	if err != nil {
-		log.Fatalf("bootstrap admin: counting existing users: %v", err)
+		log.Fatalf("bootstrap admin: counting usable admins: %v", err)
 	}
-	if n > 0 {
-		log.Printf("bootstrap admin: BOOTSTRAP_ADMIN_USERNAME/PASSWORD set but ignored — %d account(s) already exist", n)
+	if usable > 0 {
+		log.Printf("bootstrap admin: BOOTSTRAP_ADMIN_USERNAME/PASSWORD set but ignored — %d usable admin account(s) already exist", usable)
 		return
 	}
 
-	hash, err := auth.HashPassword(password)
-	if err != nil {
-		log.Fatalf("bootstrap admin: hashing password: %v", err)
+	existing, err := db.GetUserByUsername(username)
+	switch {
+	case errors.Is(err, store.ErrNotFound):
+		// No exact match — but before creating a fresh account, check
+		// whether an existing account matches under a different case.
+		// Usernames aren't case-insensitive-unique in this schema, so an
+		// exact-match miss here doesn't mean "no such account" as
+		// unambiguously as it does elsewhere; silently creating a
+		// look-alike duplicate would leave the real (differently-cased)
+		// account exactly as locked-out as before, with no error to
+		// signal anything went differently than intended.
+		if ciMatch, ciErr := db.GetUserByUsernameCI(username); ciErr == nil {
+			log.Fatalf("bootstrap admin: BOOTSTRAP_ADMIN_USERNAME %q does not exactly match any account, but differs only in case from existing account %q (role=%s) — refusing to guess whether these are the same account; set BOOTSTRAP_ADMIN_USERNAME to match the stored username's exact case to recover it", username, ciMatch.Username, ciMatch.Role)
+		} else if !errors.Is(ciErr, store.ErrNotFound) {
+			log.Fatalf("bootstrap admin: checking for a case-insensitive match on %q: %v", username, ciErr)
+		}
+
+		hash, herr := auth.HashPassword(password)
+		if herr != nil {
+			log.Fatalf("bootstrap admin: hashing password: %v", herr)
+		}
+		if _, err := db.CreateUser(username, hash, "admin"); err != nil {
+			log.Fatalf("bootstrap admin: creating account %q: %v", username, err)
+		}
+		log.Printf("bootstrap admin: created initial admin account %q", username)
+
+	case err != nil:
+		log.Fatalf("bootstrap admin: looking up account %q: %v", username, err)
+
+	case existing.Role != "admin":
+		log.Fatalf("bootstrap admin: account %q already exists with role %q — refusing to touch a non-admin account; choose a different BOOTSTRAP_ADMIN_USERNAME", username, existing.Role)
+
+	case existing.Status != "suspended":
+		// "active" is unreachable here (CountUsableAdmins would have
+		// counted it). "pending" should never occur for role=admin.
+		// Either way, fail loud rather than guess.
+		log.Fatalf("bootstrap admin: account %q is an admin but has status %q, not %q — refusing to modify it automatically", username, existing.Status, "suspended")
+
+	default: // status == "suspended": the intended recovery case
+		hash, herr := auth.HashPassword(password)
+		if herr != nil {
+			log.Fatalf("bootstrap admin: hashing password: %v", herr)
+		}
+		if err := db.SetPassword(username, hash); err != nil {
+			log.Fatalf("bootstrap admin: resetting password for %q: %v", username, err)
+		}
+		if err := db.UnbanUser(username); err != nil {
+			log.Fatalf("bootstrap admin: reactivating %q: %v", username, err)
+		}
+		log.Printf("bootstrap admin: recovered admin account %q (password reset, ban lifted)", username)
 	}
-	if _, err := db.CreateUser(username, hash, "admin"); err != nil {
-		log.Fatalf("bootstrap admin: creating account %q: %v", username, err)
-	}
-	log.Printf("bootstrap admin: created initial admin account %q", username)
 }

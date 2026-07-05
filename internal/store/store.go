@@ -49,6 +49,22 @@ type User struct {
 	MustChangePassword bool           // true after admin EXPIRE PASSWORD; cleared by SetPassword
 }
 
+// IsUsableAdmin reports whether u currently counts as a reachable admin
+// account — the single-row equivalent of CountUsableAdmins. Keep in sync
+// with its SQL by hand.
+func (u *User) IsUsableAdmin() bool {
+	if u.Role != "admin" {
+		return false
+	}
+	if u.Status == "active" {
+		return true
+	}
+	return u.Status == "suspended" &&
+		u.BannedUntil.Valid &&
+		u.BannedUntil.Time.Before(time.Now()) &&
+		u.BannedUntil.Time.Year() < 2090
+}
+
 // Store wraps a database/sql connection pool to the SQLite file.
 type Store struct {
 	db *sql.DB
@@ -195,6 +211,27 @@ func (s *Store) GetUserByUsername(username string) (*User, error) {
 		        COALESCE(email, '') as email,
 		        banned_until, must_change_password
 		 FROM users WHERE username = ?`,
+		username,
+	)
+	return scanUser(row)
+}
+
+// GetUserByUsernameCI looks up a user by username using a case-insensitive
+// comparison — scoped to this one query via COLLATE NOCASE, not a
+// schema-wide collation change (which would touch uniqueness assumptions
+// and every other username lookup in the codebase). Used only by
+// bootstrapAdminAccount's recovery path (cmd/server) to detect a
+// same-name-different-case match and fail loud rather than silently
+// creating a look-alike duplicate account. Returns ErrNotFound if no such
+// user exists under any case.
+func (s *Store) GetUserByUsernameCI(username string) (*User, error) {
+	row := s.db.QueryRow(
+		`SELECT id, username, password_hash, ssh_pubkey, status, role,
+		        plan_text, color_opt_in, admin_visible, failed_attempts,
+		        locked_until, created_at, last_login_at,
+		        COALESCE(email, '') as email,
+		        banned_until, must_change_password
+		 FROM users WHERE username = ? COLLATE NOCASE`,
 		username,
 	)
 	return scanUser(row)
@@ -437,6 +474,27 @@ func (s *Store) CountPendingAccounts() (int, error) {
 func (s *Store) CountUsers() (int, error) {
 	var n int
 	err := s.db.QueryRow(`SELECT COUNT(*) FROM users`).Scan(&n)
+	return n, err
+}
+
+// CountUsableAdmins returns the number of admin accounts reachable via
+// normal login right now — active, or suspended with a timed (non-
+// permanent) ban that has already lapsed, matching
+// CheckAndLiftExpiredBan's self-heal semantics so an admin whose ban is
+// about to lift on its own doesn't spuriously read as "zero usable
+// admins." Keep this predicate in sync by hand with User.IsUsableAdmin
+// and CheckAndLiftExpiredBan — there is no shared query builder here.
+func (s *Store) CountUsableAdmins() (int, error) {
+	var n int
+	err := s.db.QueryRow(
+		`SELECT COUNT(*) FROM users
+		 WHERE role = 'admin'
+		       AND (status = 'active'
+		            OR (status = 'suspended'
+		                AND banned_until IS NOT NULL
+		                AND banned_until < datetime('now')
+		                AND CAST(strftime('%Y', banned_until) AS INTEGER) < 2090))`,
+	).Scan(&n)
 	return n, err
 }
 

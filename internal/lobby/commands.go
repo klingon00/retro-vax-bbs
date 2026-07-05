@@ -896,6 +896,33 @@ func requireAdminLogged(m Model, action, detail string) string {
 	return ""
 }
 
+// lastUsableAdminGuard refuses actionLabel (e.g. "BAN" or "DELETE USER")
+// against username if doing so would leave zero usable admin accounts —
+// the exact state bootstrapAdminAccount's recovery lever (cmd/server)
+// exists to undo, but far better avoided than recovered from. Returns ""
+// if safe to proceed. Self-targeting is allowed as long as other usable
+// admins remain — only the last-usable-admin case is refused.
+func lastUsableAdminGuard(m Model, actionLabel, username string) string {
+	if m.db == nil {
+		return ""
+	}
+	target, err := m.db.GetUserByUsername(username)
+	if err != nil {
+		return "" // not found / lookup failure: existing downstream handling covers this
+	}
+	if !target.IsUsableAdmin() {
+		return "" // target isn't currently a usable admin; can't drop the count
+	}
+	usable, err := m.db.CountUsableAdmins()
+	if err != nil {
+		return fmt.Sprintf("%%VAX-BBS-E-LASTADMIN, could not verify remaining admin accounts (%v) — action refused.", err)
+	}
+	if usable <= 1 {
+		return fmt.Sprintf("%%VAX-BBS-E-LASTADMIN, Cannot %s %q — this is the last usable admin account.", actionLabel, username)
+	}
+	return ""
+}
+
 // ---- APPROVE / DENY -----------------------------------------------------
 
 func approveUsage(m Model) (string, tea.Cmd) {
@@ -1026,6 +1053,9 @@ func banCommand(m Model, args string) (string, tea.Cmd) {
 	until, display, err := parseBanDuration(durStr)
 	if err != nil {
 		return fmt.Sprintf("%%VAX-BBS-E-BAN, %v", err), nil
+	}
+	if e := lastUsableAdminGuard(m, "BAN", username); e != "" {
+		return e, nil
 	}
 	// Kick the user first if they're connected.
 	m.reg.Kick(username)
@@ -1294,6 +1324,9 @@ func deleteUserCommand(m Model, username string) (string, tea.Cmd) {
 	// Safety check: don't let an admin delete themselves.
 	if strings.EqualFold(username, m.username) {
 		return "%VAX-BBS-E-SELF, Cannot DELETE USER on your own account.", nil
+	}
+	if e := lastUsableAdminGuard(m, "DELETE USER", username); e != "" {
+		return e, nil
 	}
 	// Kick the user if they're currently connected.
 	_ = m.reg.Kick(username) // ignore "not online" errors

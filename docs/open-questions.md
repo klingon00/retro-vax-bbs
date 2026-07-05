@@ -768,6 +768,132 @@ Installed locally in this working copy (symlinked into `.git/hooks/`,
 local blocklist populated) and documented in a new README "Contributing"
 section for future clones/worktrees.
 
+## Banned-admin recovery + last-usable-admin guard (2026-07-04)
+
+Closes the "Docker/Unraid recovery for 'all admins banned'" item that used
+to sit here as open step #3. Two changes, addressing both the recovery
+side and the root cause:
+
+- **`bootstrapAdminAccount` (`cmd/server/main.go`) now gates on a new
+  `Store.CountUsableAdmins()`** (`internal/store/store.go`) instead of
+  `CountUsers()`. `CountUsableAdmins` counts admin accounts that are
+  active, or suspended with a timed (non-permanent) ban that's already
+  lapsed — the same lapsed-ban test `CheckAndLiftExpiredBan` already uses,
+  so an admin whose ban is about to self-heal on next login doesn't
+  spuriously read as "zero usable admins." When triggered, the function
+  now does a three-way check on `BOOTSTRAP_ADMIN_USERNAME` via
+  `GetUserByUsername`: not found → unchanged fresh-`CreateUser` behavior;
+  found with `role != "admin"` → `log.Fatalf` (refuses to touch or
+  silently reassign an unrelated account); found as a `suspended` admin →
+  the new recovery path, `SetPassword` + `UnbanUser` in that order (both
+  individually idempotent, so a crash between the two on a container
+  restart-policy retry just re-enters the same branch cleanly).
+  `User.IsUsableAdmin()` is a single-row Go-side twin of the same
+  predicate, used by the lobby guard below so it doesn't need a redundant
+  query on a row already in hand — kept in sync with the SQL by hand,
+  there's no shared query builder in this codebase.
+- **A side effect of the gate swap, worth knowing:** it also fixes a
+  latent, unrelated quirk where a single self-registered non-admin user
+  used to permanently block bootstrap-admin creation forever under
+  `CountUsers()`; now fixed since the gate only cares about *admin*
+  usability.
+- **Case-sensitivity fail-safe: `GetUserByUsernameCI`
+  (`internal/store/store.go`).** `GetUserByUsername` is exact-match (no
+  `COLLATE NOCASE` in the schema), so an initial version of this change
+  had a real silent-failure mode: if `BOOTSTRAP_ADMIN_USERNAME` differed
+  only in case from an existing suspended admin's stored username (e.g.
+  `klingon00` vs. a stored `Klingon00`), the exact-match lookup missed,
+  fell through to `errors.Is(err, store.ErrNotFound)`, and silently
+  fresh-created a second, look-alike admin under the mismatched name —
+  leaving the real banned admin untouched with no error or warning that
+  anything had gone differently than intended. Fixed by adding
+  `GetUserByUsernameCI`, a `COLLATE NOCASE` lookup scoped to this one call
+  site (deliberately not a schema-wide collation change, which would touch
+  username-uniqueness assumptions everywhere else). In
+  `bootstrapAdminAccount`'s `ErrNotFound` branch, before falling through to
+  fresh-create, a case-insensitive lookup now runs first: a match →
+  `log.Fatalf` naming the existing account's exact stored username rather
+  than guessing, matching the same fail-loud-on-ambiguity pattern already
+  used by the role-mismatch branch; no match (under any case) → proceeds
+  to fresh-create exactly as before.
+- **New preventive guard: `lastUsableAdminGuard`
+  (`internal/lobby/commands.go`)**, wired into both `banCommand` and
+  `deleteUserCommand` right before each command's `Kick` call. Refuses the
+  action if the target is currently a usable admin and `CountUsableAdmins`
+  is `<= 1` — i.e., this action would zero out admin access. This closes
+  the actual root cause: `BanUser`/`banCommand` previously had zero
+  guardrails at all (no role check, no self-ban check), so an admin could
+  ban every other admin and then themselves with no warning.
+  **Self-ban is deliberately still allowed** as long as another usable
+  admin remains — a conscious choice, not an oversight: self-banning only
+  affects the actor's own access, so it isn't a real attack path for a
+  rogue/compromised admin the way zeroing out *all* admin access is; only
+  the last-usable-admin case is actually dangerous, so that's the only
+  case refused.
+- **New tests:** `internal/store/store_test.go` gained
+  `TestCountUsableAdmins` (0/1 active/permanently-banned/lapsed-ban-admin
+  combinations), `TestIsUsableAdmin` (table-driven over the same
+  status/role/BannedUntil combinations), and `TestGetUserByUsernameCI`
+  (finds a match regardless of case, preserves the originally-stored
+  casing in the result, returns `ErrNotFound` for a genuinely absent
+  username). `internal/lobby` gained its
+  *first* test file, `commands_test.go` — it drives `banCommand`,
+  `deleteUserCommand`, and `lastUsableAdminGuard` directly (constructing a
+  real `lobby.Model` over a real in-memory SQLite store, not through
+  actual SSH) covering: a solo admin refused on self-BAN (last usable
+  admin), a two-admin BAN succeeding then the remaining admin correctly
+  refused on a follow-up self-BAN, a non-admin target never refused, and
+  `DELETE USER`'s guard invoked directly (its own unconditional self-guard
+  would otherwise short-circuit before reaching this one in the only
+  self-target scenario, so the guard itself is exercised standalone).
+- **A pre-existing, unrelated escape hatch worth documenting alongside
+  this:** `docker exec <container> /adduser -username <new> -password ...
+  -role admin` already works today regardless of any admin's ban state —
+  `adduser` is a separate one-shot binary with no ban check in
+  `CreateUser`, and no interaction with the running server's bootstrap
+  logic at all. It can't recover an *existing* banned identity (refuses
+  duplicate usernames), but it's the fastest option when the operator just
+  wants back in under a new name. Added to `admin-guide.md`'s "All admin
+  accounts are banned" section as a third option alongside the bare-metal
+  `sqlite3` path and the new env-var recovery path. Confirmed directly: ran
+  the compiled `adduser` binary against a scratch DB with one admin already
+  suspended, and it created a new active admin account with no error and no
+  interaction with the suspended row at all.
+- **Manually verified against the real compiled `server` binary** (not
+  just `go build`/`go vet`/`gofmt -l`/`go test ./...`, all clean) — every
+  scenario run against scratch, file-backed SQLite databases with real
+  startup log capture: (1) fresh empty DB + bootstrap vars → unchanged
+  fresh-create log line and an active admin row; (2) restart with that
+  admin still active + bootstrap vars set → skipped, with the new "usable
+  admin account(s)" wording; (3) that admin suspended via a direct SQL
+  edit (simulating a ban predating this change, or a manual DB edit).
+  Restart with `BOOTSTRAP_ADMIN_USERNAME`/`PASSWORD` matching produced the
+  new `bootstrap admin: recovered admin account "..." (password reset, ban
+  lifted)` log line — not the fresh-create line — with exactly one row
+  left in the table (status `active`, `banned_until` cleared), confirmed
+  by direct query; the actual password reset was verified as real (not
+  just a log claim) via `auth.VerifyPassword` against the stored hash
+  through a temporary in-module helper: the new password verified true,
+  the old one verified false. (4) Pointing the bootstrap username at an
+  existing `role='user'` account: process exited nonzero with the new
+  role-mismatch fatal message, and that account's row was confirmed
+  unchanged afterward. (5) The case-sensitivity fail-safe re-run against
+  the fixed binary, using a test admin named `klingon00test` for this run:
+  suspending it, then restarting with `BOOTSTRAP_ADMIN_USERNAME` set to a
+  different-case variant of that name now exits nonzero with a fatal error
+  naming the existing account's exact stored username, and no second row
+  gets created — confirmed by querying the table afterward and seeing only
+  the original, still-suspended row. Regression-checked immediately after:
+  restarting with the *exact*-case username against that same suspended
+  admin still recovers it correctly (password reset, ban lifted), and a
+  genuinely fresh, empty database with no matching username under any case
+  still takes the unchanged fresh-create path. Did not drive an actual
+  interactive SSH login in this pass
+  (the BAN-guard behavior was verified instead via the new `internal/lobby`
+  tests above, against the real command-handler code path); worth a
+  follow-up real-terminal pass before calling this fully closed the way the
+  Docker/Unraid packaging work was.
+
 ## Next concrete steps
 
 1. **VAX/VMS command abbreviation** — shortest unambiguous prefix (DCL
@@ -777,10 +903,3 @@ section for future clones/worktrees.
    `<Icon>` as of 2026-07-04); CA repo listing itself still open. Gated on
    the manual GHCR steps above, which are confirmed working end-to-end
    (`docker pull` succeeding anonymously).
-3. **Docker/Unraid recovery for "all admins banned" (not deleted)** — the
-   bootstrap-admin mechanism above only fires when `Store.CountUsers()`
-   is zero, so it doesn't help when admin accounts still exist but are all
-   banned; that scenario currently has no recovery path reachable from the
-   shell-less Docker/Unraid image at all (bare-metal's `sqlite3 UPDATE`
-   workaround needs shell access this image doesn't have). Flagged as
-   worth revisiting — no design decided yet.

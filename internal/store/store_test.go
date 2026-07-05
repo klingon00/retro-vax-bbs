@@ -1,6 +1,7 @@
 package store
 
 import (
+	"database/sql"
 	"testing"
 	"time"
 )
@@ -151,6 +152,112 @@ func TestClearFailedAttempts_ResetsCounter(t *testing.T) {
 	}
 	if got.LockedUntil.Valid {
 		t.Error("locked_until should be NULL after clear")
+	}
+}
+
+func TestGetUserByUsernameCI(t *testing.T) {
+	s := openTestStore(t)
+
+	if _, err := s.CreateUser("SysOp", "hash", "admin"); err != nil {
+		t.Fatalf("CreateUser: %v", err)
+	}
+
+	got, err := s.GetUserByUsernameCI("sysop")
+	if err != nil {
+		t.Fatalf("GetUserByUsernameCI(%q): %v", "sysop", err)
+	}
+	if got.Username != "SysOp" {
+		t.Errorf("got username %q, want %q (original case preserved)", got.Username, "SysOp")
+	}
+
+	got, err = s.GetUserByUsernameCI("SYSOP")
+	if err != nil {
+		t.Fatalf("GetUserByUsernameCI(%q): %v", "SYSOP", err)
+	}
+	if got.Username != "SysOp" {
+		t.Errorf("got username %q, want %q", got.Username, "SysOp")
+	}
+
+	_, err = s.GetUserByUsernameCI("nobody")
+	if err != ErrNotFound {
+		t.Errorf("expected ErrNotFound for a genuinely absent username, got %v", err)
+	}
+}
+
+func TestCountUsableAdmins(t *testing.T) {
+	s := openTestStore(t)
+
+	n, err := s.CountUsableAdmins()
+	if err != nil {
+		t.Fatalf("CountUsableAdmins: %v", err)
+	}
+	if n != 0 {
+		t.Errorf("got %d usable admins on a fresh store, want 0", n)
+	}
+
+	if _, err := s.CreateUser("activeAdmin", "hash", "admin"); err != nil {
+		t.Fatalf("CreateUser: %v", err)
+	}
+	n, err = s.CountUsableAdmins()
+	if err != nil {
+		t.Fatalf("CountUsableAdmins: %v", err)
+	}
+	if n != 1 {
+		t.Errorf("got %d usable admins with one active admin, want 1", n)
+	}
+
+	if err := s.BanUser("activeAdmin", nil); err != nil { // permanent ban
+		t.Fatalf("BanUser: %v", err)
+	}
+	n, err = s.CountUsableAdmins()
+	if err != nil {
+		t.Fatalf("CountUsableAdmins: %v", err)
+	}
+	if n != 0 {
+		t.Errorf("got %d usable admins with the only admin permanently banned, want 0", n)
+	}
+
+	if _, err := s.CreateUser("lapsedBanAdmin", "hash", "admin"); err != nil {
+		t.Fatalf("CreateUser: %v", err)
+	}
+	past := time.Now().Add(-time.Hour)
+	if err := s.BanUser("lapsedBanAdmin", &past); err != nil {
+		t.Fatalf("BanUser: %v", err)
+	}
+	n, err = s.CountUsableAdmins()
+	if err != nil {
+		t.Fatalf("CountUsableAdmins: %v", err)
+	}
+	if n != 1 {
+		t.Errorf("got %d usable admins with one permanently-banned and one lapsed-ban admin, want 1 (lapsed ban self-heals)", n)
+	}
+}
+
+func TestIsUsableAdmin(t *testing.T) {
+	past := time.Now().Add(-time.Hour)
+	future := time.Now().Add(time.Hour)
+	permanent := NeverExpires()
+
+	cases := []struct {
+		name string
+		u    User
+		want bool
+	}{
+		{"active admin", User{Role: "admin", Status: "active"}, true},
+		{"active user (non-admin)", User{Role: "user", Status: "active"}, false},
+		{"suspended admin, permanent ban", User{Role: "admin", Status: "suspended", BannedUntil: sql.NullTime{Time: permanent, Valid: true}}, false},
+		{"suspended admin, timed ban not yet expired", User{Role: "admin", Status: "suspended", BannedUntil: sql.NullTime{Time: future, Valid: true}}, false},
+		{"suspended admin, timed ban already lapsed", User{Role: "admin", Status: "suspended", BannedUntil: sql.NullTime{Time: past, Valid: true}}, true},
+		{"suspended admin, no banned_until set", User{Role: "admin", Status: "suspended"}, false},
+		{"pending admin", User{Role: "admin", Status: "pending"}, false},
+	}
+
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			if got := c.u.IsUsableAdmin(); got != c.want {
+				t.Errorf("IsUsableAdmin() = %v, want %v", got, c.want)
+			}
+		})
 	}
 }
 

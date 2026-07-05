@@ -83,19 +83,46 @@ Two things worth understanding before using this:
   clear log message, rather than starting in a half-configured state.
 - **This is also your emergency recovery lever, not just a first-boot
   convenience.** The check is "does the database currently have zero
-  accounts," not "is this the very first boot ever." If every admin
-  account is later deleted, leaving these variables set means the *next*
-  container restart re-creates the account automatically. The "Forgot an
-  admin password" / "All admin accounts are banned" procedures further
-  below assume bare-metal `sqlite3`/`go run ./cmd/adduser` access, which
-  this shell-less image doesn't have at all — so for Docker/Unraid, this
-  bootstrap mechanism doubles as the only real recovery path if you're
-  ever fully locked out. Decide deliberately: clear both variables once
-  you've confirmed login if you don't want that standing recovery option,
-  or leave them set (understanding the trade-off) if you do. Either way,
-  the password field being masked in Unraid's UI is cosmetic only — the
-  value is still stored in plaintext in the template's saved config and in
-  `docker inspect` output, so don't treat it as real secret storage.
+  *usable* admin accounts" (active, or suspended with a timed ban that's
+  already lapsed) — not "is this the very first boot ever," and not merely
+  "are there zero accounts." This covers two distinct disaster scenarios,
+  both automatically:
+  - **Every admin account deleted:** restart re-creates
+    `BOOTSTRAP_ADMIN_USERNAME` as a fresh admin, same as before.
+  - **Every admin account banned but still present (new):** if
+    `BOOTSTRAP_ADMIN_USERNAME` exactly matches an existing, currently
+    banned admin account, a restart instead **resets that account's
+    password to `BOOTSTRAP_ADMIN_PASSWORD` and lifts its ban** — it does
+    not create a duplicate account, and it does not touch any *other*
+    banned admin (log back in as the recovered account and `UNBAN` the
+    rest manually). Two things to get right when using this:
+    - **A username that doesn't exactly match is never guessed at.** If
+      `BOOTSTRAP_ADMIN_USERNAME` doesn't exactly match any account, but
+      differs only in *case* from one that does exist (e.g. `klingon00`
+      vs. a stored `Klingon00`), the server refuses to start rather than
+      assuming they're the same account or silently creating a second,
+      look-alike admin under the mismatched name. The fatal error names
+      the existing account's exact stored username — set
+      `BOOTSTRAP_ADMIN_USERNAME` to that value to recover it.
+    - **Pointing this at an existing non-admin account is refused, loudly
+      and repeatedly.** If the configured username belongs to a `user`-role
+      account (or an admin in an unexpected state, e.g. `pending`), the
+      server logs a fatal error and refuses to start, on every restart,
+      rather than silently doing nothing or reassigning that account's
+      role. If you hit either of these fatal cases in a crash-loop, either
+      unset the bootstrap variables or correct `BOOTSTRAP_ADMIN_USERNAME`
+      to the exact username the log message names.
+  - The "Forgot an admin password" / "All admin accounts are banned"
+    procedures further below assume bare-metal `sqlite3`/`go run
+    ./cmd/adduser` access, which this shell-less image doesn't have at all
+    — so for Docker/Unraid, this bootstrap mechanism doubles as the real
+    recovery path for both scenarios above. Decide deliberately: clear both
+    variables once you've confirmed login if you don't want that standing
+    recovery option, or leave them set (understanding the trade-off) if you
+    do. Either way, the password field being masked in Unraid's UI is
+    cosmetic only — the value is still stored in plaintext in the
+    template's saved config and in `docker inspect` output, so don't treat
+    it as real secret storage.
 - **If you're building your own custom template instead of using
   `unraid-template.xml` as-is**, make sure both of these fields have an
   empty `Default`. Unraid re-populates a field from its template `Default`
@@ -348,7 +375,7 @@ logged. See **Logging** below for the exact format.
 
 | Command | Description |
 |---|---|
-| `DELETE USER <username>` | Permanently remove an account and free the username. Cannot be used on your own account. |
+| `DELETE USER <username>` | Permanently remove an account and free the username. Cannot be used on your own account, or on the last usable admin account. |
 | `UNLOCK <username>` | Clear a login lockout (triggered after 5 consecutive failed password attempts; normally lifts after 15 minutes). |
 
 ### Password management
@@ -367,7 +394,7 @@ not admin-only.
 | Command | Description |
 |---|---|
 | `KICK <username>` | Immediately disconnect a user's active session. They can reconnect right away. Use for troubleshooting or asking someone to reconnect. |
-| `BAN <username> <duration>` | Suspend an account for the specified duration. Disconnects them if currently online. See duration format below. |
+| `BAN <username> <duration>` | Suspend an account for the specified duration. Disconnects them if currently online. See duration format below. Refused if the target is the last usable admin account (self-bans are fine as long as another usable admin remains). |
 | `UNBAN <username>` | Lift a ban and restore the account to active. |
 
 **Ban duration format:**
@@ -464,22 +491,24 @@ dual-listener split are all always active regardless of deployment mode.
 
 ## Emergency procedures
 
-**Docker/Unraid note:** every procedure below assumes bare-metal shell and
-`sqlite3`/`go run ./cmd/adduser` access. None of it reaches the shell-less
-Docker image. `BOOTSTRAP_ADMIN_USERNAME`/`BOOTSTRAP_ADMIN_PASSWORD` (see
-"Bootstrapping the first admin account without a shell" above) is a
-Docker/Unraid recovery option, but only for the "every account has been
-*deleted*" case — it triggers on zero rows in the `users` table, which a
-merely-banned account doesn't produce (a banned row still exists). For the
-"all admin accounts are banned" case just below, there is currently no
-Docker/Unraid-reachable recovery at all — that gap is worth revisiting if
-it comes up in practice.
+**Docker/Unraid note:** the `sqlite3` commands in this section assume
+bare-metal shell access, which the shell-less Docker image doesn't have.
+See the "All admin accounts are banned" section immediately below for the
+Docker/Unraid-reachable alternatives — both the "every account has been
+*deleted*" case and the "every admin account is banned but still present"
+case now have a documented recovery path that works from a shell-less
+image.
 
 ### All admin accounts are banned
 
 If all admin accounts have been suspended (e.g., a mistake during testing),
-no admin can log in through normal means. Recovery requires direct SQLite
-access on the server:
+no admin can log in through normal means. Also relevant: `BAN` and
+`DELETE USER` both refuse an action that would drop the count of usable
+admins to zero, so reaching this state today requires either a ban applied
+before that guard existed, or a direct database edit — not a single normal
+admin command.
+
+**Bare metal (direct SQLite access):**
 
 ```bash
 sqlite3 data/retro-vax-bbs.db \
@@ -487,6 +516,29 @@ sqlite3 data/retro-vax-bbs.db \
 ```
 
 Restart the server afterward.
+
+**Docker/Unraid (no shell in the image) — two options:**
+
+1. **Fastest — mint a brand-new admin under a different name**, sidestepping
+   the banned accounts entirely:
+   ```bash
+   docker exec -it retro-vax-bbs /adduser -username rescueadmin -password '<strong-password>' -role admin
+   ```
+   This works today regardless of any other admin's ban state — `adduser`
+   is a separate one-shot binary with no ban check, baked into the image
+   alongside the server. It creates a new identity rather than recovering
+   an existing one; once logged in as `rescueadmin`, use `UNBAN` to restore
+   the original accounts if you want them back.
+2. **Recover a specific banned admin's original identity** via the
+   bootstrap-env-var mechanism (see "Bootstrapping the first admin account
+   without a shell" above): set `BOOTSTRAP_ADMIN_USERNAME` to that admin's
+   exact (case-sensitive) username and `BOOTSTRAP_ADMIN_PASSWORD` to a new
+   password, then restart the container. The server detects zero *usable*
+   admins, finds the matching suspended admin account, resets its password,
+   and lifts its ban — confirm via a `bootstrap admin: recovered admin
+   account "..." (password reset, ban lifted)` log line. Log in with the
+   new password, then `UNBAN` any other still-banned admins from that
+   session.
 
 ### Forgot an admin password
 
