@@ -155,6 +155,94 @@ func TestClearFailedAttempts_ResetsCounter(t *testing.T) {
 	}
 }
 
+func TestCheckAndLiftExpiredBan_FutureBanStaysBanned(t *testing.T) {
+	s := openTestStore(t)
+	u, err := s.CreateUser("bannedfuture", "hash", "user")
+	if err != nil {
+		t.Fatalf("CreateUser: %v", err)
+	}
+	future := time.Now().Add(10 * time.Minute)
+	if err := s.BanUser("bannedfuture", &future); err != nil {
+		t.Fatalf("BanUser: %v", err)
+	}
+
+	lifted, err := s.CheckAndLiftExpiredBan(u.ID)
+	if err != nil {
+		t.Fatalf("CheckAndLiftExpiredBan: %v", err)
+	}
+	if lifted {
+		t.Error("ban with a 10-minute future expiry was lifted immediately — should still be banned")
+	}
+
+	got, err := s.GetUserByID(u.ID)
+	if err != nil {
+		t.Fatalf("GetUserByID: %v", err)
+	}
+	if got.Status != "suspended" {
+		t.Errorf("got status %q immediately after banning 10 minutes out, want %q", got.Status, "suspended")
+	}
+}
+
+func TestCheckAndLiftExpiredBan_PastBanIsLifted(t *testing.T) {
+	s := openTestStore(t)
+	u, err := s.CreateUser("bannedpast", "hash", "user")
+	if err != nil {
+		t.Fatalf("CreateUser: %v", err)
+	}
+	past := time.Now().Add(-10 * time.Minute)
+	if err := s.BanUser("bannedpast", &past); err != nil {
+		t.Fatalf("BanUser: %v", err)
+	}
+
+	lifted, err := s.CheckAndLiftExpiredBan(u.ID)
+	if err != nil {
+		t.Fatalf("CheckAndLiftExpiredBan: %v", err)
+	}
+	if !lifted {
+		t.Error("ban with a 10-minute-past expiry was not lifted — should self-heal")
+	}
+
+	got, err := s.GetUserByID(u.ID)
+	if err != nil {
+		t.Fatalf("GetUserByID: %v", err)
+	}
+	if got.Status != "active" {
+		t.Errorf("got status %q after a lapsed ban, want %q", got.Status, "active")
+	}
+}
+
+func TestValidateAndConsumeInvite_FutureExpiryStillValid(t *testing.T) {
+	s := openTestStore(t)
+	creator, err := s.CreateUser("invitecreator1", "hash", "admin")
+	if err != nil {
+		t.Fatalf("CreateUser: %v", err)
+	}
+	future := time.Now().Add(10 * time.Minute)
+	if err := s.CreateInvite("future-code-42", creator.ID, 1, future); err != nil {
+		t.Fatalf("CreateInvite: %v", err)
+	}
+
+	if err := s.ValidateAndConsumeInvite("future-code-42"); err != nil {
+		t.Errorf("invite with a 10-minute future expiry was rejected immediately after creation: %v", err)
+	}
+}
+
+func TestValidateAndConsumeInvite_PastExpiryIsInvalid(t *testing.T) {
+	s := openTestStore(t)
+	creator, err := s.CreateUser("invitecreator2", "hash", "admin")
+	if err != nil {
+		t.Fatalf("CreateUser: %v", err)
+	}
+	past := time.Now().Add(-10 * time.Minute)
+	if err := s.CreateInvite("past-code-42", creator.ID, 1, past); err != nil {
+		t.Fatalf("CreateInvite: %v", err)
+	}
+
+	if err := s.ValidateAndConsumeInvite("past-code-42"); err != ErrInviteInvalid {
+		t.Errorf("invite with a 10-minute-past expiry: got err %v, want %v", err, ErrInviteInvalid)
+	}
+}
+
 func TestGetUserByUsernameCI(t *testing.T) {
 	s := openTestStore(t)
 

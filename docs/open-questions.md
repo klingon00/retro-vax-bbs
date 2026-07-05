@@ -894,6 +894,63 @@ side and the root cause:
   follow-up real-terminal pass before calling this fully closed the way the
   Docker/Unraid packaging work was.
 
+## Timed-ban and invite-expiry self-heal bug: naive local time stored, compared as UTC (2026-07-04)
+
+Found independently of the admin-recovery work above, reported directly
+from a live repro: `BAN alice 10m` followed immediately by a login attempt
+lifted the ban within seconds, nowhere near the 10-minute window.
+
+**Root cause was upstream of `CheckAndLiftExpiredBan`, which was already
+correct.** `BanUser` (`internal/store/store.go`) formatted its `until`
+parameter with `until.Format("2006-01-02 15:04:05")` and stored the result
+directly. `until` is built by `internal/lobby/commands.go`'s
+`parseBanDuration`/`parseBanDurationFull` as `time.Now().Add(d)` — a
+`time.Time` carrying the server's *local* Location. `.Format()` prints the
+wall-clock digits with no zone indicator, so the stored string is a naive
+local timestamp. `CheckAndLiftExpiredBan`'s SQL compares that string
+against SQLite's `datetime('now')`, which always returns UTC. On a server
+running behind UTC (this one: `EDT`, UTC-4), a ban set for "10 minutes from
+now" in local time gets stored as a string that reads roughly 4 hours
+*earlier* than the UTC "now" it's compared against — so it looks
+already-expired the instant it's written, regardless of the requested
+duration. On a server running ahead of UTC, the fault would run the other
+way: bans would outlast their stated duration until local wall-clock time
+caught up to the mis-tagged expiry.
+
+**The identical bug existed in `CreateInvite`**, found by inspection once
+the pattern in `BanUser` was identified — same
+`expiresAt.Format(...)` with no `.UTC()`, feeding
+`ValidateAndConsumeInvite`'s `time.Parse("2006-01-02 15:04:05", expiresAt)`
+(which defaults to UTC when the layout has no zone, per Go's documented
+`time.Parse` behavior) compared against `time.Now()`. Same root cause,
+different downstream mechanism — one hits a SQL string comparison, the
+other a Go-side re-parse — both broken by the same naive-local-string
+write.
+
+**Fix, both call sites:** convert to UTC immediately before formatting —
+`until.UTC().Format(...)` in `BanUser`, `expiresAt.UTC().Format(...)` in
+`CreateInvite`. `NeverExpires()` was already unaffected — it constructs its
+2099 sentinel directly with `time.UTC`, never through this local-`Format`
+path.
+
+**Verified by reproducing first, then fixing, then re-verifying** — not
+just added tests that happened to pass: `internal/store/store_test.go`
+gained `TestCheckAndLiftExpiredBan_FutureBanStaysBanned` and
+`_PastBanIsLifted`, run against the *unfixed* code first (the future-ban
+test failed exactly as reported — status flipped to `active` immediately),
+then confirmed passing after the `BanUser` fix. Same procedure for
+`TestValidateAndConsumeInvite_FutureExpiryStillValid` and
+`_PastExpiryIsInvalid` against `CreateInvite` (future-expiry test failed
+identically before the fix, passed after). Full `go build`/`go vet`/`gofmt
+-l`/`go test ./...` clean afterward.
+
+**Noted but not touched:** `Invite.IsExpired()` (`store.go`) duplicates
+`ValidateAndConsumeInvite`'s expiry check as a separate method, but is
+never actually called anywhere in the codebase (confirmed via grep) —
+`ValidateAndConsumeInvite` has its own inline parse-and-check instead of
+calling it. Dead code, and arguably a reuse opportunity, but out of scope
+for a bug-fix pass; flagging for whoever next touches invite logic.
+
 ## Next concrete steps
 
 1. **VAX/VMS command abbreviation** — shortest unambiguous prefix (DCL

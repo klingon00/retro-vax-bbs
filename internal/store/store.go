@@ -504,13 +504,22 @@ func (s *Store) CountUsableAdmins() (int, error) {
 // lifts. Pass nil for a permanent ban. Permanent bans record a far-future
 // sentinel (NeverExpires) so banned_until remains NOT NULL-compatible if
 // needed.
+//
+// until is converted to UTC before formatting. Callers construct it via
+// time.Now().Add(d), which carries the server's local Location — SQLite's
+// own datetime('now') (used by CheckAndLiftExpiredBan and this package's
+// other expiry checks) always returns UTC, so a naive local-wall-clock
+// string compared against it is off by the server's UTC offset. This bit
+// us for real: a 10-minute ban was found to self-lift within seconds on a
+// server running UTC-4, because the locally-formatted "10 minutes from
+// now" sorted earlier than SQLite's UTC "now" string.
 func (s *Store) BanUser(username string, until *time.Time) error {
 	var banUntil interface{}
 	if until == nil {
 		ne := NeverExpires()
 		banUntil = ne.Format("2006-01-02 15:04:05")
 	} else {
-		banUntil = until.Format("2006-01-02 15:04:05")
+		banUntil = until.UTC().Format("2006-01-02 15:04:05")
 	}
 	res, err := s.db.Exec(
 		`UPDATE users SET status = 'suspended', banned_until = ? WHERE username = ?`,
@@ -566,11 +575,21 @@ func (s *Store) CheckAndLiftExpiredBan(userID int64) (bool, error) {
 
 // CreateInvite inserts a new invite code. expiresAt should be
 // NeverExpires() for codes with no time limit.
+//
+// expiresAt is converted to UTC before formatting — same fix, same root
+// cause as BanUser's until parameter: callers construct expiresAt via
+// time.Now().Add(d), which carries the server's local Location, but
+// ValidateAndConsumeInvite re-parses the stored string with time.Parse
+// (which defaults to UTC when no zone is present) and compares it against
+// time.Now(). A naive local-wall-clock string gets misinterpreted as UTC
+// on read, off by the server's UTC offset — the same bug class that made
+// timed bans self-lift immediately, just surfacing via Go-side re-parsing
+// here instead of a SQL string comparison.
 func (s *Store) CreateInvite(code string, createdBy int64, uses int, expiresAt time.Time) error {
 	_, err := s.db.Exec(
 		`INSERT INTO invites (code, created_by, uses_remaining, expires_at)
 		 VALUES (?, ?, ?, ?)`,
-		code, createdBy, uses, expiresAt.Format("2006-01-02 15:04:05"),
+		code, createdBy, uses, expiresAt.UTC().Format("2006-01-02 15:04:05"),
 	)
 	if err != nil {
 		return fmt.Errorf("creating invite: %w", err)
