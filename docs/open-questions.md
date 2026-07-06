@@ -1021,6 +1021,17 @@ assertions are timing-sensitive, so the deterministic channel-state tests are
 the committed regression guard. `go build`/`go vet`/`go test ./...`/`gofmt -l`
 all clean.
 
+**Real-terminal SSH pass — completed by klingon00, 2026-07-06.** The gap noted
+above (the agent's own verification stopped at the churn harness plus the
+deterministic unit tests — the mid-call *disconnect* path can't be fully
+exercised without two live terminals) is now closed: two real SSH sessions in an
+active PHONE call, then one side hard-killed by closing the terminal — not a
+clean HANGUP or EXIT — and the surviving session correctly showed "X has left the
+call," with no hang and no phantom participant left in the call. That exercises
+the `HangupUser`-from-`sessionMiddleware`-teardown-defer path on a real socket
+death, the same real-terminal standard the Docker/Unraid packaging and
+admin-recovery work were held to.
+
 **Not addressed here (deliberate, bounded):** with a per-account `done`, an
 earlier session of a multi-session account has its event-receiver reaped only
 when the account's *last* session leaves (that's when `done` closes) — bounded,
