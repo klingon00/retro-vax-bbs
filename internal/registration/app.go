@@ -160,7 +160,11 @@ func (m Model) submit() (tea.Model, tea.Cmd) {
 			m.errMsg = "Please enter your invite code."
 			return m, nil
 		}
-		if err := m.db.ValidateAndConsumeInvite(code); err != nil {
+		// Validate only — do not consume a use yet. The actual decrement is
+		// deferred to finalise(), once the account is confirmed created, so an
+		// abandoned registration (e.g. disconnect during password entry) or a
+		// failed account creation never burns an invite use.
+		if err := m.db.ValidateInvite(code); err != nil {
 			m.errMsg = "Invite code is invalid or has expired. Please try again."
 			m.input = ""
 			return m, nil
@@ -218,6 +222,22 @@ func (m Model) finalise() (tea.Model, tea.Cmd) {
 	}
 
 	if m.mode == "invite-only" {
+		// Consume the invite only now that the account row exists. The code
+		// was validated (without decrementing) back at stateInviteCode; if the
+		// user had abandoned registration, or CreatePendingAccount above had
+		// failed, the invite would still be untouched. This re-checks and
+		// decrements atomically, since the code could have expired or been
+		// used up by another registration in the meantime.
+		if err := m.db.ValidateAndConsumeInvite(m.invite); err != nil {
+			// The invite went invalid between entry and now. Roll back the
+			// pending account we just created so a now-unusable, never-
+			// activated account doesn't linger and squat the username.
+			_ = m.db.RejectPendingAccount(m.username)
+			m.errMsg = "Invite code is no longer valid or has been used up. Please restart registration."
+			m.step = stateUsername
+			m.input = ""
+			return m, nil
+		}
 		// Valid invite = immediate approval; no admin action needed.
 		if err := m.db.ActivateAccount(m.username); err != nil {
 			m.result = fmt.Sprintf("Account created but activation failed: %v\nContact the administrator.", err)

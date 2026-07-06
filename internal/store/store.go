@@ -601,9 +601,42 @@ func (s *Store) CreateInvite(code string, createdBy int64, uses int, expiresAt t
 // uses remaining, or has expired.
 var ErrInviteInvalid = errors.New("invite code invalid or expired")
 
+// ValidateInvite checks that an invite code exists, has uses remaining, and
+// has not expired — WITHOUT decrementing its use count. Used by the
+// registration flow at code-entry time to give the user immediate feedback,
+// while deferring the actual consume to ValidateAndConsumeInvite at
+// confirmed-account-creation time; that way an abandoned or failed
+// registration never burns a use. Returns ErrInviteInvalid if the code
+// cannot currently be used. Note this is an unsynchronized point-in-time
+// check: a concurrent registration could consume the last use between this
+// call and the later ValidateAndConsumeInvite, which is why the latter
+// re-validates atomically rather than trusting this result.
+func (s *Store) ValidateInvite(code string) error {
+	var uses int
+	var expiresAt string
+	err := s.db.QueryRow(
+		`SELECT uses_remaining, expires_at FROM invites WHERE code = ?`, code,
+	).Scan(&uses, &expiresAt)
+	if errors.Is(err, sql.ErrNoRows) {
+		return ErrInviteInvalid
+	}
+	if err != nil {
+		return err
+	}
+	if uses <= 0 {
+		return ErrInviteInvalid
+	}
+	if inviteExpired(expiresAt) {
+		return ErrInviteInvalid
+	}
+	return nil
+}
+
 // ValidateAndConsumeInvite atomically checks that the code is valid and
 // decrements uses_remaining. Returns ErrInviteInvalid if the code cannot
-// be used.
+// be used. The check is redone inside the transaction (not delegated to
+// ValidateInvite) so the validate-and-decrement is a single atomic unit —
+// two concurrent registrations can't both consume the last use.
 func (s *Store) ValidateAndConsumeInvite(code string) error {
 	tx, err := s.db.Begin()
 	if err != nil {
@@ -625,13 +658,7 @@ func (s *Store) ValidateAndConsumeInvite(code string) error {
 	if uses <= 0 {
 		return ErrInviteInvalid
 	}
-	// Parse and check expiry; year >= 2090 = never expires.
-	t, err := time.Parse("2006-01-02 15:04:05", expiresAt)
-	if err != nil {
-		// Try alternate format SQLite may use.
-		t, err = time.Parse("2006-01-02T15:04:05Z", expiresAt)
-	}
-	if err == nil && t.Year() < 2090 && time.Now().After(t) {
+	if inviteExpired(expiresAt) {
 		return ErrInviteInvalid
 	}
 
@@ -641,6 +668,20 @@ func (s *Store) ValidateAndConsumeInvite(code string) error {
 		return err
 	}
 	return tx.Commit()
+}
+
+// inviteExpired reports whether a stored expires_at string represents a time
+// in the past. A year >= 2090 is the never-expires sentinel. A string that
+// fails to parse under either known layout is treated as non-expiring — this
+// preserves the prior inline behavior exactly (fail-open on an unparseable
+// timestamp); it is deliberately not changed here.
+func inviteExpired(expiresAt string) bool {
+	t, err := time.Parse("2006-01-02 15:04:05", expiresAt)
+	if err != nil {
+		// Try alternate format SQLite may use.
+		t, err = time.Parse("2006-01-02T15:04:05Z", expiresAt)
+	}
+	return err == nil && t.Year() < 2090 && time.Now().After(t)
 }
 
 // ListInvites returns all invite codes, for admin display.

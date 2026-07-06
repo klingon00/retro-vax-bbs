@@ -243,6 +243,49 @@ func TestValidateAndConsumeInvite_PastExpiryIsInvalid(t *testing.T) {
 	}
 }
 
+// TestValidateInvite_DoesNotConsume guards the registration fix: validating a
+// code must not decrement its use count — only ValidateAndConsumeInvite does,
+// deferred to confirmed account creation. A single-use code must therefore
+// survive repeated validation and still be consumable exactly once.
+func TestValidateInvite_DoesNotConsume(t *testing.T) {
+	s := openTestStore(t)
+	creator, err := s.CreateUser("invitecreator3", "hash", "admin")
+	if err != nil {
+		t.Fatalf("CreateUser: %v", err)
+	}
+	if err := s.CreateInvite("single-use-42", creator.ID, 1, NeverExpires()); err != nil {
+		t.Fatalf("CreateInvite: %v", err)
+	}
+
+	// Validate several times: a 1-use code must stay valid, never decremented.
+	for i := 0; i < 3; i++ {
+		if err := s.ValidateInvite("single-use-42"); err != nil {
+			t.Fatalf("ValidateInvite call %d rejected a still-unused code: %v", i+1, err)
+		}
+	}
+
+	// The single use is still available: consume succeeds once...
+	if err := s.ValidateAndConsumeInvite("single-use-42"); err != nil {
+		t.Errorf("ValidateAndConsumeInvite after validate-only: got %v, want nil", err)
+	}
+	// ...and is now exhausted for both validate and consume.
+	if err := s.ValidateInvite("single-use-42"); err != ErrInviteInvalid {
+		t.Errorf("ValidateInvite on exhausted code: got %v, want %v", err, ErrInviteInvalid)
+	}
+	if err := s.ValidateAndConsumeInvite("single-use-42"); err != ErrInviteInvalid {
+		t.Errorf("ValidateAndConsumeInvite on exhausted code: got %v, want %v", err, ErrInviteInvalid)
+	}
+}
+
+// TestValidateInvite_UnknownCode confirms a nonexistent code is rejected the
+// same way by the validate-only path as by the consuming path.
+func TestValidateInvite_UnknownCode(t *testing.T) {
+	s := openTestStore(t)
+	if err := s.ValidateInvite("no-such-code-99"); err != ErrInviteInvalid {
+		t.Errorf("ValidateInvite on unknown code: got %v, want %v", err, ErrInviteInvalid)
+	}
+}
+
 func TestGetUserByUsernameCI(t *testing.T) {
 	s := openTestStore(t)
 
