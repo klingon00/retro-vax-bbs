@@ -959,6 +959,75 @@ never actually called anywhere in the codebase (confirmed via grep) —
 calling it. Dead code, and arguably a reuse opportunity, but out of scope
 for a bug-fix pass; flagging for whoever next touches invite logic.
 
+## Audit finding #1 fix: never-closed event-channel goroutine leak (2026-07-06)
+
+Closes finding #1 of `docs/audits/audit-2026-07-05.md` — the one item that
+audit flagged as actually worth prioritizing (a real availability issue for a
+24/7 service). Two `tea.Cmd` goroutines did a *blocking* channel receive that
+never returned: `waitForPhoneEvent` (`internal/lobby/model.go`) on the
+registry's per-account `notify` channel, and `waitForChar`
+(`internal/phone/app.go`) on a PHONE participant's `IncomingChar`. Neither
+channel was ever closed, and Bubble Tea can't cancel an in-flight `Cmd`, so
+every lobby session leaked one goroutine and every call participation leaked
+another, for the whole process uptime.
+
+The naive fix (close the channel in `Unregister`/`Hangup`) would panic: the
+senders (`sendEvent`/`NotifyAdmins`/`BroadcastChar`) do non-blocking sends, and
+a `close()` racing an in-flight send is a send-on-closed panic that `default:`
+does not catch. The fix uses two *different* coordinated-shutdown mechanisms,
+chosen by where each channel's sends are locked:
+
+- **registry `notify` → a signal-only `done` channel the receiver selects on.**
+  `sendEvent` sends *after* releasing the registry RLock (it's handed the
+  channel by `Notify()`), so close-under-lock can't exclude it. Instead each
+  `entry` gains a `done chan struct{}`, closed once in `Unregister` when the
+  account's last session departs (`count <= 0`). `waitForPhoneEvent` selects on
+  `notify` and `done`; `notify` itself is never closed, so the lock-free
+  non-blocking sends can never panic. `Events()` now returns `(notify, done)` as
+  a matched pair under a single RLock — fetching them in two calls could pair a
+  live channel with a stale one across a reconnect. `waitForPhoneEvent` guards
+  *both* for nil: a non-nil `notify` with a nil `done` would make `select` block
+  forever on the nil arm, silently re-disabling shutdown, so it fails toward
+  "stop listening" (visible) not "leak" (silent).
+
+- **phone `IncomingChar` → close directly under the sender's lock.**
+  `BroadcastChar` (the only sender) holds `c.mu`, the same lock `Hangup`/`Reject`
+  hold, so closing there can't race a send, and once the participant is spliced
+  out of the slice no later `BroadcastChar` targets it. A shared `hangupLocked`
+  helper does the remove-close-notify-teardown, and is idempotent (an
+  `idx == -1` guard makes a second removal of an already-gone participant a
+  no-op, never a double close). The receiver's pre-existing
+  `if !ok { return nil }` path — the audit's "smoking gun" for an
+  intended-but-missing close — reaps the goroutine with no receiver change.
+
+- **`Calls.HangupUser(username)` for the disconnect case.** A mid-call SSH *drop*
+  runs neither HANGUP nor EXIT, so nothing closed the dropped session's
+  `IncomingChar` and it left a phantom participant in everyone else's call. The
+  fix hangs the user up from `sessionMiddleware`'s teardown defer — the one hook
+  that fires on every exit and runs *outside* the doomed `tea.Program`.
+  Registered *after* `reg.Unregister` so LIFO runs `HangupUser` first (tear down
+  the call, then remove presence). This also closes the latent
+  phantom-participant bug, not just the leak.
+
+**Verification.** Deterministic channel-close / idempotency / nil-guard tests in
+`internal/registry/registry_test.go`, `internal/phone/call_test.go` (new file),
+and `internal/lobby/model_test.go` (new file). Separately, a throwaway churn
+harness armed 100 blocked event-receivers and 200 blocked char-receivers (the
+goroutine count rose by exactly +100 then +200, proving they really spawned),
+then confirmed teardown returned to baseline, and a 500-cycle
+connect/call/disconnect churn held the goroutine count flat (+0) at every
+100-cycle checkpoint. The harness was **not** committed — goroutine-count
+assertions are timing-sensitive, so the deterministic channel-state tests are
+the committed regression guard. `go build`/`go vet`/`go test ./...`/`gofmt -l`
+all clean.
+
+**Not addressed here (deliberate, bounded):** with a per-account `done`, an
+earlier session of a multi-session account has its event-receiver reaped only
+when the account's *last* session leaves (that's when `done` closes) — bounded,
+self-clearing, and a proportionate call given the notify channel is
+deliberately per-account (the documented "ring reaches one session" design).
+Findings #3–#6 and the minor items in the audit remain open follow-ups.
+
 ## Next concrete steps
 
 1. **VAX/VMS command abbreviation** — shortest unambiguous prefix (DCL
