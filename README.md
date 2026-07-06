@@ -2,10 +2,8 @@
 
 A modern, self-hosted, retro VAX/VMS-style multi-user shell, built on
 `wish` + `bubbletea` + `lipgloss` over SSH. See `docs/design-doc.md` and
-`docs/open-questions.md` for the full architecture and decision history —
-keep those up to date as design decisions get made; this README is just
-the "how do I run this" doc. For operating a live instance, see
-`docs/admin-guide.md`.
+`docs/open-questions.md` for the full architecture and decision history.
+For operating a live instance, see `docs/admin-guide.md`.
 
 ## What this is (and isn't)
 
