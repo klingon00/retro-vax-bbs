@@ -46,6 +46,13 @@ type entry struct {
 	// registers; all concurrent sessions for the same user share it.
 	notify chan PhoneEvent
 
+	// done is closed by Unregister when the last session for this account
+	// departs, waking any goroutine blocked in waitForPhoneEvent so it
+	// exits instead of leaking. Signal-only: nothing ever sends on it, so
+	// closing is always race-free — unlike notify, which has lock-free
+	// non-blocking senders (sendEvent/NotifyAdmins) and must never be closed.
+	done chan struct{}
+
 	// kick, when non-nil, terminates the user's active SSH session.
 	// Set by sessionMiddleware; used by the KICK admin command.
 	kick func()
@@ -87,12 +94,17 @@ func (r *Registry) Register(username, role string, adminVisible bool, initialApp
 			count:        1,
 			currentApp:   initialApp,
 			notify:       make(chan PhoneEvent, 8),
+			done:         make(chan struct{}),
 		}
 	}
 }
 
-// Unregister decrements the session count for username and removes the
-// entry (and its notify channel) when the count reaches zero.
+// Unregister decrements the session count for username. When the last
+// session departs (count reaches zero) it closes the entry's done channel
+// — unblocking any waitForPhoneEvent goroutine so it returns instead of
+// leaking — then removes the entry. done is closed exactly once: the close
+// and delete share this critical section, so a later Unregister for an
+// already-removed user hits the !ok early return above and never re-closes.
 func (r *Registry) Unregister(username string) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
@@ -102,6 +114,7 @@ func (r *Registry) Unregister(username string) {
 	}
 	e.count--
 	if e.count <= 0 {
+		close(e.done)
 		delete(r.sessions, username)
 	}
 }
@@ -128,16 +141,20 @@ func (r *Registry) Notify(username string) chan<- PhoneEvent {
 	return nil
 }
 
-// Events returns the receive end of the PhoneEvent channel for the given
-// username, so that the user's own Bubble Tea program can poll for
-// incoming events. Returns nil if not connected.
-func (r *Registry) Events(username string) <-chan PhoneEvent {
+// Events returns the receive ends of both the PhoneEvent channel and the
+// done channel for the given username, so the user's own Bubble Tea program
+// can wait for an incoming event or for session teardown. Both are fetched
+// under a single RLock so they can't come from different entry generations
+// (a reconnect between two separate lookups could otherwise pair a live
+// notify with a stale done, or vice versa). done closes when the account's
+// last session departs. Both are nil if not connected — callers must check.
+func (r *Registry) Events(username string) (<-chan PhoneEvent, <-chan struct{}) {
 	r.mu.RLock()
 	defer r.mu.RUnlock()
 	if e, ok := r.sessions[username]; ok {
-		return e.notify
+		return e.notify, e.done
 	}
-	return nil
+	return nil, nil
 }
 
 // List returns a visibility-filtered, alphabetically sorted snapshot.

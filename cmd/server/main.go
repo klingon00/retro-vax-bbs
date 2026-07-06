@@ -164,7 +164,7 @@ func main() {
 	publicLimiter := newLimiter(cfg)
 	adminLimiter := newLimiter(cfg)
 
-	sessionMW := sessionMiddleware(db, reg)
+	sessionMW := sessionMiddleware(db, reg, globalCalls)
 
 	// Build the pre-auth timeout option once; used by both listeners.
 	// If authTimeoutSecs is 0, no timeout is applied (wish.NewServer
@@ -255,7 +255,7 @@ func main() {
 // in the ssh.Context for teaHandler to read. The registration is
 // deferred-unregistered so it is always cleaned up when the session ends,
 // regardless of how it exits.
-func sessionMiddleware(db *store.Store, reg *registry.Registry) wish.Middleware {
+func sessionMiddleware(db *store.Store, reg *registry.Registry, calls *phone.Calls) wish.Middleware {
 	return func(next ssh.Handler) ssh.Handler {
 		return func(s ssh.Session) {
 			// Registration sessions connect as "new" — no DB account exists yet.
@@ -277,7 +277,20 @@ func sessionMiddleware(db *store.Store, reg *registry.Registry) wish.Middleware 
 			reg.Register(s.User(), user.Role, user.AdminVisible, "LOBBY")
 			// Store a kick function so admin KICK command can close this session.
 			reg.SetKick(s.User(), func() { s.Exit(0) })
+
+			// Teardown cleanup. Go runs defers last-registered-first (LIFO), so
+			// this ordering is deliberate: Unregister is registered FIRST and
+			// HangupUser SECOND, which means at session end HangupUser runs
+			// BEFORE Unregister. HangupUser removes this user from any active
+			// PHONE call — closing their IncomingChar to reap the waitForChar
+			// goroutine and notifying the other participants — and Unregister
+			// then removes this account's registry entry and closes its done
+			// channel, reaping the waitForPhoneEvent goroutine. A mid-call SSH
+			// *drop* runs neither HANGUP nor EXIT, so these defers are the only
+			// thing that tears down a call and its goroutines on an abrupt
+			// disconnect.
 			defer reg.Unregister(s.User())
+			defer calls.HangupUser(s.User())
 			next(s)
 		}
 	}

@@ -93,3 +93,68 @@ func TestList_AdminSeesOtherAdmins(t *testing.T) {
 		t.Fatalf("admin viewer should see invisible admin, got %v", views)
 	}
 }
+
+// isClosed reports whether a signal-only channel (one that is only ever
+// closed, never sent to) has been closed, without blocking.
+func isClosed(done <-chan struct{}) bool {
+	select {
+	case <-done:
+		return true
+	default:
+		return false
+	}
+}
+
+func TestUnregister_ClosesDoneChannel(t *testing.T) {
+	r := New()
+	r.Register("carol", "user", false, "LOBBY")
+
+	_, done := r.Events("carol")
+	if done == nil {
+		t.Fatal("Events returned a nil done channel for a registered user")
+	}
+	if isClosed(done) {
+		t.Fatal("done should be open while the session is active")
+	}
+
+	r.Unregister("carol")
+	if !isClosed(done) {
+		t.Fatal("done should be closed once the last session unregisters")
+	}
+}
+
+func TestUnregister_DoneStaysOpenUntilLastSession(t *testing.T) {
+	r := New()
+	r.Register("carol", "user", false, "LOBBY")
+	r.Register("carol", "user", false, "LOBBY") // second session shares the entry
+	_, done := r.Events("carol")
+
+	r.Unregister("carol") // one session remains — done must stay open
+	if isClosed(done) {
+		t.Fatal("done closed while a session for carol still remains")
+	}
+
+	r.Unregister("carol") // last session gone — done must close
+	if !isClosed(done) {
+		t.Fatal("done should be closed after the final session unregisters")
+	}
+}
+
+func TestEvents_MatchedPairAndNilWhenAbsent(t *testing.T) {
+	r := New()
+
+	// Not connected: both nil, so waitForPhoneEvent's guard returns a nil Cmd.
+	notify, done := r.Events("ghost")
+	if notify != nil || done != nil {
+		t.Fatalf("Events for an absent user should return (nil, nil), got notify!=nil=%v done!=nil=%v",
+			notify != nil, done != nil)
+	}
+
+	// Connected: both non-nil (a matched pair from the same entry).
+	r.Register("carol", "user", false, "LOBBY")
+	notify, done = r.Events("carol")
+	if notify == nil || done == nil {
+		t.Fatalf("Events for a registered user should return a non-nil pair, got notify!=nil=%v done!=nil=%v",
+			notify != nil, done != nil)
+	}
+}

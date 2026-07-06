@@ -165,6 +165,10 @@ func (c *Calls) Answer(callID, calleeUsername string) (*Call, *Participant, erro
 	}
 
 	if call.State != CallPending {
+		// Roll back the just-appended calleeP. No waitForChar goroutine is armed
+		// until doAnswer succeeds (it returns on this error instead), so
+		// calleeP.IncomingChar has no receiver to reap — dropping the slot lets
+		// GC reclaim the channel; there is nothing to close.
 		call.participants = call.participants[:len(call.participants)-1]
 		return nil, nil, fmt.Errorf("call %s is in unexpected state", callID)
 	}
@@ -222,8 +226,16 @@ func (c *Calls) Reject(callID, calleeUsername string) error {
 		return fmt.Errorf("call %s is not in a rejectable state", callID)
 	}
 
-	// Standard 2-party pending call rejection.
+	// Standard 2-party pending call rejection. The caller leaves this path via
+	// goIdle in its EventReject handler, not via Hangup, so close its
+	// IncomingChar here to reap the caller's waitForChar goroutine. In a pending
+	// call the caller is the only participant (the callee never created one —
+	// that happens on Answer), and the call is deleted just below, so no later
+	// BroadcastChar can target the closed channel. Safe under c.mu.
 	close(call.stopRing)
+	for _, p := range call.participants {
+		close(p.IncomingChar)
+	}
 	delete(c.calls, callID)
 	c.sendEvent(call.Caller, registry.PhoneEvent{
 		Type:   registry.EventReject,
@@ -234,8 +246,9 @@ func (c *Calls) Reject(callID, calleeUsername string) error {
 	return nil
 }
 
-// Hangup removes a participant from a call. If the last participant leaves,
-// the call is torn down and remaining participants are notified.
+// Hangup removes a participant from a call by call ID. If the last participant
+// leaves, the call is torn down and remaining participants are notified. Safe
+// to call for a participant who has already left — hangupLocked is a no-op then.
 func (c *Calls) Hangup(callID, username string) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
@@ -244,18 +257,59 @@ func (c *Calls) Hangup(callID, username string) {
 	if !ok {
 		return
 	}
+	c.hangupLocked(call, username)
+}
 
-	remaining := call.participants[:0]
-	for _, p := range call.participants {
-		if p.Username != username {
-			remaining = append(remaining, p)
+// HangupUser removes username from whatever call they are currently in,
+// regardless of call ID. Called from the session-teardown path: a dropped SSH
+// connection never runs a HANGUP/EXIT command, so without this a mid-call
+// disconnect would leave a phantom participant in the call and leak the
+// departed session's waitForChar goroutine (its IncomingChar would never be
+// closed). A user is only ever in one call at a time, so the first match is the
+// only one; a no-op if they are in no call.
+func (c *Calls) HangupUser(username string) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
+	for _, call := range c.calls {
+		for _, p := range call.participants {
+			if p.Username == username {
+				c.hangupLocked(call, username)
+				return
+			}
 		}
 	}
-	call.participants = remaining
+}
+
+// hangupLocked removes username from call: it closes their IncomingChar (waking
+// their waitForChar goroutine, which returns on the !ok receive), notifies the
+// remaining participants, and tears the call down ONLY if it is now empty. The
+// caller must hold c.mu — the same lock BroadcastChar holds — so closing the
+// channel here cannot race an in-flight send, and once the participant is out
+// of the slice no later BroadcastChar can target the closed channel.
+//
+// Idempotent per participant: if username is not in call.participants (e.g. a
+// clean HANGUP/EXIT already removed them and session-teardown HangupUser fires
+// second), idx stays -1 and it returns without closing anything — so
+// IncomingChar is never double-closed.
+func (c *Calls) hangupLocked(call *Call, username string) {
+	idx := -1
+	for i, p := range call.participants {
+		if p.Username == username {
+			idx = i
+			break
+		}
+	}
+	if idx == -1 {
+		return
+	}
+	removed := call.participants[idx]
+	call.participants = append(call.participants[:idx], call.participants[idx+1:]...)
+	close(removed.IncomingChar)
 
 	event := registry.PhoneEvent{
 		Type:   registry.EventHangup,
-		CallID: callID,
+		CallID: call.ID,
 		Caller: username,
 	}
 	for _, p := range call.participants {
@@ -268,13 +322,13 @@ func (c *Calls) Hangup(callID, username string) {
 			if call.Callee != "" {
 				c.sendEvent(call.Callee, registry.PhoneEvent{
 					Type:   registry.EventHangup,
-					CallID: callID,
+					CallID: call.ID,
 					Caller: username,
 					Callee: call.Callee,
 				})
 			}
 		}
-		delete(c.calls, callID)
+		delete(c.calls, call.ID)
 	}
 }
 

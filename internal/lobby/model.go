@@ -101,7 +101,7 @@ func (m Model) ringBellCmd() tea.Cmd {
 }
 
 func (m Model) Init() tea.Cmd {
-	return waitForPhoneEvent(m.reg.Events(m.username))
+	return m.subscribePhoneEvents()
 }
 
 func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
@@ -112,7 +112,7 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 
 		if ring, ok := msg.(phoneRingMsg); ok {
 			actualMsg = phone.PhoneEventMsg{Event: ring.event}
-			resubscribeCmd = waitForPhoneEvent(m.reg.Events(m.username))
+			resubscribeCmd = m.subscribePhoneEvents()
 		}
 
 		updated, appCmd := m.activeApp.Update(actualMsg)
@@ -137,7 +137,7 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 						}
 					}
 				}
-				return m, waitForPhoneEvent(m.reg.Events(m.username))
+				return m, m.subscribePhoneEvents()
 			}
 		}
 		return m, tea.Batch(appCmd, resubscribeCmd)
@@ -157,7 +157,7 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	case phoneRingMsg:
 		var bellCmd tea.Cmd
 		m, bellCmd = m.handleRing(msg.event)
-		return m, tea.Batch(bellCmd, waitForPhoneEvent(m.reg.Events(m.username)))
+		return m, tea.Batch(bellCmd, m.subscribePhoneEvents())
 
 	case clearLobbyBellMsg:
 		return m, nil
@@ -340,17 +340,41 @@ func (m Model) View() string {
 	return b.String()
 }
 
-// waitForPhoneEvent returns a tea.Cmd that blocks until a PhoneEvent
-// arrives on the session's notify channel, firing a phoneRingMsg.
-func waitForPhoneEvent(ch <-chan registry.PhoneEvent) tea.Cmd {
-	if ch == nil {
+// subscribePhoneEvents re-arms this session's phone-event receiver. It fetches
+// the notify and done channels in one Events() call so they are always a
+// matched pair from the same registry entry generation — the invariant
+// waitForPhoneEvent relies on. Returns a nil Cmd when the session isn't
+// registered (Events returns both nil).
+func (m Model) subscribePhoneEvents() tea.Cmd {
+	events, done := m.reg.Events(m.username)
+	return waitForPhoneEvent(events, done)
+}
+
+// waitForPhoneEvent returns a tea.Cmd that blocks until either a PhoneEvent
+// arrives on the session's notify channel (firing a phoneRingMsg) or the
+// session's done channel closes at teardown (returning nil so the goroutine
+// exits instead of leaking). notify itself is never closed — it has lock-free
+// non-blocking senders — so done is the shutdown signal, selected alongside it.
+// Bubble Tea can't cancel an in-flight Cmd, so without this select the blocking
+// receive would keep the goroutine alive for the whole process lifetime.
+func waitForPhoneEvent(ch <-chan registry.PhoneEvent, done <-chan struct{}) tea.Cmd {
+	// Guard both, not just ch: a receive from a nil channel blocks forever, so
+	// a non-nil ch paired with a nil done would silently disable the shutdown
+	// arm and reintroduce the leak with no error. Events() always returns the
+	// two together (both non-nil or both nil), so a mismatch is a broken
+	// invariant — fail toward "stop listening" (visible) not "leak" (silent).
+	if ch == nil || done == nil {
 		return nil
 	}
 	return func() tea.Msg {
-		event, ok := <-ch
-		if !ok {
+		select {
+		case event, ok := <-ch:
+			if !ok {
+				return nil
+			}
+			return phoneRingMsg{event: event}
+		case <-done:
 			return nil
 		}
-		return phoneRingMsg{event: event}
 	}
 }
