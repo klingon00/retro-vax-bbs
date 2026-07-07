@@ -477,28 +477,48 @@ func (s *Store) CountUsers() (int, error) {
 	return n, err
 }
 
+// usableAdminPredicate is the SQL WHERE-fragment identifying a currently
+// reachable admin account: an admin who can be logged into right now —
+// status 'active', or 'suspended' with a timed (non-permanent) ban that has
+// already lapsed (matching CheckAndLiftExpiredBan's self-heal semantics, so
+// an admin whose ban is about to lift on its own doesn't read as "zero
+// usable admins"). It lives in one place so CountUsableAdmins and the atomic
+// last-admin guards in BanUser/DeleteUser all reference the same text rather
+// than each carrying a copy (see audit 2026-07-05 findings #3 and #4).
+//
+// Keep it in sync BY HAND with User.IsUsableAdmin, the Go single-row twin —
+// a string constant can't cross the SQL/Go boundary. The year<2090 clause
+// excludes the permanent-ban sentinel (NeverExpires, year 2099); it is
+// redundant with "< datetime('now')" for today's data but states
+// permanent-means-never-usable explicitly, backstops clock skew, and must
+// mirror IsUsableAdmin's own .Year() < 2090 check.
+const usableAdminPredicate = `role = 'admin' AND (` +
+	`status = 'active' ` +
+	`OR (status = 'suspended' ` +
+	`AND banned_until IS NOT NULL ` +
+	`AND banned_until < datetime('now') ` +
+	`AND CAST(strftime('%Y', banned_until) AS INTEGER) < 2090))`
+
 // CountUsableAdmins returns the number of admin accounts reachable via
-// normal login right now — active, or suspended with a timed (non-
-// permanent) ban that has already lapsed, matching
-// CheckAndLiftExpiredBan's self-heal semantics so an admin whose ban is
-// about to lift on its own doesn't spuriously read as "zero usable
-// admins." Keep this predicate in sync by hand with User.IsUsableAdmin
-// and CheckAndLiftExpiredBan — there is no shared query builder here.
+// normal login right now. See usableAdminPredicate for the exact definition
+// and its hand-sync obligation with User.IsUsableAdmin.
 func (s *Store) CountUsableAdmins() (int, error) {
 	var n int
 	err := s.db.QueryRow(
-		`SELECT COUNT(*) FROM users
-		 WHERE role = 'admin'
-		       AND (status = 'active'
-		            OR (status = 'suspended'
-		                AND banned_until IS NOT NULL
-		                AND banned_until < datetime('now')
-		                AND CAST(strftime('%Y', banned_until) AS INTEGER) < 2090))`,
+		`SELECT COUNT(*) FROM users WHERE ` + usableAdminPredicate,
 	).Scan(&n)
 	return n, err
 }
 
 // ---- Ban / suspend -------------------------------------------------------
+
+// ErrLastUsableAdmin is returned by BanUser and DeleteUser when the write
+// was refused because applying it would have left zero usable admin
+// accounts. The check is atomic with the mutation (folded into the SQL
+// WHERE clause), so this is the authoritative signal that the last-admin
+// invariant blocked the action — not a best-effort pre-check. See audit
+// 2026-07-05 finding #3.
+var ErrLastUsableAdmin = errors.New("would remove the last usable admin account")
 
 // BanUser sets a user's status to 'suspended' and records when the ban
 // lifts. Pass nil for a permanent ban. Permanent bans record a far-future
@@ -521,15 +541,32 @@ func (s *Store) BanUser(username string, until *time.Time) error {
 	} else {
 		banUntil = until.UTC().Format("2006-01-02 15:04:05")
 	}
+	// The last-usable-admin guard is folded into the WHERE clause so the
+	// count and the mutation are one atomic statement: the ban applies only
+	// if the target isn't itself a usable admin (banning it can't reduce the
+	// count) or more than one usable admin exists. Two admins banning each
+	// other concurrently can't both slip through — SQLite serializes the
+	// writes, so the second statement sees the first's effect. Audit #3.
 	res, err := s.db.Exec(
-		`UPDATE users SET status = 'suspended', banned_until = ? WHERE username = ?`,
+		`UPDATE users SET status = 'suspended', banned_until = ?
+		 WHERE username = ?
+		       AND (NOT (`+usableAdminPredicate+`)
+		            OR (SELECT COUNT(*) FROM users WHERE `+usableAdminPredicate+`) > 1)`,
 		banUntil, username,
 	)
 	if err != nil {
 		return fmt.Errorf("banning %q: %w", username, err)
 	}
 	if n, _ := res.RowsAffected(); n == 0 {
-		return ErrNotFound
+		// Zero rows means either no such user or the guard refused (target is
+		// the last usable admin). Disambiguate for the caller's message only —
+		// the atomic write above already decided safely; a state change between
+		// it and this read can at worst mislabel the error, never zero out the
+		// admins.
+		if _, gerr := s.GetUserByUsername(username); errors.Is(gerr, ErrNotFound) {
+			return ErrNotFound
+		}
+		return ErrLastUsableAdmin
 	}
 	return nil
 }
@@ -714,13 +751,26 @@ func (s *Store) ListInvites() ([]Invite, error) {
 // Returns ErrNotFound if no such user exists.
 // Distinct from BAN (which suspends) — this is a hard delete.
 func (s *Store) DeleteUser(username string) error {
-	res, err := s.db.Exec(`DELETE FROM users WHERE username = ?`, username)
+	// Same atomic last-usable-admin guard as BanUser (audit #3): the delete
+	// applies only if the target isn't the last usable admin. One statement,
+	// so a concurrent delete/ban of the other admin can't race it to zero.
+	res, err := s.db.Exec(
+		`DELETE FROM users
+		 WHERE username = ?
+		       AND (NOT (`+usableAdminPredicate+`)
+		            OR (SELECT COUNT(*) FROM users WHERE `+usableAdminPredicate+`) > 1)`,
+		username,
+	)
 	if err != nil {
 		return fmt.Errorf("deleting user %q: %w", username, err)
 	}
-	n, _ := res.RowsAffected()
-	if n == 0 {
-		return ErrNotFound
+	if n, _ := res.RowsAffected(); n == 0 {
+		// No such user, or the guard refused. Disambiguate for the message
+		// only — see BanUser for why the follow-up read is race-safe.
+		if _, gerr := s.GetUserByUsername(username); errors.Is(gerr, ErrNotFound) {
+			return ErrNotFound
+		}
+		return ErrLastUsableAdmin
 	}
 	return nil
 }

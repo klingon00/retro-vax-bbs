@@ -2,6 +2,8 @@ package store
 
 import (
 	"database/sql"
+	"errors"
+	"sync"
 	"testing"
 	"time"
 )
@@ -16,6 +18,21 @@ func openTestStore(t *testing.T) *Store {
 	}
 	t.Cleanup(func() { s.Close() })
 	return s
+}
+
+// forceBan writes a suspended/banned state directly, bypassing BanUser's
+// last-usable-admin guard. Read-side tests (e.g. CountUsableAdmins) need to
+// construct "unusable admin" states — including the zero-usable-admins state
+// that the guard now makes unreachable through the normal ban/delete path —
+// without the write itself being refused. White-box: same package.
+func forceBan(t *testing.T, s *Store, username string, until time.Time) {
+	t.Helper()
+	if _, err := s.db.Exec(
+		`UPDATE users SET status = 'suspended', banned_until = ? WHERE username = ?`,
+		until.UTC().Format("2006-01-02 15:04:05"), username,
+	); err != nil {
+		t.Fatalf("forceBan %q: %v", username, err)
+	}
 }
 
 func TestCreateAndGetUser(t *testing.T) {
@@ -337,9 +354,10 @@ func TestCountUsableAdmins(t *testing.T) {
 		t.Errorf("got %d usable admins with one active admin, want 1", n)
 	}
 
-	if err := s.BanUser("activeAdmin", nil); err != nil { // permanent ban
-		t.Fatalf("BanUser: %v", err)
-	}
+	// Permanently ban the only admin. Forced directly: BanUser now refuses to
+	// ban the last usable admin (that's the whole point of the guard), so the
+	// zero-usable-admins state can only be constructed out-of-band here.
+	forceBan(t, s, "activeAdmin", NeverExpires())
 	n, err = s.CountUsableAdmins()
 	if err != nil {
 		t.Fatalf("CountUsableAdmins: %v", err)
@@ -351,10 +369,9 @@ func TestCountUsableAdmins(t *testing.T) {
 	if _, err := s.CreateUser("lapsedBanAdmin", "hash", "admin"); err != nil {
 		t.Fatalf("CreateUser: %v", err)
 	}
-	past := time.Now().Add(-time.Hour)
-	if err := s.BanUser("lapsedBanAdmin", &past); err != nil {
-		t.Fatalf("BanUser: %v", err)
-	}
+	// Also forced: at this moment lapsedBanAdmin is the sole *usable* admin
+	// (activeAdmin is perma-banned), so a guarded BanUser would refuse it too.
+	forceBan(t, s, "lapsedBanAdmin", time.Now().Add(-time.Hour))
 	n, err = s.CountUsableAdmins()
 	if err != nil {
 		t.Fatalf("CountUsableAdmins: %v", err)
@@ -412,5 +429,153 @@ func TestRecordFailedAttempt_DoesNotExtendLockBeyondThreshold(t *testing.T) {
 	diff := afterExtra.LockedUntil.Time.Sub(firstLockTime)
 	if diff > time.Second {
 		t.Errorf("locked_until moved by %v after an extra attempt past threshold — should stay fixed", diff)
+	}
+}
+
+// ---- Atomic last-usable-admin guard (audit 2026-07-05 finding #3) --------
+
+// TestBanUser_RefusesLastUsableAdmin proves the invariant: banning down to
+// the last usable admin is refused, and the account is left untouched.
+func TestBanUser_RefusesLastUsableAdmin(t *testing.T) {
+	s := openTestStore(t)
+	if _, err := s.CreateUser("admin1", "hash", "admin"); err != nil {
+		t.Fatalf("CreateUser admin1: %v", err)
+	}
+	if _, err := s.CreateUser("admin2", "hash", "admin"); err != nil {
+		t.Fatalf("CreateUser admin2: %v", err)
+	}
+
+	// Banning one of two usable admins is allowed — one still remains.
+	if err := s.BanUser("admin1", nil); err != nil {
+		t.Fatalf("banning one of two admins should succeed: %v", err)
+	}
+	if n, _ := s.CountUsableAdmins(); n != 1 {
+		t.Fatalf("after banning one admin, want 1 usable admin, got %d", n)
+	}
+
+	// Banning the last usable admin must be refused, atomically.
+	if err := s.BanUser("admin2", nil); !errors.Is(err, ErrLastUsableAdmin) {
+		t.Errorf("banning the last usable admin: got %v, want ErrLastUsableAdmin", err)
+	}
+	if n, _ := s.CountUsableAdmins(); n != 1 {
+		t.Errorf("last admin must survive a refused ban: want 1 usable admin, got %d", n)
+	}
+	got, _ := s.GetUserByUsername("admin2")
+	if got.Status != "active" {
+		t.Errorf("refused-ban admin status = %q, want active (unchanged)", got.Status)
+	}
+}
+
+// TestDeleteUser_RefusesLastUsableAdmin is the DELETE USER twin of the ban
+// test above.
+func TestDeleteUser_RefusesLastUsableAdmin(t *testing.T) {
+	s := openTestStore(t)
+	if _, err := s.CreateUser("admin1", "hash", "admin"); err != nil {
+		t.Fatalf("CreateUser admin1: %v", err)
+	}
+	if _, err := s.CreateUser("admin2", "hash", "admin"); err != nil {
+		t.Fatalf("CreateUser admin2: %v", err)
+	}
+
+	if err := s.DeleteUser("admin1"); err != nil {
+		t.Fatalf("deleting one of two admins should succeed: %v", err)
+	}
+	if n, _ := s.CountUsableAdmins(); n != 1 {
+		t.Fatalf("after deleting one admin, want 1 usable admin, got %d", n)
+	}
+
+	if err := s.DeleteUser("admin2"); !errors.Is(err, ErrLastUsableAdmin) {
+		t.Errorf("deleting the last usable admin: got %v, want ErrLastUsableAdmin", err)
+	}
+	if n, _ := s.CountUsableAdmins(); n != 1 {
+		t.Errorf("last admin must survive a refused delete: want 1 usable admin, got %d", n)
+	}
+	if _, err := s.GetUserByUsername("admin2"); err != nil {
+		t.Errorf("refused-delete admin should still exist: %v", err)
+	}
+}
+
+// TestBanUser_NonAdminAllowedWithSingleAdmin confirms the guard only bites
+// admins: banning a regular user never touches the admin count, even when a
+// single admin remains (the NOT(usable-admin) branch of the predicate).
+func TestBanUser_NonAdminAllowedWithSingleAdmin(t *testing.T) {
+	s := openTestStore(t)
+	if _, err := s.CreateUser("soleadmin", "hash", "admin"); err != nil {
+		t.Fatalf("CreateUser soleadmin: %v", err)
+	}
+	if _, err := s.CreateUser("regular", "hash", "user"); err != nil {
+		t.Fatalf("CreateUser regular: %v", err)
+	}
+	if err := s.BanUser("regular", nil); err != nil {
+		t.Errorf("banning a regular user with one admin present should succeed: %v", err)
+	}
+}
+
+// TestBanUser_NotFoundNotMisreportedAsLastAdmin checks the 0-rows
+// disambiguation: a nonexistent target reports ErrNotFound, not the guard's
+// ErrLastUsableAdmin.
+func TestBanUser_NotFoundNotMisreportedAsLastAdmin(t *testing.T) {
+	s := openTestStore(t)
+	if _, err := s.CreateUser("soleadmin", "hash", "admin"); err != nil {
+		t.Fatalf("CreateUser: %v", err)
+	}
+	if err := s.BanUser("ghost", nil); !errors.Is(err, ErrNotFound) {
+		t.Errorf("banning a nonexistent user: got %v, want ErrNotFound", err)
+	}
+}
+
+// TestBanUser_ConcurrentMutualBan is the direct regression for finding #3:
+// two admins banning each other. The atomic guard must let at most one
+// through — a usable admin always survives. The pool is pinned to a single
+// connection because modernc's ":memory:" gives each connection its own
+// isolated database; the atomicity guarantee itself is structural (one SQL
+// statement under SQLite's write serialization), so serialized execution
+// still exercises the exact "second write sees the first" ordering the fix
+// relies on.
+func TestBanUser_ConcurrentMutualBan(t *testing.T) {
+	s := openTestStore(t)
+	s.db.SetMaxOpenConns(1)
+	if _, err := s.CreateUser("adminA", "hash", "admin"); err != nil {
+		t.Fatalf("CreateUser adminA: %v", err)
+	}
+	if _, err := s.CreateUser("adminB", "hash", "admin"); err != nil {
+		t.Fatalf("CreateUser adminB: %v", err)
+	}
+
+	var wg sync.WaitGroup
+	errs := make([]error, 2)
+	targets := []string{"adminB", "adminA"}
+	wg.Add(2)
+	for i := range targets {
+		go func(i int) {
+			defer wg.Done()
+			errs[i] = s.BanUser(targets[i], nil)
+		}(i)
+	}
+	wg.Wait()
+
+	// Load-bearing assertion: never zero usable admins.
+	n, err := s.CountUsableAdmins()
+	if err != nil {
+		t.Fatalf("CountUsableAdmins: %v", err)
+	}
+	if n < 1 {
+		t.Fatalf("mutual concurrent ban left %d usable admins — invariant violated", n)
+	}
+
+	// Exactly one ban succeeds; the other is refused by the guard.
+	successes, refusals := 0, 0
+	for _, e := range errs {
+		switch {
+		case e == nil:
+			successes++
+		case errors.Is(e, ErrLastUsableAdmin):
+			refusals++
+		default:
+			t.Errorf("unexpected BanUser error in mutual ban: %v", e)
+		}
+	}
+	if successes != 1 || refusals != 1 {
+		t.Errorf("mutual ban: got %d success / %d refused, want 1 / 1", successes, refusals)
 	}
 }

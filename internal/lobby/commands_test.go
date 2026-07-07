@@ -28,34 +28,12 @@ func newTestModel(username, role string, db *store.Store) Model {
 	return New(username, role, reg, db, calls, io.Discard, 0)
 }
 
-func TestLastUsableAdminGuard(t *testing.T) {
-	db := newTestLobbyStore(t)
-	if _, err := db.CreateUser("adminA", "hash", "admin"); err != nil {
-		t.Fatalf("CreateUser adminA: %v", err)
-	}
-	m := newTestModel("adminA", "admin", db)
-
-	if e := lastUsableAdminGuard(m, "BAN", "adminA"); e == "" {
-		t.Error("expected guard to refuse targeting the last usable admin, got no refusal")
-	}
-
-	if _, err := db.CreateUser("adminB", "hash", "admin"); err != nil {
-		t.Fatalf("CreateUser adminB: %v", err)
-	}
-	if e := lastUsableAdminGuard(m, "BAN", "adminA"); e != "" {
-		t.Errorf("expected guard to allow action with 2 usable admins, got refusal: %q", e)
-	}
-	if e := lastUsableAdminGuard(m, "BAN", "adminB"); e != "" {
-		t.Errorf("expected guard to allow action with 2 usable admins, got refusal: %q", e)
-	}
-
-	if _, err := db.CreateUser("regularUser", "hash", "user"); err != nil {
-		t.Fatalf("CreateUser regularUser: %v", err)
-	}
-	if e := lastUsableAdminGuard(m, "BAN", "regularUser"); e != "" {
-		t.Errorf("expected guard to allow targeting a non-admin (can't drop admin count), got refusal: %q", e)
-	}
-}
+// Note: the last-usable-admin invariant itself is now enforced and unit-
+// tested at the store layer (internal/store: TestBanUser_RefusesLastUsableAdmin,
+// TestDeleteUser_RefusesLastUsableAdmin, TestBanUser_ConcurrentMutualBan).
+// The lobby tests below cover the handler wiring: that banCommand /
+// deleteUserCommand map store.ErrLastUsableAdmin to the user-facing LASTADMIN
+// message and leave the account untouched on refusal.
 
 func TestBanCommand_RefusesSelfBanAsLastUsableAdmin(t *testing.T) {
 	db := newTestLobbyStore(t)
@@ -106,19 +84,24 @@ func TestBanCommand_AllowsBanWithAnotherAdminRemaining(t *testing.T) {
 	}
 }
 
-func TestDeleteUserCommand_RefusesLastUsableAdminTarget(t *testing.T) {
+func TestDeleteUserCommand_MapsLastUsableAdminRefusal(t *testing.T) {
 	db := newTestLobbyStore(t)
-	if _, err := db.CreateUser("adminA", "hash", "admin"); err != nil {
-		t.Fatalf("CreateUser: %v", err)
+	// Only adminB exists as a usable admin, and the acting session claims a
+	// different admin username ("adminA"). Normal operation can't reach the
+	// last-usable-admin case through DELETE USER for a *self* target — the
+	// E-SELF self-guard fires first — so this drives the defensive
+	// ErrLastUsableAdmin -> LASTADMIN mapping via a non-self target that is
+	// nonetheless the last usable admin in the store.
+	if _, err := db.CreateUser("adminB", "hash", "admin"); err != nil {
+		t.Fatalf("CreateUser adminB: %v", err)
 	}
 	m := newTestModel("adminA", "admin", db)
 
-	// deleteUserCommand's own self-guard would otherwise short-circuit
-	// before reaching lastUsableAdminGuard for a self-target, so exercise
-	// the guard directly with the same label deleteUserCommand uses — this
-	// is the scenario the guard exists to cover even though normal
-	// operation (an admin acting on themselves) hits the self-guard first.
-	if e := lastUsableAdminGuard(m, "DELETE USER", "adminA"); e == "" {
-		t.Error("expected guard to refuse targeting the last usable admin for DELETE USER")
+	msg, _ := deleteUserCommand(m, "adminB")
+	if !strings.Contains(msg, "LASTADMIN") {
+		t.Errorf("expected LASTADMIN refusal deleting the last usable admin, got: %q", msg)
+	}
+	if _, err := db.GetUserByUsername("adminB"); err != nil {
+		t.Errorf("last admin must survive a refused delete: %v", err)
 	}
 }

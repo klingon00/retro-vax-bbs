@@ -896,32 +896,13 @@ func requireAdminLogged(m Model, action, detail string) string {
 	return ""
 }
 
-// lastUsableAdminGuard refuses actionLabel (e.g. "BAN" or "DELETE USER")
-// against username if doing so would leave zero usable admin accounts —
-// the exact state bootstrapAdminAccount's recovery lever (cmd/server)
-// exists to undo, but far better avoided than recovered from. Returns ""
-// if safe to proceed. Self-targeting is allowed as long as other usable
-// admins remain — only the last-usable-admin case is refused.
-func lastUsableAdminGuard(m Model, actionLabel, username string) string {
-	if m.db == nil {
-		return ""
-	}
-	target, err := m.db.GetUserByUsername(username)
-	if err != nil {
-		return "" // not found / lookup failure: existing downstream handling covers this
-	}
-	if !target.IsUsableAdmin() {
-		return "" // target isn't currently a usable admin; can't drop the count
-	}
-	usable, err := m.db.CountUsableAdmins()
-	if err != nil {
-		return fmt.Sprintf("%%VAX-BBS-E-LASTADMIN, could not verify remaining admin accounts (%v) — action refused.", err)
-	}
-	if usable <= 1 {
-		return fmt.Sprintf("%%VAX-BBS-E-LASTADMIN, Cannot %s %q — this is the last usable admin account.", actionLabel, username)
-	}
-	return ""
-}
+// The last-usable-admin invariant (never let BAN or DELETE USER drop the
+// reachable-admin count to zero) is enforced atomically in the store layer —
+// store.BanUser / store.DeleteUser fold the count check into their WHERE
+// clause and return store.ErrLastUsableAdmin when they refuse. There is
+// deliberately no Go-side pre-check here: an earlier CountUsableAdmins()-then-
+// mutate version was a TOCTOU race (audit 2026-07-05 finding #3) — two admins
+// banning each other concurrently could both pass the read, then both mutate.
 
 // ---- APPROVE / DENY -----------------------------------------------------
 
@@ -1054,14 +1035,22 @@ func banCommand(m Model, args string) (string, tea.Cmd) {
 	if err != nil {
 		return fmt.Sprintf("%%VAX-BBS-E-BAN, %v", err), nil
 	}
-	if e := lastUsableAdminGuard(m, "BAN", username); e != "" {
-		return e, nil
-	}
-	// Kick the user first if they're connected.
-	m.reg.Kick(username)
+	// The last-usable-admin guard is enforced atomically inside BanUser
+	// (audit finding #3): the count-and-ban is one SQL statement, so two
+	// admins banning each other concurrently can't both slip through.
 	if err := m.db.BanUser(username, until); err != nil {
-		return fmt.Sprintf("%%VAX-BBS-E-BAN, %v", err), nil
+		switch {
+		case errors.Is(err, store.ErrLastUsableAdmin):
+			return fmt.Sprintf("%%VAX-BBS-E-LASTADMIN, Cannot BAN %q — this is the last usable admin account.", username), nil
+		case errors.Is(err, store.ErrNotFound):
+			return fmt.Sprintf("%%VAX-BBS-E-NOUSER, User '%s' not found.", username), nil
+		default:
+			return fmt.Sprintf("%%VAX-BBS-E-BAN, %v", err), nil
+		}
 	}
+	// Only disconnect the user once the ban is durably applied — avoids
+	// kicking someone we then refuse to ban in the last-admin race.
+	m.reg.Kick(username)
 	return fmt.Sprintf("'%s' has been banned (%s).", username, display), nil
 }
 
@@ -1325,17 +1314,20 @@ func deleteUserCommand(m Model, username string) (string, tea.Cmd) {
 	if strings.EqualFold(username, m.username) {
 		return "%VAX-BBS-E-SELF, Cannot DELETE USER on your own account.", nil
 	}
-	if e := lastUsableAdminGuard(m, "DELETE USER", username); e != "" {
-		return e, nil
-	}
-	// Kick the user if they're currently connected.
-	_ = m.reg.Kick(username) // ignore "not online" errors
+	// The last-usable-admin guard is enforced atomically inside DeleteUser
+	// (audit finding #3), the same one-statement check-and-mutate as BanUser.
 	if err := m.db.DeleteUser(username); err != nil {
-		if errors.Is(err, store.ErrNotFound) {
+		switch {
+		case errors.Is(err, store.ErrLastUsableAdmin):
+			return fmt.Sprintf("%%VAX-BBS-E-LASTADMIN, Cannot DELETE USER %q — this is the last usable admin account.", username), nil
+		case errors.Is(err, store.ErrNotFound):
 			return fmt.Sprintf("%%VAX-BBS-E-NOUSER, User '%s' not found.", username), nil
+		default:
+			return fmt.Sprintf("%%VAX-BBS-E-DELETE, %v", err), nil
 		}
-		return fmt.Sprintf("%%VAX-BBS-E-DELETE, %v", err), nil
 	}
+	// Only disconnect once the delete is durably applied — see banCommand.
+	_ = m.reg.Kick(username) // ignore "not online" errors
 	return fmt.Sprintf("%%VAX-BBS-S-DELETED, Account '%s' has been permanently deleted.", username), nil
 }
 
