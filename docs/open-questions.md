@@ -902,6 +902,14 @@ recovery (matching exact case) followed by an actual SSH login with the
 new password, live. This closes the recovery path out fully end-to-end,
 the same standard the Docker/Unraid packaging work was held to.
 
+> **Superseded in part (2026-07-06):** the `lastUsableAdminGuard` described
+> above was a non-atomic check-then-act — a TOCTOU under two concurrent admins
+> — flagged as audit finding #3 and since replaced by folding the guard into a
+> single conditional `UPDATE`/`DELETE` in `store.BanUser`/`DeleteUser`. See
+> "Audit finding #3 fix" below. The `CountUsableAdmins`/`IsUsableAdmin`
+> predicate and the deliberate self-ban-allowed policy described here are
+> unchanged; only *where* and *how atomically* the check runs changed.
+
 ## Timed-ban and invite-expiry self-heal bug: naive local time stored, compared as UTC (2026-07-04)
 
 Found independently of the admin-recovery work above, reported directly
@@ -1037,7 +1045,71 @@ earlier session of a multi-session account has its event-receiver reaped only
 when the account's *last* session leaves (that's when `done` closes) — bounded,
 self-clearing, and a proportionate call given the notify channel is
 deliberately per-account (the documented "ring reaches one session" design).
-Findings #3–#6 and the minor items in the audit remain open follow-ups.
+Findings #4–#6 and the minor items in the audit remain open follow-ups.
+
+## Audit finding #3 fix: last-usable-admin guard made atomic (2026-07-06)
+
+Closes finding #3 of `docs/audits/audit-2026-07-05.md` — the concurrency gap
+in the last-usable-admin guard. The original guard (added 2026-07-04, see
+"Banned-admin recovery + last-usable-admin guard" above) was
+`lastUsableAdminGuard` in `internal/lobby/commands.go`: it read
+`CountUsableAdmins()` and *then* `banCommand`/`deleteUserCommand` called
+`BanUser`/`DeleteUser` as a separate statement. That's a check-then-act
+TOCTOU — two admins in two sessions each banning the other could both read
+count = 2 (guard passes), then both mutate, landing at zero usable admins:
+exactly the state the guard exists to prevent, and the one
+`bootstrapAdminAccount`'s recovery lever exists to undo.
+
+The fix folds the count check into the write, so check-and-mutate is one
+atomic SQL statement (SQLite serializes writes, so the second statement sees
+the first's effect):
+
+- **Shared predicate extracted.** `usableAdminPredicate`
+  (`internal/store/store.go`) is now the single SQL definition of "reachable
+  admin," referenced by `CountUsableAdmins` and both guarded writes instead of
+  each carrying an inline copy — also trimming the hand-synced duplication
+  audit finding #4 warns about (the Go twin `User.IsUsableAdmin` still has to
+  be kept in sync by hand; a string const can't cross the SQL/Go boundary).
+- **Guarded writes.** `BanUser`/`DeleteUser` gained
+  `WHERE username = ? AND (NOT (<pred>) OR (SELECT COUNT(*) … <pred>) > 1)`:
+  the mutation applies only if the target isn't itself a usable admin (banning
+  it can't drop the count) or more than one usable admin exists. On zero rows
+  affected they do a follow-up existence read purely to *label* the result —
+  `ErrNotFound` vs the new `ErrLastUsableAdmin` — never to decide safety (the
+  atomic write already did that; a state change between write and read can at
+  worst mislabel the message, never zero out the admins).
+- **Go pre-check removed, not layered.** `lastUsableAdminGuard` is deleted;
+  the lobby handlers map `store.ErrLastUsableAdmin` to the same
+  `%VAX-BBS-E-LASTADMIN` message and now `Kick` the target only *after* a
+  confirmed mutation (previously kick-first), so a raced last-admin refusal no
+  longer disconnects someone it then declines to ban/delete.
+
+**A consequence worth remembering:** with the guard now in the store, zero
+usable admins is unreachable through *any* guarded ban/delete path (only the
+empty-DB bootstrap lever mints an admin from nothing). The pre-existing
+`TestCountUsableAdmins` had to switch to a white-box `forceBan` helper (raw
+SQL, test-only, same package) to construct the zero-usable-admins state it
+asserts on — the guarded `BanUser` now correctly refuses to build it.
+
+**Verification.** New store-level tests in `internal/store/store_test.go`:
+`TestBanUser_RefusesLastUsableAdmin`, `TestDeleteUser_RefusesLastUsableAdmin`,
+`TestBanUser_NonAdminAllowedWithSingleAdmin`,
+`TestBanUser_NotFoundNotMisreportedAsLastAdmin`, and
+`TestBanUser_ConcurrentMutualBan` — the direct race regression: two goroutines
+ban each other (pool pinned to one connection because modernc's `:memory:` is
+per-connection), asserting exactly one succeeds, one returns
+`ErrLastUsableAdmin`, and `CountUsableAdmins() >= 1` always holds. The
+`internal/lobby` tests that used to call `lastUsableAdminGuard` directly were
+migrated to drive the handlers through `store.ErrLastUsableAdmin`.
+`go build`/`go vet`/`go test ./...`/`gofmt -l` all clean; `-race` clean; the
+concurrent test stable across 20 runs. Unlike finding #1's disconnect path,
+this race can't be meaningfully hand-triggered on two live terminals (it needs
+same-instant execution), so the deterministic + `-race` tests are the
+regression guard rather than a live SSH pass; a manual sanity check (ban down
+to the last admin and confirm the `%VAX-BBS-E-LASTADMIN` refusal over SSH) is
+straightforward if wanted. Reviewed via klingon00's parallel-instance pass on
+the full diff. Branch `fix/last-admin-toctou`: code+tests in `153adb7`, audit
+status line in `cec8375`.
 
 ## Next concrete steps
 
