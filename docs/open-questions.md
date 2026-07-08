@@ -1233,7 +1233,62 @@ open. `go build`/`go vet`/`gofmt -l`/`go test ./...` all clean. Branch
 audit status line in the following commit.
 
 With #5 closed, every audit-2026-07-05 finding (#1–#6) is resolved; only the
-minor/stylistic cluster remains, left as-is by choice.
+minor/stylistic cluster remained — since addressed (see next entry).
+
+## Audit minor/stylistic cluster: cleanups + leave-alones (2026-07-07)
+
+Worked the seven minor/stylistic items from `docs/audits/audit-2026-07-05.md`.
+Each was re-located in current code (the audit's line numbers predate the #3–#6
+refactors) and marked in place in the audit doc. Three were fixed as trivial
+no-visible-behavior cleanups (this branch, `chore/audit-minor-cleanups`, commit
+`318cab9`); three were deliberately left as-is with the reasoning recorded here so
+a future pass doesn't re-flag them; one (the display-zone inconsistency) is a
+visible-behavior change handled separately on its own branch (next entry).
+
+**Fixed (`318cab9`):**
+
+- **`Invite.IsExpired()` deleted** (`internal/store/store.go`) — dead code, zero
+  callers repo-wide. The finding #6 fix made the string-based `inviteExpired` the
+  single hardened (fail-closed) expiry check used by both `ValidateInvite` and
+  `ValidateAndConsumeInvite`; this parallel method on the already-parsed
+  `time.Time` had no fail-closed handling and was pure two-sources-of-truth drift
+  risk. Deleting it completes #6. The live `DisplayExpiry()` method stays.
+- **`preAuthTimeout` timer stopped** (`cmd/server/main.go`) — `time.After(d)` →
+  `time.NewTimer(d)` + `defer timer.Stop()` + `case <-timer.C:`. Behavior-identical
+  (the timeout still fires the same way; `Stop()` after it fires is a harmless
+  no-op), but on the auth-success / ctx-done paths the timer is released
+  immediately instead of lingering up to `AUTH_TIMEOUT_SECONDS` (default 120s) per
+  connection. A minor holding, not a leak — but free to fix.
+- **Nil-guard parity** (`internal/lobby/commands.go`) — `kickCommand` now guards
+  `m.reg == nil` and `listUsersCommand` guards `m.db == nil`, matching the sibling
+  handlers (`whoCommand`, `listPendingCommand`, `banCommand`) that already do. A
+  nil was previously caught by `dispatch`'s `recover`, so this is consistency +
+  a clean error rather than a bug fix.
+
+**Left as-is (recorded so they aren't re-flagged):**
+
+- **`banCommand` logs before arg-validation** — `requireAdminLogged` emits the
+  audit line before the `len(parts) < 2` usage check, so a malformed `BAN alice`
+  logs an attempt then returns usage. This *matches* the documented "log the
+  attempt" audit philosophy (the log records admin intent, malformed or not).
+  Reordering to log-after-validate would change the audit semantics from attempts
+  to actions — a policy choice, not a cleanup. Trivial to flip later if wanted.
+- **`generateInviteCode` modulo bias** — uses `crypto/rand` but `int(b[i]) %
+  len(list)`. Invite codes are deliberately human-memorable `adjective-noun-NN`
+  strings, gated by rate-limit + use-count + expiry, not cryptographic secrets;
+  modulo bias on a memorable-code generator is irrelevant to its purpose, and
+  rejection sampling would be cargo-cult hygiene.
+- **`adduser -password` plaintext on the CLI** — visible in `ps`/shell history,
+  inherent to a password flag. Accepted, documented tradeoff for the operator-run,
+  closed-mode bootstrap CLI. A real fix (prompt on stdin when `-password` is
+  omitted, like the masked in-lobby CREATE USER flow) is a small *feature* that
+  changes the invocation contract — out of scope for cleanup; noted as a future
+  hardening option.
+
+**Verification.** `go build`/`go vet`/`gofmt -l`/`go test ./...` all clean; no new
+tests (the deleted method has no callers, the timer change is a well-known idiom
+equivalence in untested SSH wiring, and the nil-guards mirror existing untested
+sibling guards).
 
 ## Next concrete steps
 
