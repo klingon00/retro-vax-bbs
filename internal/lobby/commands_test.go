@@ -105,3 +105,40 @@ func TestDeleteUserCommand_MapsLastUsableAdminRefusal(t *testing.T) {
 		t.Errorf("last admin must survive a refused delete: %v", err)
 	}
 }
+
+// ---- Reserved "new" username in admin CREATE USER (audit 2026-07-05 #5) ----
+
+// TestValidateNewUsername_BlocksNewSentinel guards finding #5: the admin
+// CREATE USER path (via validateNewUsername) must reject "new" — the
+// self-registration routing sentinel — case-insensitively, while still
+// allowing the rest of the reserved-word set that self-registration blocks
+// (admins may legitimately create "sysop"/"admin"/"root"), and still
+// enforcing the format rules.
+func TestValidateNewUsername_BlocksNewSentinel(t *testing.T) {
+	cases := []struct {
+		name      string
+		username  string
+		wantError bool
+	}{
+		{"new lowercase blocked", "new", true},
+		{"New mixed-case blocked", "New", true},
+		{"NEW uppercase blocked", "NEW", true},
+		{"reserved-but-admin-allowed sysop", "sysop", false},
+		{"reserved-but-admin-allowed admin", "admin", false},
+		{"reserved-but-admin-allowed root", "root", false},
+		{"ordinary name allowed", "alice", false},
+		{"too short rejected", "ab", true},
+		{"bad char rejected", "bad!", true},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			err := validateNewUsername(c.username)
+			if c.wantError && err == nil {
+				t.Errorf("validateNewUsername(%q) = nil, want an error", c.username)
+			}
+			if !c.wantError && err != nil {
+				t.Errorf("validateNewUsername(%q) = %v, want nil", c.username, err)
+			}
+		})
+	}
+}

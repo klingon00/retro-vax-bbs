@@ -14,6 +14,7 @@ import (
 	"flag"
 	"fmt"
 	"os"
+	"strings"
 
 	"github.com/klingon00/retro-vax-bbs/internal/auth"
 	"github.com/klingon00/retro-vax-bbs/internal/store"
@@ -33,6 +34,14 @@ func main() {
 	}
 	if *role != "user" && *role != "admin" {
 		fmt.Fprintf(os.Stderr, "invalid role %q: must be 'user' or 'admin'\n", *role)
+		os.Exit(1)
+	}
+	// "new" is the self-registration routing sentinel (the public listener
+	// sends username "new" to registration, not login), so an account named
+	// "new" could never log in. Reject it here as BOOTSTRAP_ADMIN_USERNAME
+	// already does in cmd/server. Audit 2026-07-05 #5.
+	if strings.EqualFold(*username, "new") {
+		fmt.Fprintln(os.Stderr, `invalid username: "new" is reserved for self-registration and could never log in`)
 		os.Exit(1)
 	}
 

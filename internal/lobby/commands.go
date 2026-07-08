@@ -1380,7 +1380,12 @@ func createUserCommand(m Model, args string) (string, tea.Cmd) {
 // registration (3-20 chars, letters/digits/underscore) but skips the
 // reserved-word block — an admin creating accounts directly may
 // legitimately want a name like "sysop", which self-registration blocks
-// to stop impersonation attempts.
+// to stop impersonation attempts. The one exception is "new": it isn't just
+// a reserved word, it's the registration routing sentinel (the public
+// listener sends username "new" to registration, not login — see
+// cmd/server/main.go), so an account named "new" is either unreachable
+// (user role) or a confusing footgun (admin role). Block it here too, the
+// same way BOOTSTRAP_ADMIN_USERNAME already does. Audit 2026-07-05 #5.
 func validateNewUsername(s string) error {
 	if len(s) < 3 {
 		return fmt.Errorf("username must be at least 3 characters")
@@ -1392,6 +1397,9 @@ func validateNewUsername(s string) error {
 		if !unicode.IsLetter(c) && !unicode.IsDigit(c) && c != '_' {
 			return fmt.Errorf("username may only contain letters, numbers, and underscores")
 		}
+	}
+	if strings.EqualFold(s, "new") {
+		return fmt.Errorf("username %q is reserved for self-registration and could never log in", s)
 	}
 	return nil
 }
