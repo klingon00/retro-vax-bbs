@@ -59,6 +59,23 @@ checklist above — `docker exec ... /adduser` replaces `go run
 ./cmd/adduser`, since both the running server and the one-shot `adduser`
 binary share the same mounted `/data` volume.
 
+### Timezone (local-time display)
+
+The BBS shows **local wall-clock time** in `TIME`, `WHO`, `FINGER`, `LIST
+USERS`, and `LIST PENDING` — matching authentic VAX/VMS, which showed users
+system-local time, not UTC. Timestamps are always *stored* in UTC; this only
+affects display formatting.
+
+On **bare metal**, "local" is the host's configured timezone
+(`/etc/localtime`) automatically — no action needed. **In a container**
+(Docker or Unraid), there is no `/etc/localtime`, so local time defaults to
+**UTC** unless you set the `TZ` environment variable to your IANA zone — e.g.
+`TZ=America/New_York` or `TZ=Europe/London`. The server binary bundles the
+IANA timezone database (via a `time/tzdata` import), so any zone name resolves
+without adding OS packages to the shell-less image. Leave `TZ` unset or `UTC`
+to keep every timestamp in UTC. Both `docker-compose.yml` and the Unraid
+template expose `TZ` for this.
+
 ### Bootstrapping the first admin account without a shell (Unraid)
 
 The `docker exec ... /adduser` step above requires a real terminal —

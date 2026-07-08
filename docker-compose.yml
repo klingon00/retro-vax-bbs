@@ -41,6 +41,13 @@ services:
       # 0.0.0.0 would then be genuinely unsafe. See docs/admin-guide.md's
       # Docker/Unraid section.
       ADMIN_HOST: "0.0.0.0"
+      # Timezone for the local wall-clock time the BBS shows users (TIME, WHO,
+      # FINGER, LIST USERS, LIST PENDING). The app displays local time, matching
+      # authentic VAX/VMS — but inside a container time.Local defaults to UTC.
+      # Set this to your IANA zone (e.g. America/New_York, Europe/London) to get
+      # real local time; the binary bundles the zone database, so any zone name
+      # works. Leave "UTC" to keep every timestamp in UTC. See docs/admin-guide.md.
+      TZ: "UTC"
       REGISTRATION_MODE: "closed"
       # Optional: create the first admin account automatically at startup
       # instead of `docker exec -it retro-vax-bbs /adduser ...`. Mainly for

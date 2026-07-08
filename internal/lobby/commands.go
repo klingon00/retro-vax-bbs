@@ -700,8 +700,10 @@ func fingerByName(m Model, username string) (string, tea.Cmd) {
 	}
 
 	if user.LastLoginAt.Valid {
+		// Stored UTC rendered in server-local time for display — period-authentic
+		// VAX/VMS showed users local wall-clock, and TIME/WHO already do (audit #1).
 		fmt.Fprintf(&b, "Last login: %s\n",
-			strings.ToUpper(user.LastLoginAt.Time.Format("02-Jan-2006 15:04:05")))
+			strings.ToUpper(user.LastLoginAt.Time.Local().Format("02-Jan-2006 15:04:05")))
 	} else {
 		fmt.Fprintf(&b, "Last login: (never)\n")
 	}
@@ -964,7 +966,7 @@ func listPendingCommand(m Model) (string, tea.Cmd) {
 			email = u.Email.String
 		}
 		sb.WriteString(fmt.Sprintf("\n  %-20s  %-30s  %s",
-			u.Username, email, u.CreatedAt.Format("02-Jan-2006 15:04")))
+			u.Username, email, u.CreatedAt.Local().Format("02-Jan-2006 15:04"))) // .Local(): stored UTC → server-local (audit #1)
 	}
 	sb.WriteString(fmt.Sprintf("\n\n  %d pending. Use APPROVE <user> or DENY <user>.", len(users)))
 	return sb.String(), nil
@@ -1284,7 +1286,7 @@ func listUsersCommand(m Model) (string, tea.Cmd) {
 	for _, u := range users {
 		lastLogin := "never"
 		if u.LastLoginAt.Valid {
-			lastLogin = u.LastLoginAt.Time.Format("02-Jan-2006")
+			lastLogin = u.LastLoginAt.Time.Local().Format("02-Jan-2006") // .Local(): stored UTC → server-local (audit #1)
 		}
 		status := u.Status
 		if u.BannedUntil.Valid {

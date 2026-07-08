@@ -23,6 +23,13 @@ import (
 	"strings"
 	"syscall"
 	"time"
+	// time/tzdata embeds the IANA zone DB so TZ=<zone> resolves inside the
+	// distroless image (which ships no /etc/localtime and may lack
+	// /usr/share/zoneinfo); it's a fallback only — bare-metal still uses system
+	// zoneinfo first, so behavior there is unchanged. This makes local-time
+	// display (TIME/WHO/FINGER/LIST) honor the operator's TZ in Docker/Unraid
+	// instead of silently falling back to UTC. See docs/admin-guide.md.
+	_ "time/tzdata"
 
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/charmbracelet/ssh"
