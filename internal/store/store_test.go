@@ -579,3 +579,49 @@ func TestBanUser_ConcurrentMutualBan(t *testing.T) {
 		t.Errorf("mutual ban: got %d success / %d refused, want 1 / 1", successes, refusals)
 	}
 }
+
+// ---- DSN timezone guard (audit 2026-07-05 finding #4) --------------------
+
+// TestTimestampRoundTripsAsUTC is the regression guard for audit 2026-07-05 finding
+// #4: store.Open's SQLite DSN must never gain a ?_timezone= (or _loc) parameter.
+// Timestamps are written naive-UTC and read back correctly as UTC ONLY because the
+// driver's connection loc is nil (no DSN timezone param). If someone adds
+// ?_timezone=Local, the driver ParseInLocation's stored UTC strings in the server's
+// zone, skewing every ban/lockout comparison by the UTC offset. To keep that
+// observable even in a UTC CI (where Local == UTC would hide it), this test pins
+// time.Local to a fixed non-UTC zone: a future ?_timezone=Local then resolves to THIS
+// zone and shifts the round-tripped instant, failing the assertion. (None of this
+// package's tests use t.Parallel(), so the global time.Local swap is safe; it's
+// restored on cleanup and has no effect on the current nil-loc path.)
+func TestTimestampRoundTripsAsUTC(t *testing.T) {
+	orig := time.Local
+	time.Local = time.FixedZone("TEST+5", 5*60*60) // UTC+5, no DST, no tzdata dependency
+	t.Cleanup(func() { time.Local = orig })
+
+	s := openTestStore(t)
+	if _, err := s.CreateUser("tzuser", "hash", "user"); err != nil {
+		t.Fatalf("CreateUser: %v", err)
+	}
+
+	// A pinned, unambiguous future instant in UTC. BanUser stores it as
+	// until.UTC().Format("2006-01-02 15:04:05") — a naive-UTC string.
+	want := time.Date(2030, 6, 15, 12, 0, 0, 0, time.UTC)
+	if err := s.BanUser("tzuser", &want); err != nil {
+		t.Fatalf("BanUser: %v", err)
+	}
+
+	got, err := s.GetUserByUsername("tzuser")
+	if err != nil {
+		t.Fatalf("GetUserByUsername: %v", err)
+	}
+	if !got.BannedUntil.Valid {
+		t.Fatal("banned_until did not round-trip as a valid timestamp")
+	}
+	// Equal compares absolute instants (location-independent): passes today
+	// (UTC in, UTC out), fails only if a DSN timezone param made the driver
+	// reinterpret the stored UTC string in a non-UTC zone.
+	if !got.BannedUntil.Time.Equal(want) {
+		t.Errorf("banned_until round-tripped to %v (want %v): a UTC/local skew of %v — did store.Open's DSN gain a _timezone param?",
+			got.BannedUntil.Time.UTC(), want, got.BannedUntil.Time.Sub(want))
+	}
+}

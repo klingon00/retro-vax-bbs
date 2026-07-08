@@ -75,6 +75,14 @@ type Store struct {
 // the same data/ directory the SSH host key already lives in, which is
 // already gitignored.
 func Open(path string) (*Store, error) {
+	// DSN is a bare path with NO ?_timezone= (or _loc-style) query param, and must
+	// stay that way: modernc.org/sqlite reads naive DATETIME strings back as UTC only
+	// while the connection loc is nil (no timezone param). Every timestamp here is
+	// written naive-UTC, so a nil loc is what keeps ban/lockout/expiry reads comparing
+	// UTC-to-UTC. Adding a timezone param makes the driver ParseInLocation stored UTC
+	// strings in that zone, silently skewing every comparison by the server's UTC
+	// offset — the write-side bug BanUser/CreateInvite already fixed. Audit 2026-07-05
+	// #4; TestTimestampRoundTripsAsUTC trips if this DSN ever gains such a param.
 	db, err := sql.Open("sqlite", path)
 	if err != nil {
 		return nil, fmt.Errorf("opening database: %w", err)
