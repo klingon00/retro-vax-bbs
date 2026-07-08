@@ -715,18 +715,23 @@ func (s *Store) ValidateAndConsumeInvite(code string) error {
 	return tx.Commit()
 }
 
-// inviteExpired reports whether a stored expires_at string represents a time
-// in the past. A year >= 2090 is the never-expires sentinel. A string that
-// fails to parse under either known layout is treated as non-expiring — this
-// preserves the prior inline behavior exactly (fail-open on an unparseable
-// timestamp); it is deliberately not changed here.
+// inviteExpired reports whether a stored expires_at string represents a time in
+// the past (true = expired → callers reject with ErrInviteInvalid). A year >= 2090
+// is the never-expires sentinel and is treated as valid. A string that parses
+// under neither known layout is treated as EXPIRED — fail closed: every normal
+// write uses .UTC().Format, so an unparseable value is corrupted or hand-edited,
+// and an expiry check must reject on ambiguity rather than read it as
+// never-expiring. (Audit 2026-07-05 #6; was previously fail-open.)
 func inviteExpired(expiresAt string) bool {
 	t, err := time.Parse("2006-01-02 15:04:05", expiresAt)
 	if err != nil {
 		// Try alternate format SQLite may use.
 		t, err = time.Parse("2006-01-02T15:04:05Z", expiresAt)
 	}
-	return err == nil && t.Year() < 2090 && time.Now().After(t)
+	if err != nil {
+		return true // unparseable → fail closed
+	}
+	return t.Year() < 2090 && time.Now().After(t)
 }
 
 // ListInvites returns all invite codes, for admin display.

@@ -303,6 +303,70 @@ func TestValidateInvite_UnknownCode(t *testing.T) {
 	}
 }
 
+// ---- Invite expiry fail-closed (audit 2026-07-05 finding #6) -------------
+
+// TestInviteExpired pins the fail-closed logic of the inviteExpired helper: a
+// stored expires_at that parses under neither known layout must read as EXPIRED
+// (true), not never-expiring. The empty-string and garbage cases are the #6
+// regression (they returned false — "valid" — under the old fail-open code); the
+// past/future/sentinel/alt-layout cases guard the surrounding behavior so the fix
+// can't silently break valid-invite handling.
+func TestInviteExpired(t *testing.T) {
+	past := time.Now().Add(-time.Hour).UTC().Format("2006-01-02 15:04:05")
+	future := time.Now().Add(time.Hour).UTC().Format("2006-01-02 15:04:05")
+	sentinel := NeverExpires().Format("2006-01-02 15:04:05")
+	altPast := time.Now().Add(-time.Hour).UTC().Format("2006-01-02T15:04:05Z")
+
+	cases := []struct {
+		name      string
+		expiresAt string
+		want      bool // true = expired (reject)
+	}{
+		{"past expiry", past, true},
+		{"future expiry", future, false},
+		{"never-expires sentinel", sentinel, false},
+		{"alternate ISO layout, past", altPast, true},
+		{"empty string fails closed", "", true},
+		{"garbage fails closed", "not-a-timestamp", true},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			if got := inviteExpired(c.expiresAt); got != c.want {
+				t.Errorf("inviteExpired(%q) = %v, want %v", c.expiresAt, got, c.want)
+			}
+		})
+	}
+}
+
+// TestValidateAndConsumeInvite_CorruptedExpiryFailsClosed proves the fail-closed
+// behavior end-to-end through the public API: a valid invite whose stored
+// expires_at is later corrupted (simulating a hand-edited / migrated row that
+// parses under neither layout) must be rejected by BOTH the validate-only and the
+// consuming path, not treated as never-expiring and consumed. White-box: the raw
+// UPDATE bypasses CreateInvite's well-formed .UTC().Format write, same as forceBan.
+func TestValidateAndConsumeInvite_CorruptedExpiryFailsClosed(t *testing.T) {
+	s := openTestStore(t)
+	creator, err := s.CreateUser("invitecreator4", "hash", "admin")
+	if err != nil {
+		t.Fatalf("CreateUser: %v", err)
+	}
+	if err := s.CreateInvite("corrupt-code", creator.ID, 1, NeverExpires()); err != nil {
+		t.Fatalf("CreateInvite: %v", err)
+	}
+	if _, err := s.db.Exec(
+		`UPDATE invites SET expires_at = ? WHERE code = ?`, "garbage-timestamp", "corrupt-code",
+	); err != nil {
+		t.Fatalf("corrupting expires_at: %v", err)
+	}
+
+	if err := s.ValidateInvite("corrupt-code"); err != ErrInviteInvalid {
+		t.Errorf("ValidateInvite on corrupted expiry: got %v, want ErrInviteInvalid", err)
+	}
+	if err := s.ValidateAndConsumeInvite("corrupt-code"); err != ErrInviteInvalid {
+		t.Errorf("ValidateAndConsumeInvite on corrupted expiry: got %v, want ErrInviteInvalid", err)
+	}
+}
+
 func TestGetUserByUsernameCI(t *testing.T) {
 	s := openTestStore(t)
 
