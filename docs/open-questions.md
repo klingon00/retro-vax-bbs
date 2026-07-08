@@ -1111,6 +1111,51 @@ straightforward if wanted. Reviewed via klingon00's parallel-instance pass on
 the full diff. Branch `fix/last-admin-toctou`: code+tests in `153adb7`, audit
 status line in `cec8375`.
 
+## Audit finding #4 guard: SQLite DSN timezone param (2026-07-07)
+
+Closes finding #4 of `docs/audits/audit-2026-07-05.md` — the *latent* one, not a
+live bug. Every timestamp in `internal/store` is written naive-UTC
+(`datetime('now')`, `CURRENT_TIMESTAMP`, or `.UTC().Format(...)`) and today reads
+back correctly as UTC. But that correctness rides entirely on the `sql.Open` DSN
+being a bare path with no `?_timezone=` query param: the `modernc.org/sqlite`
+driver only parses stored `DATETIME` strings with `time.Parse` (→ UTC) while the
+connection's `loc` is nil, and `loc` is nil precisely because nothing appended a
+timezone param. Verified against the pinned driver source (`v1.53.0`,
+`sqlite.go:258` sets `c.loc = time.LoadLocation(v)` from `?_timezone=`;
+`sqlite.go:154` `parseTime` switches to `time.ParseInLocation(f, ts, c.loc)` when
+`c.loc != nil`). If anyone ever appended `?_timezone=Local`, the driver would
+reinterpret stored UTC strings in the server's zone, silently skewing every
+ban/lockout/invite-expiry comparison by the UTC offset — the exact bug class the
+`BanUser`/`CreateInvite` write-side `.UTC()` fix already closed.
+
+The correctness was invisible and load-bearing, so this adds a guard rather than
+changing behavior:
+
+- **Comment at the DSN** (`internal/store/store.go`, above `sql.Open`) spelling out
+  why no `?_timezone=`/`_loc` param may be added, and pointing at the test.
+- **`TestTimestampRoundTripsAsUTC`** (`internal/store/store_test.go`) stores a
+  pinned future instant via `BanUser` (whose explicit `*time.Time` gives a value
+  we control, stored via `until.UTC().Format(...)` — the same write path all
+  timestamps take) and asserts the read-back `.Equal`s it. The subtlety: a naive
+  round-trip test would *pass even with the bug* on a UTC CI host, because
+  `?_timezone=Local` resolves through `time.LoadLocation("Local")` → `time.Local`,
+  and `Local == UTC` there. So the test pins `time.Local` to a fixed `UTC+5` zone
+  (`time.FixedZone`, no tzdata dependency, restored on `t.Cleanup`); a future
+  `?_timezone=Local` then resolves to that non-UTC zone and shifts the instant,
+  failing the assertion. None of this package's tests use `t.Parallel()`, so the
+  global `time.Local` swap is safe, and it has no effect on the current nil-loc
+  path (which passes today).
+
+**Verification.** `go build`/`go vet`/`go test ./internal/store/`/`gofmt -l` all
+clean; the new test green at baseline. Load-bearing check that the guard actually
+bites: temporarily injecting `?_timezone=America/New_York` failed the test with a
++4h skew (EDT in June) and `?_timezone=Local` with a −5h skew (the pinned zone),
+both with a legible "did store.Open's DSN gain a _timezone param?" message; the
+DSN was reverted before committing. A regression test that can't fail is
+worthless, so proving it fails on the regression is the point. Branch
+`fix/dsn-timezone-guard`: comment+test in `145e421`, this docs entry + audit
+status line in the following commit.
+
 ## Next concrete steps
 
 1. **VAX/VMS command abbreviation** — shortest unambiguous prefix (DCL
