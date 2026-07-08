@@ -1194,6 +1194,47 @@ fail is worthless. Branch `fix/invite-expiry-fail-closed` off `c661d19`:
 code+tests `52a3ed1`, this docs entry + audit status line in the following
 commit.
 
+## Audit finding #5 fix: block "new" in admin account-creation paths (2026-07-07)
+
+Closes finding #5 of `docs/audits/audit-2026-07-05.md` — and the last open
+finding from that audit. The two admin account-creation paths let you create an
+account named `new`, which collides with the self-registration routing sentinel:
+the public listener does `strings.EqualFold(username, "new")` (`cmd/server/main.go`)
+and routes such a connection to registration instead of login. So a `user`-role
+`new` account can never log in (a zombie), and an `admin`-role `new` (reachable
+only on the admin listener, which doesn't special-case `new`) is a confusing
+footgun. Only self-registration's `reservedUsernames` blocked it;
+`validateNewUsername` (CREATE USER) and `cmd/adduser` did not.
+
+The fix rejects `new` case-insensitively in both paths, mirroring the guard
+`bootstrapAdminAccount` already applies to `BOOTSTRAP_ADMIN_USERNAME`
+(`cmd/server/main.go`, "reserved for self-registration and could never log in").
+
+**Deliberately only `new`, not the whole reserved set.** `validateNewUsername`'s
+doc comment already records that skipping the reserved-word block is intentional
+— an admin creating accounts directly may legitimately want `sysop`, `admin`, or
+`root`, which self-registration blocks to stop impersonation. `new` is different:
+it's the *routing sentinel*, not just a reserved word, so it's the one name that
+must be blocked even on the admin paths. Blocking the full set would contradict
+the existing design; the test pins `sysop`/`admin`/`root` as still-allowed to
+guard against that regression.
+
+**Verification.** `TestValidateNewUsername_BlocksNewSentinel`
+(`internal/lobby/commands_test.go`) table-tests the helper: `new`/`New`/`NEW`
+rejected (case-insensitive), `sysop`/`admin`/`root`/`alice` allowed, and the
+format rules (too-short, bad-char) still enforced. Verified it goes red without
+the guard (only the new/New/NEW cases fail — the reserved-but-allowed and format
+cases stay green, confirming the test targets exactly the fix). `cmd/adduser`'s
+guard is inline in `main()` (a `package main` CLI, like the untested
+`BOOTSTRAP_ADMIN_USERNAME` twin) and was verified manually: `adduser -username new`
+and `-username New` both exit non-zero with the reserved message, before any DB
+open. `go build`/`go vet`/`gofmt -l`/`go test ./...` all clean. Branch
+`fix/reserve-new-username` off `c6f62bb`: code+tests `50ebfec`, this docs entry +
+audit status line in the following commit.
+
+With #5 closed, every audit-2026-07-05 finding (#1–#6) is resolved; only the
+minor/stylistic cluster remains, left as-is by choice.
+
 ## Next concrete steps
 
 1. **VAX/VMS command abbreviation** — shortest unambiguous prefix (DCL
