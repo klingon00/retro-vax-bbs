@@ -1290,6 +1290,47 @@ tests (the deleted method has no callers, the timer change is a well-known idiom
 equivalence in untested SSH wiring, and the nil-guards mirror existing untested
 sibling guards).
 
+## Audit minor #1 fix: local wall-clock display + tzdata for containers (2026-07-07)
+
+The one visible-behavior item from the minor cluster (previous entry), on its own
+branch `fix/display-zone-local-time`. `TIME`/`WHO` printed server-local time
+(`time.Now()`) while `FINGER`/`LIST USERS`/`LIST PENDING` printed the stored UTC
+`time.Time` values, so on a non-UTC server they visibly disagreed.
+
+**Direction: normalize to local, not UTC** — authentic early-90s VAX/VMS showed
+users local wall-clock time, which is the whole aesthetic goal. Storage stays UTC
+internally (unaffected, correct); this is purely display formatting: `.Local()`
+added to the three stored-value sites in `internal/lobby/commands.go`, no zone
+label (bare local time is what authentic DCL printed).
+
+**The deployment-context catch (worth remembering):** "local" is only meaningful if
+`time.Local` resolves to the operator's zone. It does on bare metal
+(`/etc/localtime`), but the shipped image (`gcr.io/distroless/static-debian12`) has
+**no `/etc/localtime`, so `time.Local` = UTC unless `TZ` is set** — and even a set
+`TZ` can fall back to UTC because a minimal image may ship no zone database. So
+without more, "local" would silently just mean UTC in the most common deployment
+path. Fix: blank-import `time/tzdata` in `cmd/server/main.go`, embedding the IANA
+DB (~450 KB) as a fallback used only when system zoneinfo is absent — bare-metal
+unchanged, but `TZ=<zone>` now resolves inside distroless. The `TZ` knob is
+surfaced in `docker-compose.yml` + `unraid-template.xml` (default `UTC`) and
+documented in `docs/admin-guide.md`'s Docker/Unraid section.
+
+**Verification (the deployment-context proof).** (1) The built server binary
+contains the embedded zone data (grep found `America/New_York`). (2) `.Local()`
+shifts a stored `12:00 UTC` instant correctly per `TZ`: Tokyo `21:00`, New_York
+`08:00` (EDT), UTC `12:00`. (3) **Container smoke test on the actual distroless
+image** — the server's own Go-`log` timestamps (default `Ldate|Ltime`, i.e. local)
+tracked `TZ` end-to-end: against a real `02:30 UTC`, the container logged `02:30`
+(TZ=UTC), `11:30` (TZ=Asia/Tokyo, +9), and `22:30` prev-day (TZ=America/New_York,
+−4). Without the `time/tzdata` import the last two would have stayed at UTC — the
+exact silent-UTC failure the embed prevents. `go build`/`go vet`/`gofmt -l`/`go
+test ./...` all clean. Branch `fix/display-zone-local-time` off `2b5a3e6`: feature
+`57fb763`, this docs entry + audit status line in the following commit.
+
+**With this, the audit-2026-07-05 minor/stylistic cluster is fully dispositioned
+(#1/#2/#4/#7 fixed, #3/#5/#6 deliberately left as-is), closing the entire audit —
+all six findings plus all seven minor items resolved.**
+
 ## Next concrete steps
 
 1. **VAX/VMS command abbreviation** — shortest unambiguous prefix (DCL
