@@ -1156,6 +1156,44 @@ worthless, so proving it fails on the regression is the point. Branch
 `fix/dsn-timezone-guard`: comment+test in `145e421`, this docs entry + audit
 status line in the following commit.
 
+## Audit finding #6 fix: invite expiry now fails closed (2026-07-07)
+
+Closes finding #6 of `docs/audits/audit-2026-07-05.md` — a fail-open on the
+invite expiry check. `inviteExpired` (`internal/store/store.go`) parses the
+stored `expires_at` string and returned "not expired" whenever *either* the
+value was genuinely in the future *or* it failed to parse under both known
+layouts, because the expression was `err == nil && year<2090 && now.After(t)`:
+a parse failure makes `err == nil` false and short-circuits the whole thing to
+`false`. So a corrupted or hand-edited `expires_at` read as a *never-expiring*
+invite — the wrong direction for an expiry check to fail.
+
+The fix returns `true` (expired → callers reject with `ErrInviteInvalid`) on a
+parse failure, so the ambiguous case fails **closed**. It's a one-helper change
+that covers both entry points (`ValidateInvite` and `ValidateAndConsumeInvite`
+both route through `inviteExpired`; `ListInvites` has a separate display-only
+parse, left untouched). Failing closed can't reject a legitimately-stored
+invite: every normal write goes through `CreateInvite`'s
+`expiresAt.UTC().Format("2006-01-02 15:04:05")`, which always parses — only
+genuinely-corrupted data reaches the new `return true`. The stale doc comment
+that had documented the fail-open as "deliberately not changed" (a hold-over
+from finding #2's refactor) was rewritten to match.
+
+**Verification.** Two new tests in `internal/store/store_test.go`:
+`TestInviteExpired` table-tests the helper (garbage and empty-string → expired
+are the regression cases; past/future/never-expires-sentinel/alternate-ISO-layout
+pin the surrounding behavior so the fix can't silently break valid-invite
+handling), and `TestValidateAndConsumeInvite_CorruptedExpiryFailsClosed` proves
+the rejection end-to-end through the public API by corrupting a row's
+`expires_at` with a raw white-box `UPDATE` (same technique as `forceBan`) and
+asserting both validate paths return `ErrInviteInvalid`. `go build`/`go vet`/
+`gofmt -l`/`go test ./internal/store/` all clean. Load-bearing check: both new
+tests were run against the old fail-open body and confirmed to go red (garbage/
+empty flip to `false`, and the end-to-end paths return `<nil>` instead of
+`ErrInviteInvalid`) before the fix was restored — a regression test that can't
+fail is worthless. Branch `fix/invite-expiry-fail-closed` off `c661d19`:
+code+tests `52a3ed1`, this docs entry + audit status line in the following
+commit.
+
 ## Next concrete steps
 
 1. **VAX/VMS command abbreviation** — shortest unambiguous prefix (DCL
