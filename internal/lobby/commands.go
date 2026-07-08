@@ -1003,6 +1003,9 @@ func kickCommand(m Model, username string) (string, tea.Cmd) {
 	if e := requireAdminLogged(m, "KICK", username); e != "" {
 		return e, nil
 	}
+	if m.reg == nil {
+		return "KICK is not available — session registry not initialized.", nil
+	}
 	if m.reg.Kick(username) {
 		return fmt.Sprintf("'%s' has been disconnected.", username), nil
 	}
@@ -1263,6 +1266,9 @@ func generateInviteCode() string {
 func listUsersCommand(m Model) (string, tea.Cmd) {
 	if e := requireAdmin(m); e != "" {
 		return e, nil
+	}
+	if m.db == nil {
+		return "%VAX-BBS-E-NODB, database unavailable.", nil
 	}
 	users, err := m.db.ListAllUsers()
 	if err != nil {

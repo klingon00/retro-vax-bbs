@@ -174,12 +174,6 @@ type Invite struct {
 	ExpiresAt     time.Time
 }
 
-// IsExpired returns true if the invite has an expiry before now.
-// Invites stored with NeverExpires() are never expired.
-func (inv *Invite) IsExpired() bool {
-	return inv.ExpiresAt.Year() < 2090 && time.Now().After(inv.ExpiresAt)
-}
-
 // DisplayExpiry returns a human-readable expiry string.
 func (inv *Invite) DisplayExpiry() string {
 	if inv.ExpiresAt.Year() >= 2090 {

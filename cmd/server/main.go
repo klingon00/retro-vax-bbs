@@ -381,8 +381,14 @@ func preAuthTimeout(d time.Duration) ssh.Option {
 			authDone := make(chan struct{})
 			ctx.SetValue(authDoneKey, authDone)
 			go func() {
+				// time.NewTimer + defer Stop() rather than time.After, so the
+				// timer is released immediately on the auth-done / ctx-done
+				// paths instead of lingering until d elapses (up to
+				// AUTH_TIMEOUT_SECONDS) after the goroutine has already exited.
+				timer := time.NewTimer(d)
+				defer timer.Stop()
 				select {
-				case <-time.After(d):
+				case <-timer.C:
 					// Server-side resources (goroutine, file descriptor) are
 					// freed immediately when conn.Close() is called here. The
 					// client's terminal may still show the password prompt until
