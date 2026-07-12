@@ -1331,6 +1331,63 @@ test ./...` all clean. Branch `fix/display-zone-local-time` off `2b5a3e6`: featu
 (#1/#2/#4/#7 fixed, #3/#5/#6 deliberately left as-is), closing the entire audit —
 all six findings plus all seven minor items resolved.**
 
+## v0.3.1 release: published to GHCR + verified end-to-end (2026-07-12)
+
+Version bump to `v0.3.1`, tagging the post-audit tree (`85e9d81` — every
+audit-2026-07-05 finding plus the whole minor/stylistic cluster resolved, per
+the entries above). Tag pushed by klingon00; the `docker-publish.yml` workflow
+fired on the `v*.*.*` tag and built/pushed `ghcr.io/klingon00/retro-vax-bbs`
+(amd64, image built 2026-07-12 22:53 UTC).
+
+Verified to the same standard as the `v0.1.0` closeout — an anonymous-pull proof
+*plus* an actual boot-and-serve check, not just green dashboard toggles:
+
+- **Anonymous pull.** `docker pull ghcr.io/klingon00/retro-vax-bbs:0.3.1` from a
+  shell with no `~/.docker/config.json` (no ghcr.io credentials) pulled every
+  layer clean. `:0.3.1` and `:latest` share one config digest
+  (`sha256:9c722a…`), confirming the workflow tagged both from a single build.
+  The **`v`-prefix strip still holds:** git tag `v0.3.1` publishes as image tag
+  `0.3.1` (`${GITHUB_REF_NAME#v}`), same as v0.1.0 — pull `:0.3.1`, never
+  `:v0.3.1`.
+- **Clean boot.** Ran the pulled image detached in bridge-mode Docker with a
+  named volume at `/data` (dodges both the missing-`/data` crash *and*
+  root-owned host files on cleanup), high host ports `12222/12223`
+  (collision-proof for a throwaway container), and a bootstrap admin via
+  `BOOTSTRAP_ADMIN_USERNAME`/`_PASSWORD`. Startup logged the config line,
+  `bootstrap admin: created initial admin account "verifyadmin"` (password not
+  logged, as designed), and both listeners up — no DB crash.
+  **`ADMIN_HOST=0.0.0.0` was required** for the admin port to be reachable
+  through the published-port mapping — the documented bridge-mode gotcha (the
+  app default `localhost` binds container loopback, which Docker port-forwarding
+  never reaches).
+- **SSH on 2223 confirmed by the server's own auth log** (source of truth, not
+  an inferred `ssh` exit code): a real admin login produced
+  `admin auth success: "verifyadmin" from 172.17.0.1:…`, and the dual-listener
+  partition held — the same admin account on the public listener (2222) produced
+  `public auth failure: admin account "verifyadmin" rejected on public
+  listener`. The `172.17.0.1` source (the Docker bridge gateway, i.e. the host
+  as seen from inside the container) is itself evidence the connection arrived
+  via the bridge/published-port path — the exact reason `ADMIN_HOST=0.0.0.0` is
+  needed there.
+
+Two reusable notes for the next release verification:
+
+- **Log-based login proof beats exit-code proof for a TUI over SSH.** A scripted
+  `ssh` into the Bubble Tea lobby has no clean exit — the session gets
+  `timeout`-killed (exit 124) because the full-screen app never returns. But
+  auth completes *before* the TUI renders, so the server's `admin auth success`
+  line is the unambiguous confirmation. Read the app's audit log; don't try to
+  script the interactive session.
+- **`docker manifest inspect` works client-side; `docker pull` needs the daemon
+  socket.** In a restricted/sandboxed shell, `manifest inspect` (a direct
+  registry query over HTTPS) can succeed while `pull` fails with
+  `permission denied … unix:///var/run/docker.sock`. Handy for a fast
+  "is it published yet?" check that needs no daemon access — but only a full
+  `pull` proves every layer is retrievable, which is the real user-facing
+  guarantee.
+
+Throwaway container + named volume removed afterward; the release is good.
+
 ## Next concrete steps
 
 1. **VAX/VMS command abbreviation** — shortest unambiguous prefix (DCL
