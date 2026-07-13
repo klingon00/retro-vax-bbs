@@ -466,6 +466,19 @@ func dispatch(line string, m Model) (output string, cmd tea.Cmd) {
 		}
 	}()
 
+	// Expand DCL-style command abbreviations to canonical form before the
+	// exact/prefix tables run (see abbrev.go, decision 6). Role-scoped, so a
+	// non-admin's abbreviation can never resolve to — or be revealed via an
+	// ambiguity message by — an admin command. An ambiguous prefix
+	// short-circuits with a helpful message; anything else yields a line the
+	// tables below consume unchanged. The adminCommandKeys gates below still
+	// run, so this is never a back door into an admin handler.
+	resolvedLine, ambiguousMsg := resolveAbbrev(line, m.role)
+	if ambiguousMsg != "" {
+		return ambiguousMsg, nil
+	}
+	line = resolvedLine
+
 	upper := strings.ToUpper(strings.TrimSpace(line))
 
 	// Prefix match for argument-taking commands.
