@@ -10,11 +10,6 @@ Companion to the main design doc. This is the "still soft" stuff — things ackn
 - **External notifications** — hook point reserved in the login/presence path, but the actual mechanism (webhook vs. ntfy-style push vs. something else), subscription command syntax, and notification rate-limiting are all undesigned.
 - **Unraid Community Apps template** — not started. XML template, icon, port-mapping documentation, README for the listing: all pending.
 - **CIDR-based admin allowlist** — documented as an alternative/complement to the dual-listener split, not implemented, not required (the listener split is the primary mechanism).
-- **VAX/VMS-style command abbreviation** — agreed as a nice-to-have (shortest unambiguous prefix), not yet scoped into v1 build order. The design forks below are **open questions, not decisions** — nothing is settled; they're recorded so a fresh session inherits the problem shape instead of re-deriving it. **Items 1 and 3 gate the others** (the token model and role-scoped resolution shape every other choice) — settle those first.
-  1. **Token model (gating).** DCL abbreviated *per-token* (`SH USER` → `SHOW USER`), so multi-word commands (`SET PLAN`, `LIST PENDING`, `RESET PASSWORD`, `SHOW USER`) likely need per-token prefix matching, not whole-string prefix matching. *Open:* confirm per-token is the right model, and pin down how it interacts with the two-word admin commands specifically.
-  2. **Two dispatch tables.** Abbreviation has to be reasoned through for *both* the exact-match `commands` map and the `argCommands` prefix slice (`FINGER <user>`, admin commands that take arguments). *Open:* how "prefix of an already-prefix-based command" resolves.
-  3. **Role-scoped resolution (gating, security-relevant).** `dispatch()` currently gates admin commands via `adminCommandKeys`, so a non-admin typing an admin command gets the identical "not recognized" response as a typo — an intentional anti-enumeration property. Abbreviation must resolve *only* against the command set visible to the caller's role, or a non-admin could probe for admin command existence via abbreviation (e.g. `BA` resolving to, or reporting ambiguity against, `BAN`). This includes the ambiguity error path itself: an "ambiguous between X and Y" message must never name a command the caller's role can't see — the error *text* is as much a leak vector as successful resolution.
-  4. **Ambiguity + aliases.** What error is returned on an ambiguous prefix (DCL prints "ambiguous"), and whether existing aliases (`WHO`/`SHOW USERS`, `TIME`/`SHOW TIME`) participate in prefix resolution.
 - **Argon2id tuning** — rough starting params given (~64MB memory, 3 iterations) but not benchmarked against actual deployment hardware.
 - **Third-party notices file** — license is MIT, all current and planned dependencies are MIT/BSD-3-Clause, but a proper notices file listing each dependency's license hasn't been created yet. Good practice before public/Unraid release.
 - **PHONE: mute / do-not-disturb** — bell suppression for ring notifications and Ctrl-G. Future config flag; deferred.
@@ -1392,10 +1387,68 @@ Two reusable notes for the next release verification:
 
 Throwaway container + named volume removed afterward; the release is good.
 
+## VAX/VMS command abbreviation — design settled (2026-07-12)
+
+Moved out of "Not yet designed": the shortest-unambiguous-prefix feature
+(DCL-style command abbreviation) is now **fully designed; implementation not yet
+started.** The forks previously logged there as open questions are now settled
+decisions, recorded below. No code yet — the next step is implementation scoping
+(resolver location in `internal/lobby/`, function signature, and the integration
+point in `dispatch()`).
+
+**Decisions:**
+
+1. **Token model: per-token prefix matching.** Each word of a command is matched
+   independently against the set of valid words *at that position*, not the whole
+   command line as one prefix. Resolution proceeds left to right: match word 1
+   against the valid first-words; once resolved, match word 2 (if any) against
+   only the valid continuations of that resolved first word. Example: `L` →
+   unambiguous first-word match on `LIST`; `LIST P` → then unambiguous
+   second-word match on `PENDING` (vs. `USERS`/`INVITES`).
+
+2. **Exact match wins over prefix ambiguity.** If a typed word exactly equals a
+   valid word at that position, it resolves immediately even if it is also a
+   prefix of a longer valid word. Example: `SHOW USER` resolves to the
+   `USER <username>` command exactly, despite `USERS` also starting with the same
+   letters.
+
+3. **Role-scoped candidate list, computed before matching.** The candidate command
+   set is filtered to the caller's role — the same scoping `dispatch()`'s
+   `adminCommandKeys` already applies — *before* any prefix resolution runs. Admin
+   commands never enter the matching process for a non-admin session: they can't
+   be matched, can't contribute to an ambiguity, and can't appear in an ambiguity
+   message, for a non-admin caller. This preserves the existing anti-enumeration
+   property (abbreviation can't distinguish an admin command from gibberish any
+   more than exact typing can).
+
+4. **Aliases are independent candidates, not linked.** `TIME`/`SHOW TIME` and
+   `WHO`/`SHOW USERS` are two separate entry points to the same handler. Each is
+   matched independently; one alias being an unambiguous prefix match isn't
+   blocked or affected by the other alias existing.
+
+5. **Ambiguity error lists the role-scoped candidates.** On an ambiguous prefix,
+   return an error listing the ambiguous candidate command names, generated from
+   the *same* role-scoped candidate list used for matching — never a separate or
+   unfiltered lookup. This keeps the message-construction path from accidentally
+   bypassing the role scoping (decision 3) and leaking an admin command name to a
+   non-admin.
+
+6. **Both dispatch tables run through one resolver.** The exact-match `commands`
+   map and the `argCommands` prefix slice (`FINGER <user>`, admin commands with
+   arguments) both run through the same role-scoped, per-token resolver *before*
+   falling through to the existing exact/prefix dispatch logic. Abbreviation is a
+   resolution step that sits *ahead* of the existing tables, not a parallel path:
+   the resolver expands an abbreviated input to its canonical command, then the
+   existing dispatch tables handle it unchanged. (Resolves the original
+   "two dispatch tables" fork.)
+
 ## Next concrete steps
 
 1. **VAX/VMS command abbreviation** — shortest unambiguous prefix (DCL
-   style). Nice-to-have, non-blocking.
+   style). **Design settled 2026-07-12** (see the "design settled" entry
+   above for the six decisions); next action is implementation scoping —
+   resolver location in `internal/lobby/`, function signature, and the
+   `dispatch()` integration point. Nice-to-have, non-blocking.
 2. Unraid Community Applications submission — icon asset done (`icon.png`
    at repo root, 256x256 transparent, wired into `unraid-template.xml`'s
    `<Icon>` as of 2026-07-04); CA repo listing itself still open. Gated on
