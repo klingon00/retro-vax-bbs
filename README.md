@@ -43,6 +43,7 @@ Per the build order in `docs/open-questions.md`:
 - [x] Lobby HELP expansion
 - [x] Lobby scrollback (PgUp / PgDn / End)
 - [x] Docker packaging
+- [x] Command abbreviation (DCL-style shortest unambiguous prefix, role-scoped)
 
 ## ⚠️ Security status — read before running anywhere but your laptop
 

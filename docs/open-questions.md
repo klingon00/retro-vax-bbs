@@ -1389,6 +1389,11 @@ Throwaway container + named volume removed afterward; the release is good.
 
 ## VAX/VMS command abbreviation — design settled (2026-07-12)
 
+> **Update (2026-07-13): implemented and live-SSH-verified.** See the
+> "implemented + live-verified" build-log entry below. The
+> "implementation not yet started" wording in this entry is left in place as
+> the point-in-time record of the design as of 2026-07-12.
+
 Moved out of "Not yet designed": the shortest-unambiguous-prefix feature
 (DCL-style command abbreviation) is now **fully designed; implementation not yet
 started.** The forks previously logged there as open questions are now settled
@@ -1447,15 +1452,71 @@ point in `dispatch()`).
    existing dispatch tables handle it unchanged. (Resolves the original
    "two dispatch tables" fork.)
 
+## VAX/VMS command abbreviation — implemented + live-verified (2026-07-13)
+
+Shipped. The six settled decisions above are now code, and the feature has been
+exercised end-to-end over real SSH — not just unit tests.
+
+**Implementation** landed across four commits on 2026-07-12: `f4c0f1f` (scope the
+design forks), `eb6e87d` (settle them into the six decisions), `ed54e64` (fix a
+decision-1 example — `L` collides with `LOGOUT`), and `07ea9c1` (the feature:
+code + tests). It's a per-token, role-scoped resolver in
+`internal/lobby/abbrev.go`: a keyword trie (`abbrevNode`) built once via
+`sync.Once` from the *same* `commands` map + `argCommands` prefixes that drive
+dispatch (single source of truth — same pattern as `adminCommandKeys`, so a new
+command auto-enrolls in abbreviation with no second list to hand-sync), plus
+`resolveAbbrev(line, role) (canonical, ambiguityMsg)`. Integration is a ~13-line
+block at the top of `dispatch()` in `commands.go` that runs *ahead* of the
+exact/prefix tables and rewrites the line; the existing `adminCommandKeys` gates
+still run after it (defence in depth — abbreviation is never a back door into an
+admin handler). Tests: `internal/lobby/abbrev_test.go` (resolver unit tests +
+`dispatch()` integration, incl. role-scoping/anti-enumeration).
+
+**Live SSH verification (2026-07-13).** Built the server, ran it on isolated
+loopback ports (`127.0.0.1:4222`/`:4223`) against a throwaway DB seeded with a
+regular user and an admin, and drove real SSH sessions with a Python `pexpect`
+script plus a small hand-rolled VT100 emulator to read the BubbleTea alt-screen
+(pyte wasn't installed). The server's own auth log showed three clean
+auth-success + connect/disconnect cycles with no panics / `recovered` / errors,
+so `resolveAbbrev` genuinely ran through `dispatch()` under the wish/BubbleTea
+stack. All observed behavior matched the unit tests, which also re-ran green.
+Confirmed on a real terminal: `WH`→WHO, `TIM`→TIME, `FI alice`→FINGER (argument
+case preserved), `LI P` & `LIST P`→LIST PENDING, `LI U`→LIST USERS; exact-match-
+wins verified as two *different* resolutions — `SHOW USER sysop` (finger) vs
+`SHOW USERS` (WHO-style list); ambiguity messages for admin `L` (→ LIST, LOGOUT)
+and `SH US` (→ SHOW USER, SHOW USERS); and the anti-enumeration invariant held —
+a non-admin's `BA`, `DE`, `LI`, and pure gibberish `ZZ` all returned the
+byte-identical `"X" is not a recognized command.`
+
+**Two behavior nuances the live pass pinned down — the code is correct; two
+plausible-sounding predictions about it were wrong:**
+
+1. **Regular-user `L` → LOGOUT, not "unknown command."** Because `LIST` is hidden
+   from non-admins (decision 3), `L` is *unambiguous* for them and resolves to the
+   only user-visible L-command, `LOGOUT` (matching the unit test `{"L","LOGOUT"}`
+   for role `user`). The anti-enumeration property is still intact — `LIST` is
+   never revealed (that's what `LI`→"not recognized" demonstrates) — but `L` does
+   not behave like a typo for a regular user; it ends the session with `Goodbye.`
+
+2. **Admin `LI` → `"LIST" is not a recognized command`, not an ambiguity naming
+   LIST PENDING/USERS/INVITES.** The resolver is strictly per-token with no
+   look-ahead: `LI` uniquely resolves the *first* token to `LIST` (the only
+   top-level word starting "LI"), but there is no bare `LIST` command and the
+   resolver does not peek at the `PENDING`/`USERS`/`INVITES` children, so dispatch
+   reports the resolved-but-incomplete `LIST` as unrecognized. Ambiguity only ever
+   surfaces at the *first ambiguous token actually typed* — which is why `L`
+   (LIST vs LOGOUT) and `SH US` (SHOW USER vs USERS) are the real ambiguous cases,
+   not `LI`. This is consistent with decision 1 (`LI` is described there only as
+   the *first-word* step of `LI P`, never as a standalone command).
+
 ## Next concrete steps
 
-1. **VAX/VMS command abbreviation** — shortest unambiguous prefix (DCL
-   style). **Design settled 2026-07-12** (see the "design settled" entry
-   above for the six decisions); next action is implementation scoping —
-   resolver location in `internal/lobby/`, function signature, and the
-   `dispatch()` integration point. Nice-to-have, non-blocking.
+1. ✅ **VAX/VMS command abbreviation** — shortest unambiguous prefix (DCL style).
+   **Done: implemented 2026-07-12, live-SSH-verified 2026-07-13** (see the two
+   entries above). No further work outstanding on this feature.
 2. Unraid Community Applications submission — icon asset done (`icon.png`
    at repo root, 256x256 transparent, wired into `unraid-template.xml`'s
    `<Icon>` as of 2026-07-04); CA repo listing itself still open. Gated on
    the manual GHCR steps above, which are confirmed working end-to-end
-   (`docker pull` succeeding anonymously).
+   (`docker pull` succeeding anonymously). This is now the only remaining
+   open item, and it's ops-only (no coding).
