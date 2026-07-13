@@ -1402,9 +1402,14 @@ point in `dispatch()`).
    independently against the set of valid words *at that position*, not the whole
    command line as one prefix. Resolution proceeds left to right: match word 1
    against the valid first-words; once resolved, match word 2 (if any) against
-   only the valid continuations of that resolved first word. Example: `L` →
+   only the valid continuations of that resolved first word. Example: `LI` →
    unambiguous first-word match on `LIST`; `LIST P` → then unambiguous
-   second-word match on `PENDING` (vs. `USERS`/`INVITES`).
+   second-word match on `PENDING` (vs. `USERS`/`INVITES`). (`L` alone is *not*
+   unambiguous — it collides with `LOGOUT`; and which first-word prefixes are
+   ambiguous is role-dependent, since admin-only first-words like `LIST` aren't
+   candidates for a non-admin — see decision 3. Corrected against the real
+   `commands`/`argCommands` tables in `internal/lobby/commands.go`, which is
+   exactly the kind of collision a memory-written example missed.)
 
 2. **Exact match wins over prefix ambiguity.** If a typed word exactly equals a
    valid word at that position, it resolves immediately even if it is also a
