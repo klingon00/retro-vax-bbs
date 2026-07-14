@@ -1509,6 +1509,36 @@ plausible-sounding predictions about it were wrong:**
    not `LI`. This is consistent with decision 1 (`LI` is described there only as
    the *first-word* step of `LI P`, never as a standalone command).
 
+## Known minor: long lobby output lines truncate instead of wrapping (2026-07-13)
+
+Found during the command-abbreviation live-verification pass, but **pre-existing
+and general — not specific to command abbreviation.** `internal/lobby/model.go`'s
+`View()` applies no width handling: `flattenHistory` only splits on existing
+`\n`, and every history entry is emitted verbatim through the same
+`b.WriteString(line)` path. BubbleTea's standard (line-diff) renderer then
+truncates any line wider than the terminal to the terminal width — it does not
+wrap, and it doesn't toggle terminal autowrap (`ESC[?7l` never appears in the
+stream); it clips the content at the source.
+
+Confirmed empirically at an 80-column PTY (real SSH session reconstructed on a
+wider grid so truncation is visible): the abbreviation *ambiguity* message and a
+long admin `HELP` description line both truncate identically — their tails
+(`…command name.` and `…HELP BAN for details.`) drop off the right edge and are
+absent from the byte stream — while a sub-80-column `LIST USERS` row is
+untouched. So it's a width-threshold rendering gap shared by *all* long
+single-line lobby output; abbreviation only surfaced it because an ambiguity
+error is a single unbroken line that routinely exceeds 80 columns.
+
+**Severity: minor/stylistic; not blocking**, and explicitly *not* something the
+command-abbreviation feature is gated on. The highest-value case to fix is the
+ambiguity message — truncating a `did you mean: …` candidate list off-screen
+defeats the message's purpose, whereas a clipped `HELP` description is cosmetic.
+**Likely fix (its own task, not done here):** word-wrap history lines to
+`m.width` before flatten/render (e.g. via lipgloss), and adjust the scroll math
+in `View()`/`viewportHeight()` for the changed flattened line count — a wrapped
+line occupies more than one display row, so the existing "1 entry = 1 line"
+assumption in the scroll window would need updating.
+
 ## Next concrete steps
 
 1. ✅ **VAX/VMS command abbreviation** — shortest unambiguous prefix (DCL style).
