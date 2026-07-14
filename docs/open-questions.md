@@ -1539,6 +1539,52 @@ in `View()`/`viewportHeight()` for the changed flattened line count — a wrappe
 line occupies more than one display row, so the existing "1 entry = 1 line"
 assumption in the scroll window would need updating.
 
+## v0.4.0 release: command abbreviation shipped, published to GHCR + verified end-to-end (2026-07-13)
+
+Minor version bump to `v0.4.0` — *not* a patch `v0.3.2`: DCL command abbreviation
+is a new user-facing feature, so it earns a minor bump even pre-1.0 (initially
+tagged `v0.3.2`, retagged `v0.4.0` before any push). Tagged `762da5e` — the
+command-abbreviation feature (`07ea9c1`) plus the two doc commits above (`d6d969b`
+impl+live-verify record, `762da5e` known-minor truncation note); the code tree is
+identical to the live-verified `07ea9c1`. Lightweight tag, matching v0.3.1 (tag
+style across releases is mixed — v0.1.0/v0.3.0 annotated, v0.2.0/v0.3.1/v0.4.0
+lightweight; either works, nothing depends on it). Tag pushed; `docker-publish.yml`
+fired on the `v*.*.*` tag and built/pushed `ghcr.io/klingon00/retro-vax-bbs`
+(amd64, image built 2026-07-14 00:54 UTC, config digest `sha256:3201aad7…`).
+
+Verified to the same standard as v0.3.1 and v0.1.0 — anonymous-pull proof *plus* a
+boot-and-serve check — and, new this release, an actual feature check against the
+*published binary*:
+
+- **Anonymous pull.** `docker logout ghcr.io` first, then
+  `docker pull ghcr.io/klingon00/retro-vax-bbs:0.4.0` pulled every layer clean.
+  The `v`-prefix strip still holds: git tag `v0.4.0` → image tag `0.4.0`.
+- **Clean boot.** Detached bridge-mode run with a bootstrap admin and
+  `ADMIN_HOST=0.0.0.0` (the documented bridge-mode requirement). Startup logged the
+  config line, `bootstrap admin: created initial admin account "smokeadmin"`, and
+  both listeners up — no `/data` crash (the image ships a pre-created `/data`
+  VOLUME, so the missing-dir gotcha doesn't bite the container).
+- **SSH on 2223 + dual-listener partition, confirmed by the server's own auth log:**
+  `admin auth success: "smokeadmin" from 172.17.0.1:…` on the admin listener, and
+  `public auth failure: admin account "smokeadmin" rejected on public listener` for
+  the same account attempted on 2222.
+- **Feature-in-the-artifact check (new for this release).** Drove the lobby over
+  SSH and typed `WH` — it resolved to `WHO` and rendered the Interactive Users
+  table with no "not a recognized command". This proves the shipped `0.4.0` image
+  actually *contains* the abbreviation code, not merely that it boots — the gap a
+  build-and-boot check alone leaves open.
+
+Reusable note for the next release: **poll the GHCR registry manifest anonymously
+to detect "published yet?"** when `gh` isn't installed — `GET
+https://ghcr.io/v2/klingon00/retro-vax-bbs/manifests/0.4.0` with an anonymous
+bearer token from `https://ghcr.io/token?scope=repository:…:pull` returns 404 while
+building and 200 once pushed (here ~1 min after the tag push). And note the
+`docker logout ghcr.io` used for the anonymous-pull test clears local ghcr creds —
+CI is unaffected (it uses `GITHUB_TOKEN`), but a later *local* `docker push` would
+need `docker login ghcr.io` again.
+
+Throwaway container + volume + pulled image removed afterward; the release is good.
+
 ## Next concrete steps
 
 1. ✅ **VAX/VMS command abbreviation** — shortest unambiguous prefix (DCL style).
