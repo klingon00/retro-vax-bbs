@@ -1594,5 +1594,19 @@ Throwaway container + volume + pulled image removed afterward; the release is go
    at repo root, 256x256 transparent, wired into `unraid-template.xml`'s
    `<Icon>` as of 2026-07-04); CA repo listing itself still open. Gated on
    the manual GHCR steps above, which are confirmed working end-to-end
-   (`docker pull` succeeding anonymously). This is now the only remaining
-   open item, and it's ops-only (no coding).
+   (`docker pull` succeeding anonymously). Ops-only, no coding.
+3. **Dependency refresh** — deferred as its own task (flagged 2026-07-13).
+   `go list -u -m all` shows nearly the whole module tree has newer versions,
+   including major bumps: `charmbracelet/bubbles v0.21.0 → v1.0.0` (a direct dep —
+   the `textarea` behind SET PLAN) and `charmbracelet/log v0.4.1 → v1.0.0`, plus
+   `golang.org/x/*` (crypto, sys, net, text, term), `go-git/v5`,
+   `modernc.org/{cc,ccgo,libc}`, and the `charmbracelet/x/*` sublibs. The core
+   TUI/SSH/DB direct deps are already current (`bubbletea v1.3.10`,
+   `lipgloss v1.1.0`, `wish v1.4.7`, `modernc.org/sqlite v1.53.0` — no updates), so
+   nothing here is urgent. Deliberately NOT done during a housekeeping pass:
+   `bubbles v1.0.0` is a major bump layered on an un-updated `bubbletea v1.3.10`,
+   exactly the kind of TUI-core version skew that can break rendering subtly, and
+   this whole app is TUI-over-SSH. Do it in a dedicated session and **re-verify
+   after** — `go build ./...` / `go vet ./...` / `go test ./...` *plus* a live SSH
+   pass (the pexpect + isolated-server approach used for the command-abbreviation
+   verify), not just a clean build.
