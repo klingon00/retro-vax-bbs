@@ -652,7 +652,7 @@ func (m Model) doDial(target string) (Model, tea.Cmd) {
 	}
 	call, callerP, err := m.calls.Dial(m.username, target)
 	if err != nil {
-		m.msg = fmt.Sprintf("%%PHONE-E-NOLOGIN, %v", err)
+		m.msg = ErrorMessage(err, target)
 		return m, nil
 	}
 	m.callID = call.ID
@@ -680,7 +680,7 @@ func (m Model) doAddToCall(target string) (Model, tea.Cmd) {
 		return m, nil
 	}
 	if err := m.calls.Add(m.callID, m.username, target); err != nil {
-		m.msg = fmt.Sprintf("%%PHONE-E-NOLOGIN, %v", err)
+		m.msg = ErrorMessage(err, target)
 		return m, nil
 	}
 	// Track the pending ring so any keypress can cancel it.

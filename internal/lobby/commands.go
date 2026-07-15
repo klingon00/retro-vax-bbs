@@ -788,7 +788,7 @@ func phoneDialCommand(m Model, username string) (string, tea.Cmd) {
 
 	call, callerP, err := m.calls.Dial(m.username, username)
 	if err != nil {
-		return fmt.Sprintf("%%PHONE-E-NOLOGIN, %v", err), nil
+		return phone.ErrorMessage(err, username), nil
 	}
 
 	phoneModel := phone.New(

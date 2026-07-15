@@ -2,11 +2,28 @@
 package phone
 
 import (
+	"errors"
 	"fmt"
+	"strings"
 	"sync"
 	"time"
 
 	"github.com/klingon00/retro-vax-bbs/internal/registry"
+)
+
+// Admission errors. Dial and Add both return these (wrapped with the target's
+// username where one is relevant) so callers can classify with errors.Is and
+// render a message with ErrorMessage, rather than string-matching.
+var (
+	// ErrSelfCall means caller and callee are the same account.
+	ErrSelfCall = errors.New("you cannot phone yourself")
+	// ErrNotConnected means the callee has no active session.
+	ErrNotConnected = errors.New("is not connected")
+	// ErrBusy means the callee is already a participant in a call.
+	ErrBusy = errors.New("is already in a call")
+	// ErrBeingRung means the callee already has an unanswered ring pending —
+	// distinct from ErrBusy so the message can say so accurately.
+	ErrBeingRung = errors.New("is already being called")
 )
 
 const (
@@ -49,11 +66,20 @@ type Call struct {
 	stopRing     chan struct{}  // close to stop the ring goroutine
 }
 
+// addKey identifies one outstanding conference ring: which call invited whom.
+// A struct key rather than a "callID:callee" string so both the admission scan
+// (match on callee) and hangupLocked's teardown (match on callID) compare a
+// field instead of parsing a composite string.
+type addKey struct {
+	callID string
+	callee string
+}
+
 // Calls is the process-wide call table. Thread-safe.
 type Calls struct {
 	mu          sync.Mutex
 	calls       map[string]*Call
-	pendingAdds map[string]chan struct{} // "callID:callee" → stop channel for ADD rings
+	pendingAdds map[addKey]chan struct{} // outstanding ADD rings → stop channel
 	reg         *registry.Registry
 }
 
@@ -61,8 +87,72 @@ type Calls struct {
 func NewCalls(reg *registry.Registry) *Calls {
 	return &Calls{
 		calls:       make(map[string]*Call),
-		pendingAdds: make(map[string]chan struct{}),
+		pendingAdds: make(map[addKey]chan struct{}),
 		reg:         reg,
+	}
+}
+
+// admitLocked reports why caller may not place a ring to callee, or nil if the
+// ring is allowed. It is the single admission rule for Dial and Add — the only
+// two entry points that start a ring — so a rule added here covers both with no
+// second list to hand-sync. c.mu must be held.
+//
+// Identity is account-level (username) throughout, matching the registry, which
+// is keyed by username with one notify channel shared by all of an account's
+// sessions. The caller's own call membership is deliberately NOT consulted:
+// checking it would refuse a dial from an account that merely has *another*
+// session in a call, which multi-session support explicitly allows. That
+// omission is also why "one user, one call" stays unenforced — see finding 10
+// of docs/audits/audit-2026-07-13-phone-call-admission.md.
+func (c *Calls) admitLocked(caller, callee string) error {
+	// EqualFold: the registry is exact-match keyed, so `DIAL ALICE` typed by
+	// alice would otherwise fall through to "ALICE is not connected". Naming
+	// yourself in any case is a self-call, and saying so is more useful.
+	if strings.EqualFold(caller, callee) {
+		return ErrSelfCall
+	}
+	if ch := c.reg.Notify(callee); ch == nil {
+		return fmt.Errorf("%s %w", callee, ErrNotConnected)
+	}
+	for _, call := range c.calls {
+		// Participant of any call, pending or active. A pending call's only
+		// participant is its caller, so this also covers a callee who is
+		// mid-ring on their own outbound call.
+		for _, p := range call.participants {
+			if p.Username == callee {
+				return fmt.Errorf("%s %w", callee, ErrBusy)
+			}
+		}
+		// Callee of a pending call: already being rung by someone else's DIAL.
+		if call.State == CallPending && call.Callee == callee {
+			return fmt.Errorf("%s %w", callee, ErrBeingRung)
+		}
+	}
+	// Already being rung into a conference by an ADD — from any call, including
+	// this one. One ring per callee at a time, with no per-call exception.
+	for key := range c.pendingAdds {
+		if key.callee == callee {
+			return fmt.Errorf("%s %w", callee, ErrBeingRung)
+		}
+	}
+	return nil
+}
+
+// ErrorMessage renders an admission error as a VAX/VMS-style facility message.
+// Both the lobby (phoneDialCommand) and PHONE (doDial/doAddToCall) route errors
+// through here so the error→ident mapping has one definition.
+func ErrorMessage(err error, target string) string {
+	switch {
+	case errors.Is(err, ErrSelfCall):
+		return "%PHONE-E-SELF, You cannot phone yourself."
+	case errors.Is(err, ErrBusy):
+		return fmt.Sprintf("%%PHONE-E-BUSY, %s is already in a call.", target)
+	case errors.Is(err, ErrBeingRung):
+		return fmt.Sprintf("%%PHONE-E-BUSY, %s is already being called.", target)
+	case errors.Is(err, ErrNotConnected):
+		return fmt.Sprintf("%%PHONE-E-NOLOGIN, %s is not connected.", target)
+	default:
+		return fmt.Sprintf("%%PHONE-E-NOLOGIN, %v", err)
 	}
 }
 
@@ -71,17 +161,8 @@ func (c *Calls) Dial(callerUsername, calleeUsername string) (*Call, *Participant
 	c.mu.Lock()
 	defer c.mu.Unlock()
 
-	if ch := c.reg.Notify(calleeUsername); ch == nil {
-		return nil, nil, fmt.Errorf("%s is not connected", calleeUsername)
-	}
-	for _, call := range c.calls {
-		if call.State == CallActive {
-			for _, p := range call.participants {
-				if p.Username == calleeUsername {
-					return nil, nil, fmt.Errorf("%s is already in a call", calleeUsername)
-				}
-			}
-		}
+	if err := c.admitLocked(callerUsername, calleeUsername); err != nil {
+		return nil, nil, err
 	}
 
 	id := fmt.Sprintf("%s->%s@%d", callerUsername, calleeUsername, time.Now().UnixNano())
@@ -146,7 +227,7 @@ func (c *Calls) Answer(callID, calleeUsername string) (*Call, *Participant, erro
 	if call.State == CallActive {
 		// Conference join: stop the ADD ring goroutine if one is running,
 		// then notify all existing participants that someone joined.
-		key := callID + ":" + calleeUsername
+		key := addKey{callID: callID, callee: calleeUsername}
 		if stop, ok := c.pendingAdds[key]; ok {
 			close(stop)
 			delete(c.pendingAdds, key)
@@ -206,7 +287,7 @@ func (c *Calls) Reject(callID, calleeUsername string) error {
 
 	if call.State == CallActive {
 		// Conference ADD rejection. Stop only the ADD ring goroutine.
-		key := callID + ":" + calleeUsername
+		key := addKey{callID: callID, callee: calleeUsername}
 		if stop, ok := c.pendingAdds[key]; ok {
 			close(stop)
 			delete(c.pendingAdds, key)
@@ -328,6 +409,22 @@ func (c *Calls) hangupLocked(call *Call, username string) {
 				})
 			}
 		}
+		// Stop any conference rings this call still had outstanding. Their
+		// goroutines key off stopRing alone, so without this they outlive the
+		// call and ring their target every RingInterval forever — for a call
+		// that no longer exists and can never be answered.
+		for k, stop := range c.pendingAdds {
+			if k.callID == call.ID {
+				close(stop)
+				delete(c.pendingAdds, k)
+				c.sendEvent(k.callee, registry.PhoneEvent{
+					Type:   registry.EventHangup,
+					CallID: call.ID,
+					Caller: username,
+					Callee: k.callee, // non-empty = ring cancelled, not a departure
+				})
+			}
+		}
 		delete(c.calls, call.ID)
 	}
 }
@@ -347,15 +444,14 @@ func (c *Calls) Add(callID, callerUsername, calleeUsername string) error {
 	if call.State != CallActive {
 		return fmt.Errorf("call %s is not active", callID)
 	}
-	if ch := c.reg.Notify(calleeUsername); ch == nil {
-		return fmt.Errorf("%s is not connected", calleeUsername)
+	if err := c.admitLocked(callerUsername, calleeUsername); err != nil {
+		return err
 	}
 
-	// Stop any existing pending-add ring for this person on this call.
-	key := callID + ":" + calleeUsername
-	if existing, ok := c.pendingAdds[key]; ok {
-		close(existing)
-	}
+	// No "stop the existing ring for this person" step: admitLocked refuses a
+	// callee who already has a ring outstanding from any call, so reaching here
+	// means there is nothing to stop.
+	key := addKey{callID: callID, callee: calleeUsername}
 	stopRing := make(chan struct{})
 	c.pendingAdds[key] = stopRing
 
@@ -389,14 +485,22 @@ func (c *Calls) Add(callID, callerUsername, calleeUsername string) error {
 		for {
 			select {
 			case <-ticker.C:
-				c.sendEvent(calleeUsername, ringEvent)
-				// Re-notify participants on each ring tick.
+				// Ring under the lock, and only while the call still exists.
+				// hangupLocked closes stopRing on teardown, so this is belt and
+				// suspenders — but it means no future path that drops a call
+				// can leave this goroutine ringing someone into a call that is
+				// gone. The ring itself used to sit outside this guard, which
+				// only ever protected the participant re-notify below.
 				c.mu.Lock()
-				if call2, ok := c.calls[callID]; ok {
-					for _, p := range call2.participants {
-						if p.Username != callerUsername {
-							c.sendEvent(p.Username, ringingEvent)
-						}
+				call2, ok := c.calls[callID]
+				if !ok {
+					c.mu.Unlock()
+					return
+				}
+				c.sendEvent(calleeUsername, ringEvent)
+				for _, p := range call2.participants {
+					if p.Username != callerUsername {
+						c.sendEvent(p.Username, ringingEvent)
 					}
 				}
 				c.mu.Unlock()
@@ -415,7 +519,7 @@ func (c *Calls) CancelAdd(callID, calleeUsername, callerUsername string) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 
-	key := callID + ":" + calleeUsername
+	key := addKey{callID: callID, callee: calleeUsername}
 	if stop, ok := c.pendingAdds[key]; ok {
 		close(stop)
 		delete(c.pendingAdds, key)

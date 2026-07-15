@@ -1,6 +1,7 @@
 package phone
 
 import (
+	"errors"
 	"testing"
 
 	"github.com/klingon00/retro-vax-bbs/internal/registry"
@@ -103,5 +104,218 @@ func TestReject_ClosesCallerChannel(t *testing.T) {
 	// handler, not via Hangup, so Reject must close the caller's channel itself.
 	if !isChanClosed(callerP.IncomingChar) {
 		t.Fatal("Reject should close the caller's IncomingChar")
+	}
+}
+
+// ---- Call admission -----------------------------------------------------------
+//
+// Regression tests for docs/audits/audit-2026-07-13-phone-call-admission.md.
+// Dial and Add are the only two entry points that start a ring, and both route
+// through admitLocked — so each rule is asserted on whichever entry point can
+// actually reach the state, not mechanically on both.
+
+// isStopClosed reports whether a ring's stop channel is closed, without
+// blocking. Nothing is ever sent on these — they are signal-only — so a
+// receive that succeeds means closed.
+func isStopClosed(ch <-chan struct{}) bool {
+	select {
+	case _, ok := <-ch:
+		return !ok
+	default:
+		return false
+	}
+}
+
+// activeCall builds an answered 2-party call between caller and callee, both of
+// whom it registers. Unlike dialAndAnswer it registers the caller too, so the
+// caller can also be a ring target in admission tests.
+func activeCall(t *testing.T, calls *Calls, reg *registry.Registry, caller, callee string) *Call {
+	t.Helper()
+	reg.Register(caller, "user", false, "LOBBY")
+	reg.Register(callee, "user", false, "LOBBY")
+	call, _, err := calls.Dial(caller, callee)
+	if err != nil {
+		t.Fatalf("Dial(%s, %s): %v", caller, callee, err)
+	}
+	if _, _, err := calls.Answer(call.ID, callee); err != nil {
+		t.Fatalf("Answer(%s): %v", callee, err)
+	}
+	return call
+}
+
+// Finding 6: a self-dial was admitted by every gate — it created a real pending
+// call that rang the caller's own bell every 10s.
+func TestDial_RejectsSelfCall(t *testing.T) {
+	reg := registry.New()
+	reg.Register("alice", "user", false, "LOBBY")
+	calls := NewCalls(reg)
+
+	_, _, err := calls.Dial("alice", "alice")
+	if !errors.Is(err, ErrSelfCall) {
+		t.Fatalf("Dial to self: want ErrSelfCall, got %v", err)
+	}
+	if len(calls.calls) != 0 {
+		t.Fatalf("a rejected self-dial must not create a call, got %d", len(calls.calls))
+	}
+}
+
+// The registry is exact-match keyed, so a differently-cased self-dial would
+// otherwise fall through to "not connected" rather than naming the real cause.
+func TestDial_RejectsSelfCallRegardlessOfCase(t *testing.T) {
+	reg := registry.New()
+	reg.Register("alice", "user", false, "LOBBY")
+	calls := NewCalls(reg)
+
+	if _, _, err := calls.Dial("alice", "ALICE"); !errors.Is(err, ErrSelfCall) {
+		t.Fatalf("Dial to self (mixed case): want ErrSelfCall, got %v", err)
+	}
+}
+
+// Finding 6, ADD half: %ADD <self> rang you into your own call.
+func TestAdd_RejectsSelfCall(t *testing.T) {
+	reg := registry.New()
+	calls := NewCalls(reg)
+	call := activeCall(t, calls, reg, "alice", "bob")
+
+	if err := calls.Add(call.ID, "alice", "alice"); !errors.Is(err, ErrSelfCall) {
+		t.Fatalf("Add self: want ErrSelfCall, got %v", err)
+	}
+}
+
+// Findings 1 and 2 — the reported bug. Two separate active calls; a participant
+// in call B rings a participant in call A. Dial's busy check never saw this
+// because doDial reroutes in-call DIAL to Add, which had no busy check at all.
+func TestAdd_RejectsCalleeInAnotherCall(t *testing.T) {
+	reg := registry.New()
+	calls := NewCalls(reg)
+	activeCall(t, calls, reg, "alice", "bob")           // call A
+	callB := activeCall(t, calls, reg, "carol", "dave") // call B
+
+	err := calls.Add(callB.ID, "dave", "bob")
+	if !errors.Is(err, ErrBusy) {
+		t.Fatalf("Add of a callee already in another call: want ErrBusy, got %v", err)
+	}
+	if _, ringing := calls.pendingAdds[addKey{callID: callB.ID, callee: "bob"}]; ringing {
+		t.Fatal("a refused Add must not leave a ring outstanding")
+	}
+}
+
+// Finding 5: the busy scan only considered CallActive, so someone already being
+// rung (pending, unanswered) read as free. The second ring would overwrite the
+// callee's pendingCallID and strand the first caller's call permanently.
+func TestDial_RejectsCalleeAlreadyBeingRung(t *testing.T) {
+	reg := registry.New()
+	reg.Register("carol", "user", false, "LOBBY")
+	calls := NewCalls(reg)
+
+	if _, _, err := calls.Dial("bob", "carol"); err != nil {
+		t.Fatalf("first Dial: %v", err)
+	}
+	_, _, err := calls.Dial("alice", "carol")
+	if !errors.Is(err, ErrBeingRung) {
+		t.Fatalf("Dial of a callee mid-ring: want ErrBeingRung, got %v", err)
+	}
+}
+
+// Finding 4: a DIAL and a conference ADD could target the same person at once,
+// producing two ring goroutines; whichever call lost the race rang forever.
+func TestDial_RejectsCalleeBeingAddedToConference(t *testing.T) {
+	reg := registry.New()
+	calls := NewCalls(reg)
+	call := activeCall(t, calls, reg, "alice", "bob")
+	reg.Register("carol", "user", false, "LOBBY")
+
+	if err := calls.Add(call.ID, "alice", "carol"); err != nil {
+		t.Fatalf("Add: %v", err)
+	}
+	_, _, err := calls.Dial("dave", "carol")
+	if !errors.Is(err, ErrBeingRung) {
+		t.Fatalf("Dial of a callee being ADDed: want ErrBeingRung, got %v", err)
+	}
+}
+
+// Finding 8 (gap E), resolved as a consequence of the shared predicate: one ring
+// per callee at a time, with no per-call exception. Refusing the second ADD makes
+// the old cross-cancellation (first inviter's keystroke killing the second
+// inviter's ring) unreachable, since only one ring can ever exist.
+func TestAdd_RejectsSecondAddOfSameTarget(t *testing.T) {
+	reg := registry.New()
+	calls := NewCalls(reg)
+	call := activeCall(t, calls, reg, "alice", "bob")
+	reg.Register("carol", "user", false, "LOBBY")
+
+	if err := calls.Add(call.ID, "alice", "carol"); err != nil {
+		t.Fatalf("first Add: %v", err)
+	}
+	if err := calls.Add(call.ID, "bob", "carol"); !errors.Is(err, ErrBeingRung) {
+		t.Fatalf("second Add of same target: want ErrBeingRung, got %v", err)
+	}
+	if n := len(calls.pendingAdds); n != 1 {
+		t.Fatalf("want exactly 1 outstanding ring, got %d", n)
+	}
+}
+
+// Finding 7: ADD of someone already in this very call rang an existing
+// participant, who could not answer. Covered by the predicate's participant scan
+// rather than a bespoke check.
+func TestAdd_RejectsExistingParticipant(t *testing.T) {
+	reg := registry.New()
+	calls := NewCalls(reg)
+	call := activeCall(t, calls, reg, "alice", "bob")
+
+	if err := calls.Add(call.ID, "alice", "bob"); !errors.Is(err, ErrBusy) {
+		t.Fatalf("Add of an existing participant: want ErrBusy, got %v", err)
+	}
+}
+
+// Finding 3: hangupLocked never touched pendingAdds, so tearing the call down
+// with a conference ring outstanding left the ring goroutine running — ringing
+// the target every 10s forever for a call that no longer exists.
+func TestAdd_RingStopsWhenCallIsTornDown(t *testing.T) {
+	reg := registry.New()
+	calls := NewCalls(reg)
+	call := activeCall(t, calls, reg, "alice", "bob")
+	reg.Register("carol", "user", false, "LOBBY")
+
+	if err := calls.Add(call.ID, "alice", "carol"); err != nil {
+		t.Fatalf("Add: %v", err)
+	}
+	stop, ok := calls.pendingAdds[addKey{callID: call.ID, callee: "carol"}]
+	if !ok {
+		t.Fatal("Add should have registered an outstanding ring")
+	}
+
+	// Everyone leaves before carol answers — the call is deleted.
+	calls.Hangup(call.ID, "alice")
+	calls.Hangup(call.ID, "bob")
+
+	if _, still := calls.calls[call.ID]; still {
+		t.Fatal("call should be gone once the last participant leaves")
+	}
+	if !isStopClosed(stop) {
+		t.Fatal("ring goroutine's stop channel must be closed when the call is torn down")
+	}
+	if n := len(calls.pendingAdds); n != 0 {
+		t.Fatalf("pendingAdds must be empty after teardown, got %d", n)
+	}
+}
+
+// Identity granularity guarantee — the must-still-work case, not a bug fix.
+// Admission is account-level, and the caller's own call membership is
+// deliberately never consulted: an account with one session in a call must still
+// be able to dial from another session. If this ever goes red, the predicate has
+// started enforcing one-call-per-account (finding 10) as a side effect.
+func TestDial_AdmitsCallerWhoseAccountIsAlreadyInACall(t *testing.T) {
+	reg := registry.New()
+	calls := NewCalls(reg)
+	activeCall(t, calls, reg, "alice", "bob") // alice's other session is in a call
+	reg.Register("carol", "user", false, "LOBBY")
+
+	call, callerP, err := calls.Dial("alice", "carol")
+	if err != nil {
+		t.Fatalf("alice must still dial from a second session while in a call: %v", err)
+	}
+	if call == nil || callerP == nil {
+		t.Fatal("Dial returned no call/participant despite a nil error")
 	}
 }
