@@ -280,9 +280,12 @@ func TestAdd_RingStopsWhenCallIsTornDown(t *testing.T) {
 	if err := calls.Add(call.ID, "alice", "carol"); err != nil {
 		t.Fatalf("Add: %v", err)
 	}
-	stop, ok := calls.pendingAdds[addKey{callID: call.ID, callee: "carol"}]
+	ring, ok := calls.pendingAdds[addKey{callID: call.ID, callee: "carol"}]
 	if !ok {
 		t.Fatal("Add should have registered an outstanding ring")
+	}
+	if ring.inviter != "alice" {
+		t.Fatalf("outstanding ring should record its inviter: want alice, got %q", ring.inviter)
 	}
 
 	// Everyone leaves before carol answers — the call is deleted.
@@ -292,7 +295,7 @@ func TestAdd_RingStopsWhenCallIsTornDown(t *testing.T) {
 	if _, still := calls.calls[call.ID]; still {
 		t.Fatal("call should be gone once the last participant leaves")
 	}
-	if !isStopClosed(stop) {
+	if !isStopClosed(ring.stop) {
 		t.Fatal("ring goroutine's stop channel must be closed when the call is torn down")
 	}
 	if n := len(calls.pendingAdds); n != 0 {
@@ -300,11 +303,19 @@ func TestAdd_RingStopsWhenCallIsTornDown(t *testing.T) {
 	}
 }
 
-// Identity granularity guarantee — the must-still-work case, not a bug fix.
-// Admission is account-level, and the caller's own call membership is
-// deliberately never consulted: an account with one session in a call must still
-// be able to dial from another session. If this ever goes red, the predicate has
-// started enforcing one-call-per-account (finding 10) as a side effect.
+// Identity granularity guard — asserts ADMISSION ONLY, and deliberately nothing
+// more. Admission is account-level and the caller's own call membership is never
+// consulted, so a dial from an account that already has another session in a call
+// is not refused. If this goes red, the predicate has started enforcing
+// one-call-per-account (finding 10) as a side effect.
+//
+// What this test does NOT assert — and must not be read as asserting — is that
+// the admitted call then works. It does not: per-account event routing means the
+// other session steals the EventAnswer and this one hangs up on the next
+// keystroke (finding 11, found in live testing after this test was written and
+// taken as evidence the capability worked). "The guard permits X" and "X works"
+// are different claims; this test only makes the first. Proving the second needs
+// a live two-session pass, not a Dial return value.
 func TestDial_AdmitsCallerWhoseAccountIsAlreadyInACall(t *testing.T) {
 	reg := registry.New()
 	calls := NewCalls(reg)
@@ -317,5 +328,61 @@ func TestDial_AdmitsCallerWhoseAccountIsAlreadyInACall(t *testing.T) {
 	}
 	if call == nil || callerP == nil {
 		t.Fatal("Dial returned no call/participant despite a nil error")
+	}
+}
+
+// drainEvents collects whatever is queued on a user's notify channel without
+// blocking. The channel is buffered (size 8) and never closed, so a default
+// branch is the only safe way to stop.
+func drainEvents(t *testing.T, reg *registry.Registry, username string) []registry.PhoneEvent {
+	t.Helper()
+	ch, _ := reg.Events(username)
+	var out []registry.PhoneEvent
+	for {
+		select {
+		case e := <-ch:
+			out = append(out, e)
+		default:
+			return out
+		}
+	}
+}
+
+// Regression for the misattribution found in live testing: the pending-ring
+// cancellation named whoever left the call LAST, not whoever started the ring.
+//
+// alice and bob are in a call; alice rings carol into it; alice drops, then bob
+// drops. Alice's departure leaves bob behind, so the call isn't empty and no
+// teardown runs. Bob's departure empties it and triggers the cleanup — which had
+// only hangupLocked's departing-participant username in scope and used that. So
+// carol was told "bob cancelled the call" about a ring bob had nothing to do
+// with. The leave order is the whole point of the test: with bob leaving last,
+// naming the departing participant and naming the inviter give different answers.
+func TestHangup_PendingRingCancellationNamesInviterNotLastToLeave(t *testing.T) {
+	reg := registry.New()
+	calls := NewCalls(reg)
+	call := activeCall(t, calls, reg, "alice", "bob")
+	reg.Register("carol", "user", false, "LOBBY")
+
+	if err := calls.Add(call.ID, "alice", "carol"); err != nil {
+		t.Fatalf("Add: %v", err)
+	}
+	drainEvents(t, reg, "carol") // discard the EventRing
+
+	calls.HangupUser("alice") // inviter leaves first — bob remains, no teardown
+	calls.HangupUser("bob")   // last one out — this triggers the ring cleanup
+
+	var cancel *registry.PhoneEvent
+	for _, e := range drainEvents(t, reg, "carol") {
+		if e.Type == registry.EventHangup && e.Callee == "carol" {
+			ev := e
+			cancel = &ev
+		}
+	}
+	if cancel == nil {
+		t.Fatal("carol should have been told her pending ring was cancelled")
+	}
+	if cancel.Caller != "alice" {
+		t.Fatalf("cancellation must name the inviter: want Caller=alice, got %q", cancel.Caller)
 	}
 }

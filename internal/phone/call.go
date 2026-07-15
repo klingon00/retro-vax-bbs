@@ -75,11 +75,23 @@ type addKey struct {
 	callee string
 }
 
+// pendingRing is one outstanding conference ring: the stop channel for its
+// goroutine, plus who started it. The inviter is retained because addKey records
+// who was rung and from which call, but not who did the ringing — and teardown
+// has to attribute the cancellation to someone. Without it, hangupLocked has
+// only its own departing-participant argument in scope, which named whoever left
+// the call last and told the callee a bystander had cancelled a ring they never
+// placed.
+type pendingRing struct {
+	stop    chan struct{}
+	inviter string
+}
+
 // Calls is the process-wide call table. Thread-safe.
 type Calls struct {
 	mu          sync.Mutex
 	calls       map[string]*Call
-	pendingAdds map[addKey]chan struct{} // outstanding ADD rings → stop channel
+	pendingAdds map[addKey]*pendingRing // outstanding ADD rings
 	reg         *registry.Registry
 }
 
@@ -87,7 +99,7 @@ type Calls struct {
 func NewCalls(reg *registry.Registry) *Calls {
 	return &Calls{
 		calls:       make(map[string]*Call),
-		pendingAdds: make(map[addKey]chan struct{}),
+		pendingAdds: make(map[addKey]*pendingRing),
 		reg:         reg,
 	}
 }
@@ -228,8 +240,8 @@ func (c *Calls) Answer(callID, calleeUsername string) (*Call, *Participant, erro
 		// Conference join: stop the ADD ring goroutine if one is running,
 		// then notify all existing participants that someone joined.
 		key := addKey{callID: callID, callee: calleeUsername}
-		if stop, ok := c.pendingAdds[key]; ok {
-			close(stop)
+		if ring, ok := c.pendingAdds[key]; ok {
+			close(ring.stop)
 			delete(c.pendingAdds, key)
 		}
 		for _, p := range call.participants {
@@ -288,8 +300,8 @@ func (c *Calls) Reject(callID, calleeUsername string) error {
 	if call.State == CallActive {
 		// Conference ADD rejection. Stop only the ADD ring goroutine.
 		key := addKey{callID: callID, callee: calleeUsername}
-		if stop, ok := c.pendingAdds[key]; ok {
-			close(stop)
+		if ring, ok := c.pendingAdds[key]; ok {
+			close(ring.stop)
 			delete(c.pendingAdds, key)
 		}
 		// Notify all active participants that the invite was declined.
@@ -413,14 +425,18 @@ func (c *Calls) hangupLocked(call *Call, username string) {
 		// goroutines key off stopRing alone, so without this they outlive the
 		// call and ring their target every RingInterval forever — for a call
 		// that no longer exists and can never be answered.
-		for k, stop := range c.pendingAdds {
+		for k, ring := range c.pendingAdds {
 			if k.callID == call.ID {
-				close(stop)
+				close(ring.stop)
 				delete(c.pendingAdds, k)
 				c.sendEvent(k.callee, registry.PhoneEvent{
 					Type:   registry.EventHangup,
 					CallID: call.ID,
-					Caller: username,
+					// The inviter, NOT `username`: username is whoever happened
+					// to leave last, who may have had nothing to do with this
+					// ring. The callee is told "<Caller> cancelled the call",
+					// so naming the wrong person is a visible lie.
+					Caller: ring.inviter,
 					Callee: k.callee, // non-empty = ring cancelled, not a departure
 				})
 			}
@@ -453,7 +469,7 @@ func (c *Calls) Add(callID, callerUsername, calleeUsername string) error {
 	// means there is nothing to stop.
 	key := addKey{callID: callID, callee: calleeUsername}
 	stopRing := make(chan struct{})
-	c.pendingAdds[key] = stopRing
+	c.pendingAdds[key] = &pendingRing{stop: stopRing, inviter: callerUsername}
 
 	ringEvent := registry.PhoneEvent{
 		Type:   registry.EventRing,
@@ -520,8 +536,8 @@ func (c *Calls) CancelAdd(callID, calleeUsername, callerUsername string) {
 	defer c.mu.Unlock()
 
 	key := addKey{callID: callID, callee: calleeUsername}
-	if stop, ok := c.pendingAdds[key]; ok {
-		close(stop)
+	if ring, ok := c.pendingAdds[key]; ok {
+		close(ring.stop)
 		delete(c.pendingAdds, key)
 	}
 
