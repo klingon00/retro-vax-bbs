@@ -1585,6 +1585,80 @@ need `docker login ghcr.io` again.
 
 Throwaway container + volume + pulled image removed afterward; the release is good.
 
+## PHONE call-admission fix: two live-testing bugs + a discovery pass (2026-07-14)
+
+Live testing found two PHONE bugs — a user could `DIAL` themselves, and a
+participant in one active call could dial a participant in another, leaving that
+callee unable to answer or reject while being re-rung every 10 seconds. A
+requested discovery pass over the surrounding DIAL/ADD/ANSWER logic turned up
+eight more gaps. All ten are recorded in
+`docs/audits/audit-2026-07-13-phone-call-admission.md` (findings 1-8 fixed in
+`3ecd86b`; 9 and 10 deferred by decision).
+
+**The root cause was not a missing check.** `Calls.Dial`'s busy check was already
+correct and complete — it scanned every active call for the callee regardless of
+the dialer's state. The defect was that in-call DIAL never reached it:
+`doDial` intercepts on `m.state == CallActive` and reroutes to `doAddToCall` ->
+`Calls.Add`, a **separate admission path with no busy check at all**. Two doors
+into one room, with the rule written on only one of them. So the fix was not to
+patch each symptom but to move admission to the `Calls` chokepoint as one
+`admitLocked` predicate that both `Dial` and `Add` call — the same shape as audit
+finding #3's `usableAdminPredicate`, and for the same reason: a future third
+caller inherits the rule instead of re-forgetting it. That one change resolves
+findings 1, 2, 4, 5, 6, 7 and 8 with no symptom-specific patches.
+
+Worth not relearning:
+
+- **Identity granularity was the load-bearing design question, and the answer was
+  an omission.** The predicate deliberately does **not** consult the *caller's*
+  call membership. Checking it would refuse a dial from an account that merely has
+  *another* session in a call — breaking multi-session, which is explicitly
+  supported (it is the documented rationale for `RATELIMIT_BURST=5`). That same
+  omission is why "one user, one call" (finding 10) stays unenforced: the fix
+  neither closes nor worsens it. `TestDial_AdmitsCallerWhoseAccountIsAlreadyInACall`
+  exists as the tripwire and is the one new test that passes *before* the fix too —
+  it is a guard, not a regression test.
+- **The self-check is account-level, so one session cannot phone another session
+  of the same account.** A deliberate policy call: it could never work anyway,
+  because the ring goes to the account-shared notify channel (a nondeterministic
+  session wins the receive) and the dialing session sits in `CallPending`, where
+  any keypress cancels before it could type ANSWER.
+- **Gap E (ADD cross-cancellation) was logged as deferred, then reclassified as
+  resolved-as-a-consequence** — not quietly, but as an explicit decision. The
+  being-rung check keys on the callee with no per-call exception, so a second
+  `%ADD` of the same target never starts a ring, making the cross-cancellation
+  unreachable. Preserving it as "deferred" would have meant threading `callID`
+  into the shared predicate purely to carve out an exception that keeps a known
+  bug reachable. The reasoning is recorded in the audit entry rather than just a
+  status flip.
+- **A ring goroutine outliving its call was the one item that was not admission**
+  (finding 3), and it is the same never-closed-goroutine class as audit
+  finding #1. `hangupLocked` never touched `pendingAdds`, and the `Add`
+  goroutine's `sendEvent` sat *outside* the call-existence guard — which only ever
+  protected the participant re-notify. So a conference ring outstanding when the
+  call was torn down rang its target every 10s **forever**, for a call that no
+  longer existed. Both were fixed: teardown closes the rings, and the goroutine
+  returns when its call is gone.
+
+**Verification.** 10 new tests in `internal/phone/call_test.go`, each run against
+the unfixed code first and confirmed red for the right reason — every one
+reported `got <nil>`, i.e. the ring was *admitted*, which is precisely the bug.
+`go build`/`go vet`/`go test ./...`/`gofmt -l` and `-race` all clean.
+
+**Live SSH pass** (the abbreviation-verify recipe: isolated loopback
+`127.0.0.1:4222`/`:4223`, throwaway seeded DB, pexpect): four real sessions
+building two real calls, then driving the reported scenario. 8/8 checks pass,
+server log free of panics/`recovered`. Crucially the **same harness was run
+against a pre-fix binary built from `e3ba975` and scored 2/8**, capturing the
+reported bug verbatim on the trapped callee's screen — `\x07 *** dave is calling
+(20:34:36) - %ADD to conference ***`, BEL byte included. A green harness on a
+fixed binary is consistent with a harness that asserts nothing; running it
+against the broken build is what rules that out. Two reusable notes: **BubbleTea
+runs the PTY in raw mode, so Enter is CR (`\r`) — pexpect's `sendline()` sends LF
+and is silently ignored** (symptom: typed commands pile onto one line, never
+submitting), and **every session must be logged in before any dialing starts**,
+since `Dial` refuses a callee who is not yet connected.
+
 ## Next concrete steps
 
 1. ✅ **VAX/VMS command abbreviation** — shortest unambiguous prefix (DCL style).
@@ -1595,7 +1669,26 @@ Throwaway container + volume + pulled image removed afterward; the release is go
    `<Icon>` as of 2026-07-04); CA repo listing itself still open. Gated on
    the manual GHCR steps above, which are confirmed working end-to-end
    (`docker pull` succeeding anonymously). Ops-only, no coding.
-3. **Dependency refresh** — deferred as its own task (flagged 2026-07-13).
+3. **PHONE call-state: two deferred design questions** (findings 9 and 10 of
+   `docs/audits/audit-2026-07-13-phone-call-admission.md`, deferred 2026-07-14).
+   Both are genuine design decisions, not missing guards, which is why the
+   admission fix deliberately left them alone:
+   - **Callee disconnects mid-ring** — the caller sits on "Ringing X…" forever
+     with no "X has disconnected", and a reconnecting X gets rung for a call
+     placed before they logged in. Needs a behavior call (tear down and notify
+     the caller? grace window for a reconnect?). **Its priority rose as a side
+     effect of the admission fix**: a stale ring now also makes the disconnected
+     user un-dialable by anyone until it clears, so it costs a reconnecting user
+     inbound calls, not just a confused caller.
+   - **"One user, one call" is assumed but never enforced** — `HangupUser`'s
+     comment asserts it; nothing checks it, so with two sessions one account can
+     be in two calls, and teardown may hang up the wrong one. Unaffected by the
+     admission fix by design (the predicate never consults the *caller's*
+     membership, precisely so multi-session keeps working). Closing it means first
+     deciding whether an account may hold concurrent calls at all, and if not,
+     plumbing session identity through the registry — which is keyed by username
+     today with no per-session handle.
+4. **Dependency refresh** — deferred as its own task (flagged 2026-07-13).
    `go list -u -m all` shows nearly the whole module tree has newer versions,
    including major bumps: `charmbracelet/bubbles v0.21.0 → v1.0.0` (a direct dep —
    the `textarea` behind SET PLAN) and `charmbracelet/log v0.4.1 → v1.0.0`, plus

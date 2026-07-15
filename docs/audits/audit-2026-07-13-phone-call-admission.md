@@ -10,8 +10,14 @@ both the original findings and their disposition. No code was changed by the
 audit itself.*
 
 Ten findings, ranked most-severe first. Seven share a single root cause and are
-fixed by one centralization; three are independent design questions and are
-**deferred by decision**, marked as such below.
+fixed by one centralization; three were logged as independent design questions.
+
+**Disposition (2026-07-14):** findings 1–7 fixed in `3ecd86b`. Finding 8 turned
+out to be **resolved as a consequence** of the same centralization rather than
+needing its own design pass — see its entry for the reasoning. Findings 9 and 10
+remain **deferred by decision**: they are genuine design questions, not instances
+of the admission-chokepoint bug, and finding 10 in particular is neither closed
+nor worsened by the fix.
 
 **Root cause shared by findings 1–2 and 4–7:** admission rules ("may this ring be
 placed?") live per-path in the UI layer rather than at the `Calls` chokepoint.
@@ -35,7 +41,7 @@ call-admission surface is untested.
 
 ### 1. In-call → in-call DIAL has no busy handling; the callee is trapped
 
-**Status:** ⬜ Open — fix in progress (reported from live testing).
+**Status:** ✅ Fixed in `3ecd86b` (`fix: centralize PHONE call admission; stop ADD rings outliving their call`). In-call DIAL still reroutes to Add (kept: it matches real VAX/VMS and the existing PHONE HELP text), but Add now runs the same `admitLocked` predicate as Dial, so the reroute inherits the busy rule instead of bypassing it. Confirmed over live SSH: with two real calls established, the in-call dial returns `%PHONE-E-BUSY, bob is already in a call.` and the callee is never rung. The same harness reproduces the original trapped-callee ring against a pre-fix binary.
 
 **Severity: definite bug (medium-high impact) · Confidence: high**
 
@@ -64,7 +70,7 @@ call-admission surface is untested.
 
 ### 2. `Calls.Add` has no busy check (independently reachable via `%ADD`)
 
-**Status:** ⬜ Open — fix in progress.
+**Status:** ✅ Fixed in `3ecd86b`. `Add` now calls `admitLocked` — the same predicate `Dial` uses — instead of its connectivity-only check, so `%ADD` of someone already in another call is refused on its own merits, not just as a side effect of fixing the DIAL reroute.
 
 **Severity: definite bug (medium impact) · Confidence: high**
 
@@ -79,7 +85,7 @@ call-admission surface is untested.
 
 ### 3. ADD ring goroutine outlives its call — leak plus an eternal phantom ring
 
-**Status:** ⬜ Open — fix in progress.
+**Status:** ✅ Fixed in `3ecd86b`. `hangupLocked` now closes and deletes every `pendingAdds` entry for a call being torn down, notifying the rung callee via the existing `EventHangup` Callee-non-empty convention so their prompt clears. The ring goroutine additionally returns if the call is gone: its `sendEvent` was moved *inside* the `c.mu` + call-existence guard that previously protected only the participant re-notify. Covered by `TestAdd_RingStopsWhenCallIsTornDown`.
 
 **Severity: definite bug (medium impact) · Confidence: high**
 
@@ -106,7 +112,7 @@ call-admission surface is untested.
 
 ### 4. Two calls can ring the same target; the loser's goroutine rings forever
 
-**Status:** ⬜ Open — fix in progress.
+**Status:** ✅ Fixed in `3ecd86b` — at the source, not by cleanup. `admitLocked` refuses a callee who already has any ring outstanding, so two concurrent rings to one target can no longer be created and there is no loser goroutine to leak. Covered by `TestDial_RejectsCalleeBeingAddedToConference`.
 
 **Severity: definite bug (low-medium impact) · Confidence: high**
 
@@ -121,7 +127,7 @@ call-admission surface is untested.
 
 ### 5. Busy check ignores `CallPending`, so mid-ring targets are dialable
 
-**Status:** ⬜ Open — fix in progress.
+**Status:** ✅ Fixed in `3ecd86b`. The participant scan now covers `CallPending` as well as `CallActive`, and a dedicated check catches a callee who is the `Callee` of a pending call, returning `ErrBeingRung`. Covered by `TestDial_RejectsCalleeAlreadyBeingRung`.
 
 **Severity: definite bug (low-medium impact) · Confidence: high**
 
@@ -137,7 +143,7 @@ call-admission surface is untested.
 
 ### 6. Self-dial is admitted by every gate
 
-**Status:** ⬜ Open — fix in progress (reported from live testing).
+**Status:** ✅ Fixed in `3ecd86b`. `admitLocked` rejects a self-target before any ring logic, on both Dial and Add, returning `%PHONE-E-SELF, You cannot phone yourself.` Uses `strings.EqualFold`, so `DIAL ALICE` typed by alice names the real cause instead of falling through to the misleading "ALICE is not connected". Confirmed live in both cases. Note the self-check is account-level, so one session of an account cannot dial another session of the same account — a deliberate policy call, recorded because it could not work anyway (the ring goes to the account-shared notify channel, so a nondeterministic session receives it, and the dialing session sits in `CallPending` where any keypress cancels before it could type ANSWER).
 
 **Severity: definite bug (low impact) · Confidence: high**
 
@@ -161,7 +167,7 @@ call-admission surface is untested.
 
 ### 7. `ADD` can target someone already in the same call
 
-**Status:** ⬜ Open — fix in progress.
+**Status:** ✅ Fixed in `3ecd86b` — by the shared predicate, with no bespoke check. The participant scan already sees the target in the current call and returns `ErrBusy`, which prevents both the spurious ring and the duplicate-participant append. Covered by `TestAdd_RejectsExistingParticipant`.
 
 **Severity: definite bug (low impact) · Confidence: high**
 
@@ -176,14 +182,12 @@ call-admission surface is untested.
 
 ---
 
-## Deferred by decision — independent design questions, not instances of the admission-chokepoint bug
-
-*These are **not** fixed in this pass. Each needs its own discussion before a fix
-is designed; none is resolved as a side effect of centralizing admission.*
+## Resolved as a consequence of the shared predicate
 
 ### 8. Cross-cancellation on same-call double-ADD
 
-**Status:** ⏸️ Deferred — needs a policy decision on second-ADD semantics.
+**Status:** ✅ Resolved in `3ecd86b` as a consequence of the admission predicate —
+**reclassified from "deferred"**; see the reasoning below.
 
 **Severity: definite bug (low impact) · Confidence: high**
 
@@ -193,12 +197,33 @@ is designed; none is resolved as a side effect of centralizing admission.*
   `callID:carol` key. The second `Add` closes the first's `stopRing` and overwrites
   the entry — but the first caller's `pendingAddTarget` is still set, so their next
   keystroke calls `CancelAdd` and kills the **second** caller's ring.
-- **Why deferred:** the right behavior is a policy question (reject the second ADD?
-  make it a no-op? track per-inviter?), not a missing guard. Note the admission
-  predicate does not resolve this — both ADDs target the same call, and by then
-  carol is already being rung, so the second is refused as busy *only if* the
-  being-rung check treats a same-call re-ADD as busy. That interaction is exactly
-  what needs deciding.
+- **Originally logged as deferred** on the reasoning that second-ADD semantics were
+  a policy question (reject it? no-op? track per-inviter?) deserving their own
+  discussion, and that the predicate would only resolve it *if* the being-rung check
+  treated a same-call re-ADD as busy — flagged at the time as the open interaction.
+- **Why it was reclassified rather than fixed separately:** that interaction was
+  decided deliberately, not by accident. The being-rung check keys on the **callee**
+  with no per-call exception — one ring per callee at a time — so the second `%ADD
+  carol` is refused with `ErrBeingRung` and never starts a ring. With only one ring
+  able to exist, the cross-cancellation is **unreachable**: the second inviter's
+  `doAddToCall` returns the error and never sets `pendingAddTarget`, so there is no
+  second ring for the first inviter's keystroke to kill. The alternative — threading
+  `callID` into the shared predicate to carve out an exception — would have added a
+  parameter and a special case *solely to preserve a known-bad behavior*, and would
+  still leave `%ADD` of an already-being-rung target starting a redundant second
+  ring. The policy question turned out to be answered by the same principle the rest
+  of the fix rests on: **a callee already being rung is not available.**
+- **Nothing is foreclosed:** the `pendingAddTarget` / `CancelAdd` mechanism is
+  untouched and still keyed per (call, callee). If per-inviter ADD tracking is ever
+  wanted, the only change needed is relaxing the being-rung check — the machinery is
+  still there. Covered by `TestAdd_RejectsSecondAddOfSameTarget`.
+
+---
+
+## Deferred by decision — independent design questions, not instances of the admission-chokepoint bug
+
+*These are **not** fixed. Each needs its own discussion before a fix is designed;
+neither is resolved as a side effect of centralizing admission.*
 
 ### 9. Callee disconnects mid-ring → caller hangs on "Ringing X…" forever
 
@@ -217,6 +242,18 @@ is designed; none is resolved as a side effect of centralizing admission.*
 - **Why deferred:** the fix requires deciding what *should* happen (tear the call
   down and notify the caller? keep ringing for a grace window in case they
   reconnect?) — a UX decision, not a missing check.
+- **New interaction with the finding 1–8 fix (`3ecd86b`), worth knowing before
+  designing this:** the admission predicate's being-rung check now consults
+  `pendingAdds`, so a *stale* ring left behind by a callee who disconnected
+  mid-ADD makes that callee un-dialable — anyone dialing them gets
+  `%PHONE-E-BUSY, X is already being called.` until the ring is cancelled or its
+  call is torn down (teardown now clears it — finding 3). This is **not a
+  regression**: the message is truthful, because the stale ring goroutine really
+  does resume ringing X the moment they reconnect (exactly the resurrection
+  behavior described above). But it makes this finding's blast radius wider and
+  more visible than it was, which raises its priority relative to when it was
+  first logged: it now costs a reconnecting user *inbound* calls, not just a
+  confused caller.
 
 ### 10. "One user, one call" is assumed but never enforced (multi-session)
 

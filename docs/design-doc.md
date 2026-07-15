@@ -205,6 +205,37 @@ Schema migrations run automatically at startup using `ALTER TABLE ADD COLUMN` (a
 - Multi-party from the start: `ADD <username>` adds participants to an active call; viewport layout divides screen height among N participants.
 - **Color/emphasis (future, not v1):** opt-in on both ends — renders only if the sender opted in to send it *and* the receiver opted in to receive it. Never breaks the experience of someone who hasn't opted in.
 
+### Call admission — one predicate, both entry points
+
+`DIAL` and `ADD` are the only two ways to start a ring, and both route through a
+single `admitLocked` predicate in `internal/phone/call.go`. A ring is refused if
+the target is yourself (`%PHONE-E-SELF`), not connected (`%PHONE-E-NOLOGIN`),
+already in a call — pending or active (`%PHONE-E-BUSY`), or already being rung by
+anyone (`%PHONE-E-BUSY`). **One ring per callee at a time, with no per-call
+exception.**
+
+The predicate is deliberately at the `Calls` chokepoint rather than in the
+handlers. `DIAL` while already in a call is an alias for `ADD` (matching real
+VAX/VMS, which let DIAL pull someone into an in-progress conversation), and when
+the busy rule lived only on `Dial` that alias silently bypassed it — a
+participant of one call could ring a participant of another, who could then
+neither answer nor reject. Rules at the chokepoint mean a new caller inherits
+them instead of re-forgetting them. Same reasoning as `usableAdminPredicate` in
+`internal/store` (see Admin model).
+
+**Separate calls are never merged.** Refusing a busy target is the whole design:
+the original VAX/VMS PHONE had no notion of joining two live conversations, and
+`ADD` builds a conference from *one* call outward rather than splicing two
+together.
+
+**Admission is account-level, never session-level** — the registry is keyed by
+username with one notify channel shared across an account's sessions. The
+*caller's* own call membership is deliberately not consulted, so an account with
+one session in a call can still dial from another; the flip side is that one
+account cannot phone itself. Whether an account may hold two concurrent calls is
+an open question, not a settled rule — see finding 10 of
+`docs/audits/audit-2026-07-13-phone-call-admission.md`.
+
 ---
 
 ## SET PLAN — inline profile editor
