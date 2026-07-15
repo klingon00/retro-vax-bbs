@@ -1659,6 +1659,59 @@ and is silently ignored** (symptom: typed commands pile onto one line, never
 submitting), and **every session must be logged in before any dialing starts**,
 since `Dial` refuses a callee who is not yet connected.
 
+## Live testing after the call-admission fix: one regression, one pre-existing gap (2026-07-14)
+
+Manual live testing (four real terminals) caught two things the green unit suite
+and the scripted live pass both missed. Logged as findings 11 and 12 of
+`docs/audits/audit-2026-07-13-phone-call-admission.md`. **Both were traced by
+running a repro harness against the fixed *and* the pre-fix (`e3ba975`) binaries**
+— which is what settled which was a regression and which was not, rather than
+reasoning about it. Worth doing that first next time a "this used to work" report
+arrives; the answer here was one of each, and not the expected one.
+
+**Finding 12 — a real regression, mine.** Finding 3's teardown cleanup sent the
+pending-ring cancellation with `Caller: username`, i.e. `hangupLocked`'s
+*departing participant*, not whoever started the ring. `addKey{callID, callee}`
+records who was rung and from which call but never who rang: `Add` receives
+`callerUsername` and threw it away. Repro: alice and bob in a call, alice rings
+carol, alice drops, then bob drops — alice's exit leaves bob behind so no teardown
+runs; bob's exit empties the call and fires the cleanup with `username = "bob"`.
+Carol, told "alice is phoning you", is then told **"bob cancelled the call"**. It
+always named whoever left **last**; reverse the order and it was accidentally
+right, which is exactly the trap the regression test now pins (the test has the
+inviter leave *first* — with the inviter leaving last, old and new code agree and
+the test proves nothing). Fixed by making `pendingAdds` values a
+`pendingRing{stop, inviter}`. Scope was attribution only: pre-fix, carol got no
+cancellation at all and was still being rung (finding 3's phantom ring), so the
+notification is new and correct to send — only the name was wrong.
+
+**Finding 11 — pre-existing, NOT a regression, but the fix invited it.** Two
+sessions of one account cannot both hold live calls: session 2 dials carol, carol
+answers, and the first keystroke in session 2 cancels the call. Verified identical
+at `e3ba975`. The chain: `notify` is one channel per *account*, both sessions arm
+a receiver on it, `Answer` can only address `call.Caller` by username, and
+`handlePhoneEvent` **ignores `event.CallID`** — so session 1 misreads session 2's
+`EventAnswer` as a conference join, session 2 never leaves `CallPending`, and
+`app.go`'s "any key cancels the outbound ring" hangs up a real call. Now
+prioritized (Next concrete steps #3), not deferred open-endedly.
+
+**The lesson worth keeping, because it is about the verification and not the
+code.** The admission fix shipped `TestDial_AdmitsCallerWhoseAccountIsAlreadyInACall`
+and a design-doc line saying "an account with one session in a call can still dial
+from another". The predicate genuinely preserves *admission* — but that was only
+ever verified as **`Dial` returning no error**, never as the resulting call
+working. A guarantee got advertised that the layer beneath does not deliver, and
+that is what sent someone to test it. **"The guard permits X" and "X works" are
+different claims**, and a passing test for the first reads to everyone like proof
+of the second. Both the test comment and the design-doc wording now say
+admission-only and point at finding 11. The general form: when a fix's headline is
+"we preserved capability X", the verification has to *drive X end-to-end*, not
+assert that the gate didn't close.
+
+Also note both misses were **scenario-shaped, not logic-shaped** — 12 needed a
+specific leave order, 11 needed two sessions of one account. Neither is subtle in
+hindsight; both were simply outside the shapes the harness exercised.
+
 ## Next concrete steps
 
 1. ✅ **VAX/VMS command abbreviation** — shortest unambiguous prefix (DCL style).
@@ -1669,7 +1722,33 @@ since `Dial` refuses a callee who is not yet connected.
    `<Icon>` as of 2026-07-04); CA repo listing itself still open. Gated on
    the manual GHCR steps above, which are confirmed working end-to-end
    (`docker pull` succeeding anonymously). Ops-only, no coding.
-3. **PHONE call-state: two deferred design questions** (findings 9 and 10 of
+3. **PHONE per-session event routing — prioritized, needs its own session**
+   (finding 11 of `docs/audits/audit-2026-07-13-phone-call-admission.md`, found in
+   live testing 2026-07-14). **This is the next PHONE work item, ahead of the
+   Unraid CA submission if PHONE correctness matters more than distribution.**
+   Two sessions of one account cannot both hold live calls: `notify` is one
+   channel per *account*, so an `EventAnswer` for the second session's call is
+   consumed by whichever session's receiver wins, and `handlePhoneEvent` never
+   filters on `CallID` — the first session misreads it as a conference join, the
+   second stays stuck in `CallPending`, and the next keystroke hangs up a real,
+   answered call. **Pre-existing, not a regression** (verified: identical
+   behavior at `e3ba975`), but tracked as prioritized rather than deferred because
+   it is reachable today and destroys a live call silently.
+   - **Do not start with the cheap fix.** Filtering on `CallID` in
+     `handlePhoneEvent` looks like two lines and is a trap: `notify` is a
+     single-consumer queue, not a broadcast, so the wrong session still consumes
+     the event and merely discards it — converting a misdelivery into a silent
+     drop. The real fix is per-session delivery (session identity in the registry;
+     `sendEvent` targeting a session), with `CallID` filtering as defence in depth.
+   - **It forces the finding 10 policy question**, so plan them together: with
+     per-session channels, if an account has two sessions and someone dials it,
+     *which session rings?* Both (and can two then ANSWER the same call?), or one
+     (by what rule)? Today's "the ring reaches one session" is a side effect of the
+     shared channel, not a decision anyone made.
+   - **Verify with a live two-session pass**, not a unit test. This gap survived a
+     green suite and a live SSH pass precisely because the test asserted only that
+     `Dial` returns no error — see the note in the audit header.
+4. **PHONE call-state: two deferred design questions** (findings 9 and 10 of
    `docs/audits/audit-2026-07-13-phone-call-admission.md`, deferred 2026-07-14).
    Both are genuine design decisions, not missing guards, which is why the
    admission fix deliberately left them alone:
@@ -1688,7 +1767,7 @@ since `Dial` refuses a callee who is not yet connected.
      deciding whether an account may hold concurrent calls at all, and if not,
      plumbing session identity through the registry — which is keyed by username
      today with no per-session handle.
-4. **Dependency refresh** — deferred as its own task (flagged 2026-07-13).
+5. **Dependency refresh** — deferred as its own task (flagged 2026-07-13).
    `go list -u -m all` shows nearly the whole module tree has newer versions,
    including major bumps: `charmbracelet/bubbles v0.21.0 → v1.0.0` (a direct dep —
    the `textarea` behind SET PLAN) and `charmbracelet/log v0.4.1 → v1.0.0`, plus

@@ -230,11 +230,21 @@ together.
 
 **Admission is account-level, never session-level** — the registry is keyed by
 username with one notify channel shared across an account's sessions. The
-*caller's* own call membership is deliberately not consulted, so an account with
-one session in a call can still dial from another; the flip side is that one
-account cannot phone itself. Whether an account may hold two concurrent calls is
-an open question, not a settled rule — see finding 10 of
-`docs/audits/audit-2026-07-13-phone-call-admission.md`.
+*caller's* own call membership is deliberately not consulted, so a dial is
+**admitted** from an account that already has another session in a call; the flip
+side is that one account cannot phone itself.
+
+**This is an admission-only property, not a working feature — read this before
+relying on it.** Admission being account-level means the predicate does not
+*refuse* such a dial. It does **not** mean the resulting call works: it currently
+does not. Because `notify` is one channel per account, an event for the second
+session's call (e.g. `EventAnswer`) is consumed by whichever session's receiver
+wins the race, and `handlePhoneEvent` does not filter on `CallID` — so the first
+session misreads it as a conference join while the second stays stuck in
+`CallPending` and hangs up on the next keystroke. Two sessions of one account
+cannot both hold live calls today. See finding 11 of
+`docs/audits/audit-2026-07-13-phone-call-admission.md`; whether an account
+*should* hold concurrent calls at all is finding 10, still open.
 
 ---
 

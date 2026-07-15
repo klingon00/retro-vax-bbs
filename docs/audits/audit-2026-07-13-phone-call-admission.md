@@ -9,15 +9,29 @@ frozen snapshot — as findings are resolved each is marked in place with a
 both the original findings and their disposition. No code was changed by the
 audit itself.*
 
-Ten findings, ranked most-severe first. Seven share a single root cause and are
-fixed by one centralization; three were logged as independent design questions.
+Originally ten findings from the read-only pass, ranked most-severe first. Seven
+shared a single root cause and are fixed by one centralization; three were logged
+as independent design questions. **Findings 11 and 12 were added later**, from
+manual live testing that the unit tests did not catch — see "Found later" below.
 
-**Disposition (2026-07-14):** findings 1–7 fixed in `3ecd86b`. Finding 8 turned
-out to be **resolved as a consequence** of the same centralization rather than
-needing its own design pass — see its entry for the reasoning. Findings 9 and 10
-remain **deferred by decision**: they are genuine design questions, not instances
-of the admission-chokepoint bug, and finding 10 in particular is neither closed
-nor worsened by the fix.
+**Disposition (2026-07-14):**
+
+| Findings | State |
+|---|---|
+| 1–7 | ✅ Fixed in `3ecd86b` |
+| 8 | ✅ Resolved as a consequence of the shared predicate (reclassified from deferred — reasoning in its entry) |
+| 9 | ⏸️ Deferred — disconnect-mid-ring behavior; priority *raised* by the fix (see its entry) |
+| 10 | ⏸️ Deferred as a policy question, but **upgraded** from "low likelihood": its mechanism is finding 11, reproduced live |
+| 11 | 🔴 **Open, prioritized follow-up** — per-account event routing breaks a second session's live call. Pre-existing (verified at `e3ba975`), *not* a regression, but the fix advertised a guarantee this layer doesn't deliver |
+| 12 | ✅ Fixed — pending-ring cancellation named the wrong person (a real regression from finding 3's fix) |
+
+**A note on what the unit tests missed, worth keeping.** Findings 11 and 12 were
+both caught by a human driving four real terminals, after a green suite and a live
+SSH pass. Neither was subtle in hindsight: 12 needed a *specific leave order* to
+show up (the inviter leaving first), and 11 needed *two sessions of one account*
+— a shape the harness only exercised as far as "does Dial return an error?" So
+the coverage gap was scenario-shaped, not logic-shaped. Tests that assert a guard
+permits something prove strictly less than driving the thing it permits.
 
 **Root cause shared by findings 1–2 and 4–7:** admission rules ("may this ring be
 placed?") live per-path in the UI layer rather than at the `Calls` chokepoint.
@@ -109,6 +123,9 @@ call-admission surface is untested.
   `call ... not found` (`call.go:137`). The goroutine leaks for process lifetime.
 - **Note:** same never-closed-goroutine class as audit-2026-07-05 finding #1, which
   is why it is bundled with the admission fix rather than deferred.
+- **This fix shipped with a bug of its own** — the cancellation it added named the
+  wrong person. See finding 12 (fixed in `7187581`). The teardown and the ring
+  goroutine's guard were correct; only the `Caller` on the notification was not.
 
 ### 4. Two calls can ring the same target; the loser's goroutine rings forever
 
@@ -257,11 +274,20 @@ neither is resolved as a side effect of centralizing admission.*
 
 ### 10. "One user, one call" is assumed but never enforced (multi-session)
 
-**Status:** ⏸️ Deferred — **a design question distinct from, and unaffected by, the
-admission fix.**
+**Status:** ⏸️ Deferred as a *policy* question — but **no longer low-likelihood**,
+and now coupled to finding 11, which should be worked with it.
 
-**Severity: plausible risk (low likelihood) · Confidence: high on the gap, low on
-real-world reachability**
+**Severity: upgraded 2026-07-14 from "plausible risk (low likelihood)" to a real,
+reproduced gap · Confidence: high on the gap; reachability is no longer
+theoretical**
+
+> **Update (2026-07-14):** the "rings race for whichever session's receiver wins"
+> mechanism noted below is no longer hypothetical — it was reproduced live and is
+> written up as finding 11, where it silently kills an answered call. This entry
+> stays open as the *policy* half (**should** one account hold concurrent calls?);
+> finding 11 is the *mechanism* half (event delivery cannot address a session
+> even if we decide it should). Answering 11 forces answering this, because
+> per-session delivery has to decide which session rings.
 
 - **Where:** `internal/phone/call.go:263-282` (`HangupUser`), whose comment states
   the invariant: *"A user is only ever in one call at a time, so the first match is
@@ -283,6 +309,113 @@ real-world reachability**
   first deciding the policy question — *should* one account hold concurrent calls?
   — and, if not, plumbing session identity through the registry, which today is
   keyed by username with no per-session handle.
+
+---
+
+---
+
+## Found later, in live testing (2026-07-14)
+
+*Two issues manual live testing caught that the unit tests did not. Both were
+traced with a repro harness run against **both** the fixed and the pre-fix
+(`e3ba975`) binaries, which is what settled which was a regression and which was
+not — worth doing before assuming either way.*
+
+### 11. Per-account event routing breaks a second session's live call
+
+**Status:** 🔴 Open — **prioritized follow-up, own session.** Not deferred
+open-endedly: it is reachable today and silently kills a live, answered call.
+
+**Severity: definite bug (high impact) · Confidence: high — reproduced live**
+
+- **Not a regression, verified.** The identical repro (alice session 1 in a call
+  with bob; session 2 dials carol; carol answers; alice types in session 2 → the
+  call cancels and session 2 drops to the idle `%` prompt) behaves **exactly the
+  same on `e3ba975`**, before any of the admission work. This is pre-existing.
+- **But the admission fix is what made it reachable-by-invitation**, which is why
+  it is logged here rather than as unrelated: `3ecd86b` documented and unit-tested
+  "an account with one session in a call can still dial from another" as a
+  preserved guarantee. The predicate does preserve *admission* — but that was only
+  ever verified as `Dial` returning no error, never as the resulting call working.
+  A guarantee was advertised that the layer beneath does not deliver, which is
+  what prompted someone to test it. The design-doc wording and the test comment
+  have since been corrected to say admission-only.
+- **Where:** `internal/registry/registry.go:47-51` and `:85-100` (`entry.notify`
+  is one channel per **account**; `Register` reuses it on `count++`),
+  `internal/lobby/model.go`'s `subscribePhoneEvents` → `m.reg.Events(m.username)`,
+  `internal/phone/call.go`'s `Answer` (sends `EventAnswer` to `call.Caller` — a
+  username), and `internal/phone/app.go:247-269` (`EventAnswer` branch).
+- **Root cause chain:**
+  1. `notify` is account-addressed and shared by every session of that account —
+     there is no session identity anywhere in the registry to address instead.
+  2. Each session's lobby arms its own `waitForPhoneEvent` on that *same* channel,
+     so two sessions race and each event is consumed by exactly **one**,
+     nondeterministically.
+  3. `Answer` can only address `call.Caller` by username; it cannot target the
+     session that placed the call.
+  4. **`handlePhoneEvent` ignores `event.CallID`.** The `EventAnswer` branch never
+     checks it, so session 1 — sitting in an unrelated active call — misreads the
+     answer for session 2's call as a *conference join* and appends the answerer
+     to its own call's viewports.
+  5. Session 2 therefore never leaves `CallPending`.
+  6. `app.go:384`'s "any key cancels the outbound ring"
+     (`if m.state == CallPending { return m.doHangup() }`) fires on the first
+     keystroke and hangs up the real, answered call.
+- **Live evidence (both binaries):** the harness reports `session1 shows 'carol
+  joined': True` — session 1 visibly steals the event — then typing in session 2
+  drops it to the idle prompt and carol sees the call end.
+- **Not limited to `EventAnswer`.** `EventHangup`'s CallActive branch,
+  `EventReject`, `EventRing` and `EventRinging` all ignore `CallID` too. With two
+  sessions, *any* event type can land on the wrong session; this is the loudest
+  symptom, not the only one.
+- **The obvious cheap fix is a trap.** Filtering on `CallID` in
+  `handlePhoneEvent` ("ignore events for calls I'm not in") looks like two lines,
+  but `notify` is a **single-consumer queue, not a broadcast**: the wrong session
+  still *consumes* the event and would then discard it, so the right session still
+  never sees it. That turns a misdelivery into a silent drop — strictly harder to
+  debug. A real fix needs per-session delivery (session identity in the registry,
+  `sendEvent` targeting a session), with `CallID` filtering only as defence in
+  depth.
+- **Forces the finding 10 design question**, which is why they should be worked
+  together: with per-session channels, if alice has two sessions and bob dials
+  her, **which session rings?** Both — and then two sessions could each ANSWER the
+  same call, appending a duplicate participant? Or one, and by what rule? The
+  current "the ring reaches one session" behavior is a consequence of the shared
+  channel, not a decision anyone made.
+
+### 12. Pending-ring cancellation named the wrong person
+
+**Status:** ✅ Fixed in `7187581` — regression introduced by finding 3's fix in
+`3ecd86b`, caught in live testing.
+
+**Severity: definite bug (low impact, high visibility) · Confidence: high**
+
+- **Where:** `internal/phone/call.go:423` (as shipped in `3ecd86b`).
+- **What:** Finding 3's teardown cleanup sent the cancellation with
+  `Caller: username` — `hangupLocked`'s **departing participant** argument, not
+  whoever started the ring. `addKey{callID, callee}` records who was rung and from
+  which call but never who did the ringing: `Add` receives `callerUsername` and
+  discarded it, so teardown had no inviter in scope and used the only username it
+  had.
+- **Failure scenario:** alice and bob are in a call; alice rings carol into it;
+  alice drops, then bob drops. Alice's departure leaves bob behind, so the call is
+  not empty and no teardown runs. Bob's departure empties it and triggers the
+  cleanup with `username = "bob"` — so carol, who was told "alice is phoning you",
+  is then told **"bob cancelled the call"** about a ring bob had nothing to do
+  with. It always named whoever left **last**; reversing the leave order made it
+  accidentally correct.
+- **Scope of the regression is attribution only.** Pre-fix (`e3ba975`) carol got
+  *no* cancellation at all and was still being rung after both dropped — finding
+  3's eternal phantom ring. The notification is new and correct to send; only the
+  name was wrong.
+- **Fix:** `pendingAdds` values became a `pendingRing{stop, inviter}` struct, so
+  teardown attributes the cancellation to `ring.inviter`. `CancelAdd` already took
+  `callerUsername` and got this right, so the data existed at `Add` time and was
+  simply not retained. Covered by
+  `TestHangup_PendingRingCancellationNamesInviterNotLastToLeave`, which pins the
+  discriminating leave order (inviter leaves first, bystander last) — with the
+  inviter leaving last the old and new code agree, so the test would prove
+  nothing. Live-confirmed: carol now sees "alice cancelled the call".
 
 ---
 
