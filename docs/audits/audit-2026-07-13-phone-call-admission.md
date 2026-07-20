@@ -395,6 +395,13 @@ fixed and re-verified live**
   A guarantee was advertised that the layer beneath does not deliver, which is
   what prompted someone to test it. The design-doc wording and the test comment
   have since been corrected to say admission-only.
+  **Update (2026-07-19):** that last sentence is itself superseded — see this
+  finding's ✅ status above. The design-doc no longer says admission-only; it
+  records **one call per _session_** as a working invariant, verified end-to-end
+  rather than at the `Dial`-returns-no-error level. The admission-only tripwire
+  test (`TestDial_AdmitsCallerWhoseAccountIsAlreadyInACall`) was replaced with one
+  that drives the admitted call through to a completed answer on an independent
+  session — the gap this bullet describes is what motivated that replacement.
 - **Where:** `internal/registry/registry.go:47-51` and `:85-100` (`entry.notify`
   is one channel per **account**; `Register` reuses it on `count++`),
   `internal/lobby/model.go`'s `subscribePhoneEvents` → `m.reg.Events(m.username)`,

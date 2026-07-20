@@ -41,7 +41,8 @@ type charArrivedMsg struct {
 type clearMsgMsg struct{ gen int }
 
 // PhoneEventMsg is exported so the lobby can forward phone events to the
-// active PHONE app. The lobby owns the notify channel exclusively.
+// active PHONE app. The lobby is the sole consumer of the session's notify
+// channel — one channel per session, not per account — and forwards from there.
 type PhoneEventMsg struct {
 	Event registry.PhoneEvent
 }
