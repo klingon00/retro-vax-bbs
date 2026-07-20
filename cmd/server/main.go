@@ -66,6 +66,7 @@ const (
 	authDoneKey           contextKey = "authDone"
 	regModeKey            contextKey = "regMode"            // set when username=="new"
 	mustChangePasswordKey contextKey = "mustChangePassword" // set when EXPIRE PASSWORD is pending
+	sessionIDKey          contextKey = "sessionID"          // per-session registry ID, set at Register
 )
 
 type config struct {
@@ -281,23 +282,25 @@ func sessionMiddleware(db *store.Store, reg *registry.Registry, calls *phone.Cal
 			s.Context().SetValue(roleKey, user.Role)
 			s.Context().SetValue(mustChangePasswordKey, user.MustChangePassword)
 
-			reg.Register(s.User(), user.Role, user.AdminVisible, "LOBBY")
+			sid := reg.Register(s.User(), user.Role, user.AdminVisible, "LOBBY")
+			s.Context().SetValue(sessionIDKey, sid)
 			// Store a kick function so admin KICK command can close this session.
 			reg.SetKick(s.User(), func() { s.Exit(0) })
 
 			// Teardown cleanup. Go runs defers last-registered-first (LIFO), so
 			// this ordering is deliberate: Unregister is registered FIRST and
-			// HangupUser SECOND, which means at session end HangupUser runs
-			// BEFORE Unregister. HangupUser removes this user from any active
-			// PHONE call — closing their IncomingChar to reap the waitForChar
-			// goroutine and notifying the other participants — and Unregister
-			// then removes this account's registry entry and closes its done
-			// channel, reaping the waitForPhoneEvent goroutine. A mid-call SSH
-			// *drop* runs neither HANGUP nor EXIT, so these defers are the only
-			// thing that tears down a call and its goroutines on an abrupt
-			// disconnect.
-			defer reg.Unregister(s.User())
-			defer calls.HangupUser(s.User())
+			// HangupSession SECOND, which means at session end HangupSession
+			// runs BEFORE Unregister. HangupSession removes THIS session from
+			// any active PHONE call — closing its IncomingChar to reap the
+			// waitForChar goroutine and notifying the other participants — and
+			// Unregister then removes this session's registry state and closes
+			// its done channel, reaping the waitForPhoneEvent goroutine. Both
+			// are keyed by sessionID so a multi-session account's other sessions
+			// and their calls are untouched. A mid-call SSH *drop* runs neither
+			// HANGUP nor EXIT, so these defers are the only thing that tears
+			// down a call and its goroutines on an abrupt disconnect.
+			defer reg.Unregister(sid)
+			defer calls.HangupSession(sid)
 			next(s)
 		}
 	}
@@ -335,7 +338,21 @@ func teaHandler(s ssh.Session) (tea.Model, []tea.ProgramOption) {
 	if role == "" {
 		role = "user"
 	}
-	m := lobby.New(s.User(), role, globalReg, globalDB, globalCalls, s, globalPendingExpiry)
+	sid, ok := s.Context().Value(sessionIDKey).(string)
+	if !ok || sid == "" {
+		// sessionMiddleware sets this immediately after reg.Register for every
+		// authenticated lobby session, so an empty sid here means Register never
+		// ran — reachable only via a DB lookup failure in the middleware, which
+		// already logged. Refuse rather than hand out a half-registered lobby:
+		// an empty sid resolves to no registry session, so the user could
+		// neither receive PHONE events nor be reached in a call, with no signal
+		// to anyone. "" can never collide with a real ID (Register mints "1"+),
+		// so this is about failing visibly, not preventing a crash. Same
+		// nil-model refusal used for a session with no PTY above.
+		log.Printf("session handler: missing session ID for %q; refusing session", s.User())
+		return nil, nil
+	}
+	m := lobby.New(s.User(), role, sid, globalReg, globalDB, globalCalls, s, globalPendingExpiry)
 	return m, []tea.ProgramOption{tea.WithAltScreen()}
 }
 

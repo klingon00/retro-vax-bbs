@@ -39,6 +39,7 @@ type phoneRingMsg struct {
 type Model struct {
 	username      string
 	role          string
+	sessionID     string // this session's registry ID; routes PHONE events to us
 	reg           *registry.Registry
 	db            *store.Store
 	calls         *phone.Calls
@@ -58,11 +59,14 @@ type Model struct {
 	height       int
 }
 
-// New returns a fresh lobby Model for the authenticated session.
-func New(username, role string, reg *registry.Registry, db *store.Store, calls *phone.Calls, out io.Writer, pendingExpiry time.Duration) Model {
+// New returns a fresh lobby Model for the authenticated session. sessionID is
+// this session's registry ID (from Registry.Register), used to receive PHONE
+// events addressed to this specific session rather than the account.
+func New(username, role, sessionID string, reg *registry.Registry, db *store.Store, calls *phone.Calls, out io.Writer, pendingExpiry time.Duration) Model {
 	return Model{
 		username:      username,
 		role:          role,
+		sessionID:     sessionID,
 		reg:           reg,
 		db:            db,
 		calls:         calls,
@@ -240,9 +244,22 @@ func (m Model) handleRing(event registry.PhoneEvent) (Model, tea.Cmd) {
 			"  Type ANSWER to accept or REJECT to decline.")
 		return m, m.ringBellCmd()
 	case registry.EventHangup, registry.EventReject:
+		// Only clear the ring we're actually showing (defence-in-depth).
+		if event.CallID != m.pendingCallID {
+			return m, nil
+		}
 		m.pendingCallID = ""
 		m.history = append(m.history,
 			fmt.Sprintf("%%VAX-BBS-I-PHONE, %s cancelled the call.", event.Caller))
+	case registry.EventAnswerElsewhere:
+		// Another of this account's sessions answered the call we were being
+		// rung for; retract our ring without blaming the caller for cancelling.
+		if event.CallID != m.pendingCallID {
+			return m, nil
+		}
+		m.pendingCallID = ""
+		m.history = append(m.history,
+			"%VAX-BBS-I-PHONE, Call answered on another session.")
 	case registry.EventAdminNotify:
 		if m.role == "admin" {
 			m.history = append(m.history,
@@ -346,7 +363,7 @@ func (m Model) View() string {
 // waitForPhoneEvent relies on. Returns a nil Cmd when the session isn't
 // registered (Events returns both nil).
 func (m Model) subscribePhoneEvents() tea.Cmd {
-	events, done := m.reg.Events(m.username)
+	events, done := m.reg.Events(m.sessionID)
 	return waitForPhoneEvent(events, done)
 }
 

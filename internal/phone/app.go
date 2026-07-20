@@ -1,6 +1,7 @@
 package phone
 
 import (
+	"errors"
 	"fmt"
 	"io"
 	"strings"
@@ -50,9 +51,10 @@ type PhoneEventMsg struct {
 // Model is the Bubble Tea model for the PHONE app. It implements
 // internal/app.App so the lobby can launch it generically.
 type Model struct {
-	username string
-	callID   string
-	isCaller bool
+	username  string
+	sessionID string // this session's registry ID; identifies us as a call participant
+	callID    string
+	isCaller  bool
 
 	state     CallState
 	callsWith []string // other participants (not including self)
@@ -100,10 +102,11 @@ type Model struct {
 
 // NewIdle opens PHONE in idle state (no call in progress). Used when the
 // user types PHONE from the lobby without specifying a username.
-func NewIdle(username string, calls *Calls, reg *registry.Registry, out io.Writer, width, height int) Model {
+func NewIdle(username, sessionID string, calls *Calls, reg *registry.Registry, out io.Writer, width, height int) Model {
 	reg.SetApp(username, "PHONE")
 	return Model{
 		username:  username,
+		sessionID: sessionID,
 		state:     CallIdle,
 		viewports: []*ViewportText{{Username: username}},
 		calls:     calls,
@@ -115,12 +118,13 @@ func NewIdle(username string, calls *Calls, reg *registry.Registry, out io.Write
 }
 
 // New opens PHONE and immediately starts ringing calleeUsername.
-func New(username, callID, calleeUsername string, calls *Calls, reg *registry.Registry,
+func New(username, sessionID, callID, calleeUsername string, calls *Calls, reg *registry.Registry,
 	myChars chan CharEvent, out io.Writer, width, height int) Model {
 
 	reg.SetApp(username, "PHONE")
 	return Model{
 		username:  username,
+		sessionID: sessionID,
 		callID:    callID,
 		isCaller:  true,
 		state:     CallPending,
@@ -142,7 +146,7 @@ func New(username, callID, calleeUsername string, calls *Calls, reg *registry.Re
 // NewAnswering opens PHONE in the active state for someone who just answered.
 // others contains ALL other participants' usernames (not just the original
 // caller), ensuring correct viewport setup for conference calls.
-func NewAnswering(username, callID string, others []string, calls *Calls, reg *registry.Registry,
+func NewAnswering(username, sessionID, callID string, others []string, calls *Calls, reg *registry.Registry,
 	myChars chan CharEvent, out io.Writer, width, height int) Model {
 
 	reg.SetApp(username, "PHONE")
@@ -152,6 +156,7 @@ func NewAnswering(username, callID string, others []string, calls *Calls, reg *r
 	}
 	return Model{
 		username:  username,
+		sessionID: sessionID,
 		callID:    callID,
 		isCaller:  false,
 		state:     CallActive,
@@ -245,6 +250,12 @@ func (m Model) handlePhoneEvent(event registry.PhoneEvent) (Model, tea.Cmd) {
 	switch event.Type {
 
 	case registry.EventAnswer:
+		// Defence-in-depth: per-session routing should only deliver an answer
+		// for THIS session's call, but ignore any that isn't — a stray answer
+		// must never be misread as a conference join (the finding 11 failure).
+		if event.CallID != m.callID {
+			return m, nil
+		}
 		if m.state == CallPending {
 			m.state = CallActive
 			m.status = ""
@@ -272,11 +283,17 @@ func (m Model) handlePhoneEvent(event registry.PhoneEvent) (Model, tea.Cmd) {
 		if m.state == CallIdle {
 			// Check if this cancels a pending incoming ring we were waiting
 			// to answer (e.g. caller cancelled the ADD ring before we answered).
+			// Guarded on the ring's own CallID (pendingIncomingCallID), which is
+			// how the answer-elsewhere ring retract also clears a losing session.
 			if event.CallID == m.pendingIncomingCallID {
 				m.pendingIncomingCallID = ""
 				m.pendingIncomingCaller = ""
 				return m.setNotification(fmt.Sprintf("*** %s cancelled the call ***", event.Caller), notifyDur)
 			}
+			return m, nil
+		}
+		// In a call (pending or active): act only on hangups for OUR call.
+		if event.CallID != m.callID {
 			return m, nil
 		}
 		if m.state == CallActive {
@@ -304,7 +321,7 @@ func (m Model) handlePhoneEvent(event registry.PhoneEvent) (Model, tea.Cmd) {
 			}
 			m.callsWith = cw
 			if len(m.callsWith) == 0 {
-				m.calls.Hangup(m.callID, m.username)
+				m.calls.Hangup(m.callID, m.sessionID)
 				m = m.goIdle()
 			}
 			return m.setNotification(notification, notifyDur)
@@ -314,6 +331,10 @@ func (m Model) handlePhoneEvent(event registry.PhoneEvent) (Model, tea.Cmd) {
 		return m.setNotification(fmt.Sprintf("*** %s cancelled the call ***", event.Caller), notifyDur)
 
 	case registry.EventReject:
+		// Only act on a reject for THIS session's call (defence-in-depth).
+		if event.CallID != m.callID {
+			return m, nil
+		}
 		if m.state == CallActive {
 			// Clear pending ADD target if this person declined.
 			if m.pendingAddTarget == event.Callee {
@@ -327,7 +348,23 @@ func (m Model) handlePhoneEvent(event registry.PhoneEvent) (Model, tea.Cmd) {
 		m = m.goIdle()
 		return m.setNotification(msg, notifyDur)
 
+	case registry.EventAnswerElsewhere:
+		// We were being rung for this call inside PHONE (idle at the % prompt),
+		// and another session of this account answered it. Clear our pending
+		// ring — but only if it's the one we're showing.
+		if event.CallID == m.pendingIncomingCallID {
+			m.pendingIncomingCallID = ""
+			m.pendingIncomingCaller = ""
+			return m.setNotification("*** Call answered on another session ***", notifyDur)
+		}
+		return m, nil
+
 	case registry.EventRinging:
+		// Advisory for OUR call only (defence-in-depth); a stray one must not
+		// paint a bogus "X is ringing Y" line on an unrelated call.
+		if event.CallID != m.callID {
+			return m, nil
+		}
 		// Another participant in the call is ringing someone. Show as a
 		// temporary notification — auto-clears and re-fires each ring interval.
 		return m.setNotification(
@@ -650,7 +687,7 @@ func (m Model) doDial(target string) (Model, tea.Cmd) {
 		m.msg = "Use HANGUP first, then DIAL."
 		return m, nil
 	}
-	call, callerP, err := m.calls.Dial(m.username, target)
+	call, callerP, err := m.calls.Dial(m.sessionID, m.username, target)
 	if err != nil {
 		m.msg = ErrorMessage(err, target)
 		return m, nil
@@ -695,8 +732,16 @@ func (m Model) doAnswer() (Model, tea.Cmd) {
 		m.msg = "%PHONE-W-NOCALL, no incoming call to answer."
 		return m, nil
 	}
-	call, calleeP, err := m.calls.Answer(m.pendingIncomingCallID, m.username)
+	call, calleeP, err := m.calls.Answer(m.pendingIncomingCallID, m.sessionID, m.username)
 	if err != nil {
+		// ErrAlreadyAnswered means another session of this account won the race
+		// to answer this call (first-answer-wins). Show a specific note instead
+		// of the generic error and drop back to idle.
+		if errors.Is(err, ErrAlreadyAnswered) {
+			m.pendingIncomingCallID = ""
+			m.pendingIncomingCaller = ""
+			return m.setNotification("%PHONE-I-ANSWERED, call was already answered elsewhere.", 5*time.Second)
+		}
 		m.msg = fmt.Sprintf("%%PHONE-E-ANSWER, %v", err)
 		m.pendingIncomingCallID = ""
 		return m, nil
@@ -759,7 +804,7 @@ func (m Model) goIdle() Model {
 // Does NOT exit PHONE — use doExit for that.
 func (m Model) doHangup() (Model, tea.Cmd) {
 	if m.state != CallIdle {
-		m.calls.Hangup(m.callID, m.username)
+		m.calls.Hangup(m.callID, m.sessionID)
 	}
 	return m.goIdle(), nil
 }
@@ -777,7 +822,7 @@ func (m Model) cancelPendingAdd() (Model, tea.Cmd) {
 // the lobby.
 func (m Model) doExit() (Model, tea.Cmd) {
 	if m.state != CallIdle {
-		m.calls.Hangup(m.callID, m.username)
+		m.calls.Hangup(m.callID, m.sessionID)
 	}
 	m.reg.SetApp(m.username, "LOBBY")
 	m.done = true

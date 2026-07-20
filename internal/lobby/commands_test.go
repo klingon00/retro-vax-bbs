@@ -25,7 +25,8 @@ func newTestLobbyStore(t *testing.T) *store.Store {
 func newTestModel(username, role string, db *store.Store) Model {
 	reg := registry.New()
 	calls := phone.NewCalls(reg)
-	return New(username, role, reg, db, calls, io.Discard, 0)
+	sid := reg.Register(username, role, false, "LOBBY")
+	return New(username, role, sid, reg, db, calls, io.Discard, 0)
 }
 
 // Note: the last-usable-admin invariant itself is now enforced and unit-

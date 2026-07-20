@@ -768,7 +768,7 @@ func phoneOpenCommand(m Model) (string, tea.Cmd) {
 	if m.calls == nil {
 		return "%PHONE-E-NOCALLS, phone system not initialized.", nil
 	}
-	phoneModel := phone.NewIdle(m.username, m.calls, m.reg, m.out, m.width, m.height)
+	phoneModel := phone.NewIdle(m.username, m.sessionID, m.calls, m.reg, m.out, m.width, m.height)
 	return "", launchAppCmd(phoneModel)
 }
 
@@ -786,13 +786,13 @@ func phoneDialCommand(m Model, username string) (string, tea.Cmd) {
 		return "%PHONE-E-NOCALLS, phone system not initialized.", nil
 	}
 
-	call, callerP, err := m.calls.Dial(m.username, username)
+	call, callerP, err := m.calls.Dial(m.sessionID, m.username, username)
 	if err != nil {
 		return phone.ErrorMessage(err, username), nil
 	}
 
 	phoneModel := phone.New(
-		m.username, call.ID, username,
+		m.username, m.sessionID, call.ID, username,
 		m.calls, m.reg,
 		callerP.IncomingChar,
 		m.out, m.width, m.height,
@@ -812,8 +812,12 @@ func answerCommand(m Model) (string, tea.Cmd) {
 		return "%PHONE-W-NOCALL, no incoming call to answer.", nil
 	}
 
-	call, calleeP, err := m.calls.Answer(callID, m.username)
+	call, calleeP, err := m.calls.Answer(callID, m.sessionID, m.username)
 	if err != nil {
+		if errors.Is(err, phone.ErrAlreadyAnswered) {
+			// Another session of this account won the race (first-answer-wins).
+			return "%PHONE-I-ANSWERED, call was already answered elsewhere.", nil
+		}
 		return fmt.Sprintf("%%PHONE-E-ANSWER, %v", err), nil
 	}
 
@@ -828,7 +832,7 @@ func answerCommand(m Model) (string, tea.Cmd) {
 	}
 
 	phoneModel := phone.NewAnswering(
-		m.username, call.ID, others,
+		m.username, m.sessionID, call.ID, others,
 		m.calls, m.reg,
 		calleeP.IncomingChar,
 		m.out, m.width, m.height,
