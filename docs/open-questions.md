@@ -1547,6 +1547,31 @@ two sessions of one account in different apps, WHO shows whichever wrote last (e
 "PHONE" while the other session sits at the LOBBY prompt). Cosmetic — presence display
 only; PHONE routing/admission are per-session and unaffected. Not fixed here.
 
+## Known minor: KICK only terminates one session of a multi-session account (2026-07-19)
+
+Pre-existing and **not** cosmetic, unlike its sibling above. `entry.kick` is a single
+func stored per *account*, and `SetKick` is called by `sessionMiddleware` on every
+session — so the most recently registered session overwrites the previous one's kill
+func. `KICK <user>` then closes **only that last session**; any earlier session of the
+same account survives and stays connected.
+
+That matters because KICK is a moderation control. An admin kicking a user who has two
+sessions open gets a success message and a still-connected user, with nothing in the
+output indicating a partial effect. The admin-action audit log records the KICK as
+issued, so the log agrees with the admin's belief rather than with what happened.
+
+Deliberately left as-is through the per-session PHONE routing work (`74a2ef5`), which
+made session identity available but did not rework KICK. First noted in
+`docs/audits/audit-2026-07-05.md`'s "Other observations", where it was filed alongside
+the shared-`notify` quirk that later became PHONE audit finding 11 — see that finding
+for why "low-severity multi-session edge case" was the wrong call on its neighbour.
+
+The fix is now cheap and worth doing before KICK is relied on: the registry already
+tracks per-session state, so `kick` should move from `entry` to `sessionState` and
+`Kick(username)` should iterate every session of the account. Not attempted here
+because it is a moderation-behaviour change and wants its own testing, not a rider on
+a PHONE release.
+
 ## v0.4.0 release: command abbreviation shipped, published to GHCR + verified end-to-end (2026-07-13)
 
 Minor version bump to `v0.4.0` — *not* a patch `v0.3.2`: DCL command abbreviation

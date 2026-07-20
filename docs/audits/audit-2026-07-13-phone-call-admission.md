@@ -23,8 +23,8 @@ fix — see "Found during finding 11 verification" below.
 | 1–7 | ✅ Fixed in `3ecd86b` |
 | 8 | ✅ Resolved as a consequence of the shared predicate (reclassified from deferred — reasoning in its entry) |
 | 9 | ⏸️ Deferred — disconnect-mid-ring behavior; priority *raised* by the fix (see its entry) |
-| 10 | ⏸️ Deferred as a policy question, but **upgraded** from "low likelihood": its mechanism is finding 11, reproduced live |
-| 11 | 🔴 **Open, prioritized follow-up** — per-account event routing breaks a second session's live call. Pre-existing (verified at `e3ba975`), *not* a regression, but the fix advertised a guarantee this layer doesn't deliver |
+| 10 | 🔵 **Retired 2026-07-19** — superseded by finding 11's fix, which answers the policy question: the enforced unit is the *session*, and an account may hold one call per session |
+| 11 | ✅ **Fixed in `74a2ef5`, live-verified 2026-07-19** — per-session event delivery (registry split into per-account presence + per-session notify/done). Verified by the full two-session SSH pass (S0–S6), not by unit tests alone |
 | 12 | ✅ Fixed — pending-ring cancellation named the wrong person (a real regression from finding 3's fix) |
 | 13 | 🔵 **Open, unconfirmed** — `EventHangup` in `CallPending` never returns the session to idle, unlike `EventReject`. Found by inspection, reachability not established, no fix attempted |
 | 14 | 🔵 **Open, latent** — `SendToSession` silently discards an event when a session's notify buffer is full. Pre-existing and by design; recorded because the failure is invisible and indistinguishable from finding 11's symptom |
@@ -278,8 +278,17 @@ neither is resolved as a side effect of centralizing admission.*
 
 ### 10. "One user, one call" is assumed but never enforced (multi-session)
 
-**Status:** ⏸️ Deferred as a *policy* question — but **no longer low-likelihood**,
-and now coupled to finding 11, which should be worked with it.
+**Status:** 🔵 **Retired 2026-07-19 — superseded by finding 11's fix (`74a2ef5`),
+which answers the policy question rather than deferring it.** The enforced unit is
+the **session**: one call per session, and an account may hold as many concurrent
+calls as it has sessions. Both halves are now settled — the mechanism half by
+per-session event delivery, and the policy half by making the session, not the
+account, the thing a call belongs to. Recorded in `design-doc.md`'s PHONE section
+as the standing invariant. The original entry is preserved below unchanged.
+
+*Superseded status line, kept for the record:* ⏸️ Deferred as a *policy* question
+— but **no longer low-likelihood**, and now coupled to finding 11, which should be
+worked with it.
 
 **Severity: upgraded 2026-07-14 from "plausible risk (low likelihood)" to a real,
 reproduced gap · Confidence: high on the gap; reachability is no longer
@@ -327,11 +336,44 @@ not — worth doing before assuming either way.*
 
 ### 11. Per-account event routing breaks a second session's live call
 
-**Status:** 🔴 Open — **prioritized follow-up, own session.** Not deferred
-open-endedly: it is reachable today and silently kills a live, answered call.
+**Status:** ✅ Fixed in `74a2ef5` (`fix: route PHONE events per session; add gated
+call-path logging`), **live-verified 2026-07-19** by the full two-session SSH pass
+this finding demanded.
 
-**Severity: definite bug (high impact) · Confidence: high — reproduced live**
+The fix is per-session event delivery, not a `CallID` filter — filtering in
+`handlePhoneEvent` was explicitly rejected as a trap, because `notify` is a
+single-consumer queue: the wrong session still *consumes* the event and then
+discards it, converting a misdelivery into a silent drop. The registry now splits
+per-account presence (`entry`) from per-session delivery (`sessionState`), each
+session owning its own notify/done pair, with a session ID threaded
+middleware → context → lobby → PHONE → `Participant.SessionID`. `CallID` guards
+were added at the receivers as defence-in-depth only, which is safe once each
+session owns its queue.
 
+**Verified live, scenario by scenario** (the standard this finding exists to
+enforce — a green suite and a green scripted pass both missed it before):
+S1 the headline (session 2 dials, answers, and *types* while session 1's call is
+untouched — the typing is what the old bug destroyed); S2 fan-out to both idle
+sessions, first-answer-wins, and the distinct "answered on another session"
+wording; S3 one-ring-per-callee still enforced account-level under fan-out; S4
+session-aware busy from both directions (one idle session admits, all-busy
+refuses); S5 finding 12's inviter attribution still correct; S6 a mid-call session
+drop tearing down only its own call, with
+`unregister … 1 session(s) remain, account entry retained`.
+
+**Severity: definite bug (high impact) · Confidence: high — reproduced live, then
+fixed and re-verified live**
+
+- **It was found eight days early and triaged too low.** `audit-2026-07-05.md`'s
+  "Other observations" already recorded the mechanism exactly — *"with concurrent
+  sessions of one account, a PHONE ring reaches only one session (shared `notify`
+  channel)"* — and filed it, together with the KICK quirk, as *"low-severity
+  multi-session edge cases."* The detection was not the failure. The severity call
+  was: it was rated on its most benign symptom (a ring that reaches one session,
+  which sounds cosmetic) rather than on what a shared single-consumer queue
+  implies once two sessions are both *active*, which is a silently destroyed live
+  call. One sentence described both outcomes; only the mild reading was written
+  down. Worth remembering when triaging anything phrased as an "edge case".
 - **Not a regression, verified.** The identical repro (alice session 1 in a call
   with bob; session 2 dials carol; carol answers; alice types in session 2 → the
   call cancels and session 2 drops to the idle `%` prompt) behaves **exactly the
