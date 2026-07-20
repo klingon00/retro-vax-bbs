@@ -228,23 +228,53 @@ the original VAX/VMS PHONE had no notion of joining two live conversations, and
 `ADD` builds a conference from *one* call outward rather than splicing two
 together.
 
-**Admission is account-level, never session-level** — the registry is keyed by
-username with one notify channel shared across an account's sessions. The
-*caller's* own call membership is deliberately not consulted, so a dial is
-**admitted** from an account that already has another session in a call; the flip
-side is that one account cannot phone itself.
+**The invariant is one call per _session_, not one per account.** Two sessions of
+one account can each hold their own independent live call, and this is a working
+feature — driven end-to-end over real SSH, not merely permitted by a predicate.
+(It was admission-only until `74a2ef5`; the earlier wording in this document said
+so explicitly, and finding 11 of
+`docs/audits/audit-2026-07-13-phone-call-admission.md` records why.)
 
-**This is an admission-only property, not a working feature — read this before
-relying on it.** Admission being account-level means the predicate does not
-*refuse* such a dial. It does **not** mean the resulting call works: it currently
-does not. Because `notify` is one channel per account, an event for the second
-session's call (e.g. `EventAnswer`) is consumed by whichever session's receiver
-wins the race, and `handlePhoneEvent` does not filter on `CallID` — so the first
-session misreads it as a conference join while the second stays stuck in
-`CallPending` and hangs up on the next keystroke. Two sessions of one account
-cannot both hold live calls today. See finding 11 of
-`docs/audits/audit-2026-07-13-phone-call-admission.md`; whether an account
-*should* hold concurrent calls at all is finding 10, still open.
+**Presence is per-account; event delivery is per-session.** The registry splits
+into an `entry` per account — role, admin visibility, the WHO/FINGER app label,
+the KICK hook — and a `sessionState` per session, each owning its **own** notify
+and done channels. That split is the whole fix: `notify` is a single-consumer
+queue, so one channel shared by an account's sessions meant every control event
+was raced for and consumed by exactly one of them, at random. Sessions are
+identified by an opaque monotonic ID minted at `Register` and threaded
+middleware → context → lobby → PHONE → `Participant.SessionID`, so a call
+membership is a *session's*, not an account's.
+
+**Admission is deliberately asymmetric, and the asymmetry is load-bearing:**
+
+- **Being-rung is account-level.** One ring per callee at a time, from any call,
+  with no per-call exception. This is what keeps audit findings 4 and 8 closed:
+  because a second concurrent dial to a callee is refused at admission, at most
+  one pending `Call{Callee: x}` can exist, so a ring's per-session fan-out can
+  never overlap a second ring and clobber each session's single
+  `pendingIncomingCallID`.
+- **Busy is per-session.** A callee is busy only when *every* one of their
+  sessions is already in a call; if any session is idle, the ring is admitted and
+  fans out to the idle ones.
+- **The caller's own membership is still never consulted** — not an oversight. A
+  `Dial` structurally only ever originates from an idle session, because an
+  in-call DIAL routes to `Add` instead. One-call-per-session therefore holds on
+  the caller side without a check. The flip side remains that one account cannot
+  phone itself.
+
+**Ring fan-out is first-answer-wins.** An incoming call rings every idle session
+of the callee account. The first to answer goes active; the rest have their rings
+retracted with `EventAnswerElsewhere` — a distinct type, *not* `EventHangup`,
+though the payload is otherwise identical. The distinction is purely so the losing
+sessions can say "answered on another session" instead of falsely reporting that
+the caller cancelled, at a moment when the caller is in fact talking to the
+account's other session. A second session racing an `ANSWER` in after the call is
+already active is refused at the `Calls` chokepoint with `ErrAlreadyAnswered`, so
+first-answer-wins is enforced by the call layer rather than by UI timing.
+
+**Finding 10 ("one user, one call" assumed but never enforced) is retired** — it
+was a policy question, and this design answers it: the enforced unit is the
+session, and an account may hold as many concurrent calls as it has sessions.
 
 ---
 
