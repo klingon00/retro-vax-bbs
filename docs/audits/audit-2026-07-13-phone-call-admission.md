@@ -13,8 +13,10 @@ Originally ten findings from the read-only pass, ranked most-severe first. Seven
 shared a single root cause and are fixed by one centralization; three were logged
 as independent design questions. **Findings 11 and 12 were added later**, from
 manual live testing that the unit tests did not catch — see "Found later" below.
+**Finding 13 was added later still**, by inspection while verifying finding 11's
+fix — see "Found during finding 11 verification" below.
 
-**Disposition (2026-07-14):**
+**Disposition (2026-07-14; finding 13 added 2026-07-19):**
 
 | Findings | State |
 |---|---|
@@ -24,6 +26,8 @@ manual live testing that the unit tests did not catch — see "Found later" belo
 | 10 | ⏸️ Deferred as a policy question, but **upgraded** from "low likelihood": its mechanism is finding 11, reproduced live |
 | 11 | 🔴 **Open, prioritized follow-up** — per-account event routing breaks a second session's live call. Pre-existing (verified at `e3ba975`), *not* a regression, but the fix advertised a guarantee this layer doesn't deliver |
 | 12 | ✅ Fixed — pending-ring cancellation named the wrong person (a real regression from finding 3's fix) |
+| 13 | 🔵 **Open, unconfirmed** — `EventHangup` in `CallPending` never returns the session to idle, unlike `EventReject`. Found by inspection, reachability not established, no fix attempted |
+| 14 | 🔵 **Open, latent** — `SendToSession` silently discards an event when a session's notify buffer is full. Pre-existing and by design; recorded because the failure is invisible and indistinguishable from finding 11's symptom |
 
 **A note on what the unit tests missed, worth keeping.** Findings 11 and 12 were
 both caught by a human driving four real terminals, after a green suite and a live
@@ -416,6 +420,100 @@ open-endedly: it is reachable today and silently kills a live, answered call.
   discriminating leave order (inviter leaves first, bystander last) — with the
   inviter leaving last the old and new code agree, so the test would prove
   nothing. Live-confirmed: carol now sees "alice cancelled the call".
+
+---
+
+## Found during finding 11 verification (2026-07-19)
+
+### 13. `EventHangup` in `CallPending` never returns the session to idle, unlike `EventReject`
+
+**Status:** 🔵 Open — **recorded, not fixed, and reachability not established.**
+Found by reading, not by reproducing. Deliberately written down rather than
+carried in a conversation: it was noticed while chasing a different symptom, and
+that is exactly the kind of observation that evaporates when attention moves on.
+
+**Severity: suspected bug (unconfirmed) · Confidence: medium on the asymmetry
+being real, low on it being reachable**
+
+- **Where:** `internal/phone/app.go:328-331` (the `EventHangup` fall-through)
+  against `app.go:346-349` (`EventReject`).
+- **What:** both branches handle the same situation — our pending *outbound* call
+  ended before anyone answered. `EventReject` sets a notification **and calls
+  `m.goIdle()`**. `EventHangup` sets its notification and clears
+  `pendingIncomingCallID` / `pendingIncomingCaller` — which are the *incoming*-ring
+  fields and are not what an outbound `CallPending` session is holding — but never
+  calls `goIdle()`. The session keeps `m.state == CallPending`.
+- **Consequence if reachable:** the session displays
+  `*** X cancelled the call ***` while still believing it is dialling. The next
+  keystroke reaches `app.go:421` (`if m.state == CallPending { return m.doHangup() }`),
+  which **consumes the character** and hangs up a call that no longer exists. The
+  visible signature is a flashed cancellation followed by a silently swallowed
+  first keypress.
+- **How it was found, and what it is *not*.** During S6 setup on 2026-07-19 a
+  one-shot anomaly was seen on a second session of one account: first character
+  dropped, plus a flash of a message naming the dial target. This asymmetry was
+  found while looking for a cause. It is **probably not** that cause — the likelier
+  explanation is `app.go:427-429`, where an active call with a pending ADD ring
+  deliberately consumes the next keypress and emits `Cancelled ringing <target>.`
+  That path is documented, intended, and accounts for all four observed symptoms
+  (character consumed, target named, call unaffected, hard to reproduce because it
+  needs `pendingAddTarget` set at the instant of the keystroke). The anomaly was
+  not reproducible on a clean retry and no diagnosis is claimed here.
+- **Not investigated:** whether an `EventHangup` carrying a matching `CallID` can
+  actually reach a session sitting in `CallPending`. Finding 11's fix removed one
+  route — sibling-ring retraction now sends `EventAnswerElsewhere`, not
+  `EventHangup` — leaving `Reject` and `hangupLocked` as the candidates to trace.
+  Establishing reachability is the bulk of the work; the fix itself, if warranted,
+  is one line.
+- **Next step:** decide whether `EventHangup`'s `CallPending` fall-through should
+  call `goIdle()` for symmetry with `EventReject`. A test would need to pin the
+  discriminating case (a hangup, not a reject, arriving at a session in
+  `CallPending`) — written as a reject it passes against both old and new code and
+  proves nothing, the same trap as finding 12's leave order.
+- **Instrument now available:** the `PHONE_DEBUG_LOG=1` diagnostic logging added
+  alongside this entry records every event delivery per session, including the
+  silent buffer-full discard in `registry.SendToSession`. If this recurs, the log
+  will show which event actually arrived and at which session — the detail that
+  was missing when the anomaly was first seen.
+
+### 14. A full notify buffer silently discards the event
+
+**Status:** 🔵 Open — **latent, pre-existing, by design, and recorded rather than
+fixed.** Not introduced by the finding-11 work; the per-session split changed who
+owns the buffer, not the discard behaviour.
+
+**Severity: latent defect (low likelihood, silent failure) · Confidence: high on
+the mechanism, unquantified on the likelihood**
+
+- **Where:** `internal/registry/registry.go`, `SendToSession`'s
+  `select { case ss.notify <- event: default: }`.
+- **What:** `notify` is buffered at 8. The send is non-blocking *deliberately* — a
+  slow or wedged receiver must never block the sender, which holds `c.mu` at every
+  call site. When the buffer is full the `default:` arm fires and **the event is
+  dropped**: no error, no return value, no record. The design trade is correct
+  (blocking here would deadlock the call table); the problem is that the losing
+  side of the trade is invisible.
+- **Why it matters beyond bookkeeping:** downstream, a discarded event is
+  **indistinguishable from one that was never sent**. The session simply never
+  changes state. That is precisely finding 11's symptom — a session stuck in
+  `CallPending` while everyone else believes the call is live — arrived at by a
+  different route. Anyone diagnosing a recurrence would reasonably suspect routing
+  and find the routing correct.
+- **Likelihood:** unquantified, believed low. Each session's Bubble Tea loop
+  consumes promptly via `waitForPhoneEvent`, and 8 slots is generous for a facility
+  whose events are ring/answer/hangup/reject. It needs a wedged or descheduled
+  receiver plus sustained event pressure — a re-ring every `RingInterval`, or heavy
+  conference churn — to reach.
+- **Now observable, still not handled.** `PHONE_DEBUG_LOG=1` logs the discard
+  explicitly (`DROPPED (notify buffer full)`), which converts a silent failure into
+  a visible one *when logging is on*. That is a diagnostic, **not a fix**: with the
+  flag off, which is the default and therefore the norm, the drop remains silent.
+- **Next step, if it ever fires:** the options are a larger buffer (defers the
+  problem), a drop counter surfaced somewhere always-on (cheap, makes it detectable
+  without debug logging), or treating a full buffer as a session-health signal and
+  tearing the session down rather than letting it drift out of sync. No decision
+  taken. Related: finding 13 is the other "a session sits in the wrong state and
+  the next keystroke does damage" entry.
 
 ---
 

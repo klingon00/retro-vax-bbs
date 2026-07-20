@@ -1539,6 +1539,14 @@ in `View()`/`viewportHeight()` for the changed flattened line count — a wrappe
 line occupies more than one display row, so the existing "1 entry = 1 line"
 assumption in the scroll window would need updating.
 
+## Known minor: WHO's per-account app label is last-writer-wins across sessions (2026-07-18)
+
+Pre-existing, made more visible by per-session PHONE routing: `Registry.currentApp`
+(shown by WHO/FINGER) is one label per *account*, set via `SetApp(username, …)`. With
+two sessions of one account in different apps, WHO shows whichever wrote last (e.g.
+"PHONE" while the other session sits at the LOBBY prompt). Cosmetic — presence display
+only; PHONE routing/admission are per-session and unaffected. Not fixed here.
+
 ## v0.4.0 release: command abbreviation shipped, published to GHCR + verified end-to-end (2026-07-13)
 
 Minor version bump to `v0.4.0` — *not* a patch `v0.3.2`: DCL command abbreviation
@@ -1711,6 +1719,54 @@ assert that the gate didn't close.
 Also note both misses were **scenario-shaped, not logic-shaped** — 12 needed a
 specific leave order, 11 needed two sessions of one account. Neither is subtle in
 hindsight; both were simply outside the shapes the harness exercised.
+
+## PHONE diagnostic logging — opt-in, and it perturbs what it measures (2026-07-19)
+
+Added `internal/debuglog` plus emit points across `internal/phone/call.go`
+(`Dial`, `Answer`, `Add`, `HangupSession`) and `internal/registry/registry.go`
+(`Register`, `Unregister`, `SendToSession`). Gated on **`PHONE_DEBUG_LOG=1`,
+default off**. Written during the finding-11 live pass, when a one-shot anomaly
+appeared and there was nothing to diagnose it with: the PHONE/registry/lobby
+packages had **no logging at all** beyond the two admin-action audit lines, so
+every dial, ring, answer, retract and teardown was invisible.
+
+**Default-off is deliberate, for three separate reasons.** With the flag unset an
+emit point costs one boolean test, so the binary verified in a manual pass behaves
+identically to the one that ships. The lines name accounts and record who called
+whom — call metadata, which has no business on stdout by default. And permanent-
+but-dormant instrumentation still exists the next time an intermittent fault
+appears; scaffolding stripped before commit does not.
+
+**The caveat that matters operationally: turning the log on changes the timing of
+the thing you are trying to observe.** Emit points in `call.go` use a deliberate
+LIFO-deferred pattern — the log defer is registered *before* the unlock defer, so
+it runs *after* it and the write lands outside `c.mu`. That ordering reads
+backwards and looks like something to tidy; it is load-bearing, and each site says
+so in a comment. **But it only covers each function's own line.** The per-delivery
+lines come from `registry.SendToSession`, which is called from ~15 sites in
+`call.go` that all hold `c.mu` — `ringLocked`, `notifyAccountLocked`,
+`hangupLocked`, the `Answer` retract fan-out. Those writes are inside the phone
+lock and no defer ordering in `call.go` can move them, because the lock belongs to
+the caller. A two-session ring fan-out goes from two channel sends to two channel
+sends plus two `log.Printf` syscalls, all under `c.mu`.
+
+So: **a clean re-run with `PHONE_DEBUG_LOG=1` is not evidence a race is fixed.** A
+widened critical section can serialize a race out of existence as easily as expose
+it. The log is trustworthy for what it *records*; it is not trustworthy as proof of
+absence. Making those sites lock-free would mean buffering log lines in the `Calls`
+layer and flushing after unlock at every one of them — a real refactor for a
+default-off diagnostic, not done, and recorded here rather than left implicit.
+
+The highest-value line is the one in `SendToSession`'s `default:` branch. `notify`
+is buffered at 8; past that the non-blocking send falls through and the event is
+**discarded with no error and no trace**, which downstream is indistinguishable
+from an event that was never sent — the session simply never changes state. That
+discard was completely unobservable before this. The discard itself is a latent
+defect in its own right, not merely a visibility gap: it is tracked as **finding
+14** in `docs/audits/audit-2026-07-13-phone-call-admission.md`, where the options
+(bigger buffer, always-on drop counter, treat as a session-health signal) are laid
+out. Logging makes it visible when the flag is on; with the flag off, which is the
+default, it is still silent.
 
 ## Next concrete steps
 
