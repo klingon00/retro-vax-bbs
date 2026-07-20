@@ -1620,6 +1620,25 @@ Throwaway container + volume + pulled image removed afterward; the release is go
 
 ## PHONE call-admission fix: two live-testing bugs + a discovery pass (2026-07-14)
 
+> **Update (2026-07-19) — three claims in this entry are superseded by `74a2ef5`.**
+> The entry is otherwise accurate as a record of 2026-07-14 and is kept unchanged
+> below; read these first, because each reads as present-tense.
+> 1. *"one user, one call (finding 10) stays unenforced"* — finding 10 is
+>    **retired**. It is now enforced, per **session** rather than per account: one
+>    call per session, and an account may hold as many as it has sessions.
+> 2. *"`TestDial_AdmitsCallerWhoseAccountIsAlreadyInACall` exists as the
+>    tripwire"* — that test was **replaced**. It asserted only that `Dial` returned
+>    no error, which is precisely how finding 11 hid behind a green suite; the
+>    replacement drives the admitted call through to a completed answer on an
+>    independent session.
+> 3. The self-check rationale — *"it could never work anyway, because the ring goes
+>    to the account-shared notify channel"* — no longer holds, because there is no
+>    account-shared channel. **The policy survives its justification**: the
+>    self-check is still deliberately account-level, so one session still cannot
+>    phone another session of the same account. That is now a genuine product
+>    choice rather than a concession to a routing limitation, and would need a
+>    fresh decision to change.
+
 Live testing found two PHONE bugs — a user could `DIAL` themselves, and a
 participant in one active call could dial a participant in another, leaving that
 callee unable to answer or reject while being re-rung every 10 seconds. A
@@ -1745,6 +1764,88 @@ Also note both misses were **scenario-shaped, not logic-shaped** — 12 needed a
 specific leave order, 11 needed two sessions of one account. Neither is subtle in
 hindsight; both were simply outside the shapes the harness exercised.
 
+> **Update (2026-07-19):** finding 11 is fixed and live-verified — see the
+> "PHONE per-session event routing" entry below. The references above to the
+> design-doc and test comment "now saying admission-only" are superseded: the
+> design-doc records one-call-per-**session** as a working invariant, and the
+> admission-only tripwire test was replaced with one that drives the admitted call
+> through to a completed answer. The lesson in this entry stands unchanged, and
+> was in fact the standard the fix was held to — it is why closure required a live
+> two-session pass rather than a green suite.
+
+## PHONE per-session event routing — finding 11 fixed and live-verified (2026-07-19)
+
+Fixes the gap recorded in the 2026-07-14 entry above: two sessions of one account
+could not both hold live calls. `registry.entry.notify` was one channel per
+*account*, and a Go channel is a **single-consumer queue** — so both sessions armed
+a receiver on it and every control event went to whichever won the race. A sibling
+session would consume the second session's `EventAnswer`, misread it as a
+conference join, and leave the dialing session stuck in `CallPending`, where the
+next keystroke tore down a real, answered call.
+
+**The cheap fix was a trap and was deliberately not taken.** Filtering on
+`event.CallID` in `handlePhoneEvent` looks like two lines, but it does not help:
+the wrong session still *consumes* the event and then discards it, converting a
+misdelivery into a silent drop. The state is still wrong; only the symptom moves.
+`CallID` guards were added anyway, at the receivers, as defence-in-depth — safe
+precisely *because* delivery is now per-session, not as the mechanism.
+
+**What changed (`74a2ef5`).** The registry splits per-account presence (`entry`:
+role, admin visibility, WHO/FINGER app label, KICK hook) from per-session delivery
+(`sessionState`: its own notify and done channels). `Register` mints an opaque
+monotonic session ID and returns it, threaded middleware → context → lobby → PHONE
+→ `Participant.SessionID`, so a call membership belongs to a session rather than an
+account. `Events`/`SendToSession`/`SessionsOf`/`Connected` replace the per-account
+`Notify`; `HangupUser` becomes `HangupSession`.
+
+**Admission is asymmetric on purpose.** Being-rung stays **account-level** — one
+ring per callee, no per-call exception — and that is what keeps findings 4 and 8
+closed: a second concurrent dial is refused at admission, so at most one pending
+`Call{Callee: x}` exists and a per-session fan-out can never overlap a second ring
+and clobber each session's single `pendingIncomingCallID`. Busy became
+**per-session**: admitted if the callee has any idle session. The caller's own
+membership is still never consulted, which is not an oversight — a `Dial`
+structurally only originates from an idle session, because an in-call DIAL routes
+to `Add`.
+
+**Ring fan-out is first-answer-wins.** An incoming call rings every idle session;
+the winner goes active and the losers' rings are retracted with a **distinct**
+`EventAnswerElsewhere` rather than `EventHangup`. The payload is otherwise
+identical and both clear the ring the same way — the separate type exists purely so
+the losing session says "answered on another session" instead of reporting that the
+caller cancelled, at the exact moment the caller is talking to the account's other
+session. Same class of defect as finding 12: state machine right, attribution a
+lie. A session racing an `ANSWER` in after the call is active is refused with
+`ErrAlreadyAnswered` at the `Calls` chokepoint, so first-answer-wins is enforced by
+the call layer, not by UI timing.
+
+**Verified by a full two-session live SSH pass (S0–S6), which is the point.** This
+finding exists because a green unit suite *and* a green scripted live pass both
+missed it — the tests only ever asserted that `Dial` returned no error. S1 drove
+the headline end-to-end (session 2 dials, answers, and *types* while session 1's
+call stays untouched — the typing being what the old bug destroyed); S2 fan-out to
+both idle sessions plus first-answer-wins wording in both lobby and in-app
+contexts; S3 one-ring-per-callee still refused a concurrent dial with two idle
+sessions rung; S4 session-aware busy from both directions; S5 finding 12's inviter
+attribution still correct under the discriminating leave order; S6 a mid-call
+session drop tearing down only its own call, with `1 session(s) remain, account
+entry retained` confirming the account survived its session.
+
+**One scenario could not be driven by hand, accepted.** S2's late-`ANSWER` →
+`ErrAlreadyAnswered` race is unreachable manually: the retract clears the ring
+faster than a person can type, so the lobby short-circuits with "no incoming call
+to answer" before `Calls.Answer` runs. The call-layer guard is covered by
+`TestAnswer_DoubleAnswerFirstWins`; the two *rendering* paths
+(`commands.go:819`, `app.go:743`) remain unexercised and are a genuine, if minor,
+coverage gap — they are the safety net for a lost or delayed retract, which is
+exactly when the wording would matter.
+
+**Finding 10 is retired by this**, not deferred: it asked whether one account
+*should* hold concurrent calls, and the answer is now recorded as the standing
+invariant — one call per **session**, an account may hold as many as it has
+sessions. Two new findings (13, 14) were opened during the pass; see the audit
+report and the next entry.
+
 ## PHONE diagnostic logging — opt-in, and it perturbs what it measures (2026-07-19)
 
 Added `internal/debuglog` plus emit points across `internal/phone/call.go`
@@ -1803,36 +1904,33 @@ default, it is still silent.
    `<Icon>` as of 2026-07-04); CA repo listing itself still open. Gated on
    the manual GHCR steps above, which are confirmed working end-to-end
    (`docker pull` succeeding anonymously). Ops-only, no coding.
-3. **PHONE per-session event routing — prioritized, needs its own session**
-   (finding 11 of `docs/audits/audit-2026-07-13-phone-call-admission.md`, found in
-   live testing 2026-07-14). **This is the next PHONE work item, ahead of the
-   Unraid CA submission if PHONE correctness matters more than distribution.**
-   Two sessions of one account cannot both hold live calls: `notify` is one
-   channel per *account*, so an `EventAnswer` for the second session's call is
-   consumed by whichever session's receiver wins, and `handlePhoneEvent` never
-   filters on `CallID` — the first session misreads it as a conference join, the
-   second stays stuck in `CallPending`, and the next keystroke hangs up a real,
-   answered call. **Pre-existing, not a regression** (verified: identical
-   behavior at `e3ba975`), but tracked as prioritized rather than deferred because
-   it is reachable today and destroys a live call silently.
-   - **Do not start with the cheap fix.** Filtering on `CallID` in
-     `handlePhoneEvent` looks like two lines and is a trap: `notify` is a
-     single-consumer queue, not a broadcast, so the wrong session still consumes
-     the event and merely discards it — converting a misdelivery into a silent
-     drop. The real fix is per-session delivery (session identity in the registry;
-     `sendEvent` targeting a session), with `CallID` filtering as defence in depth.
-   - **It forces the finding 10 policy question**, so plan them together: with
-     per-session channels, if an account has two sessions and someone dials it,
-     *which session rings?* Both (and can two then ANSWER the same call?), or one
-     (by what rule)? Today's "the ring reaches one session" is a side effect of the
-     shared channel, not a decision anyone made.
-   - **Verify with a live two-session pass**, not a unit test. This gap survived a
-     green suite and a live SSH pass precisely because the test asserted only that
-     `Dial` returns no error — see the note in the audit header.
-4. **PHONE call-state: two deferred design questions** (findings 9 and 10 of
+3. ✅ **PHONE per-session event routing** (finding 11). **Done: fixed in
+   `74a2ef5`, live-verified 2026-07-19** by a full two-session SSH pass (S0–S6) —
+   see the "PHONE per-session event routing" entry above. The registry now splits
+   per-account presence from per-session delivery. The `CallID`-filter shortcut was
+   correctly avoided (single-consumer queue: the wrong session consumes and then
+   drops), and the finding 10 policy question it forced is **answered, not
+   deferred** — the enforced unit is the session. No further work outstanding on
+   this finding.
+   - **The design question this item used to pose is answered, not dropped.** It
+     asked: with per-session channels, which session rings, and can two of them
+     answer the same call? **All idle sessions of the callee ring**
+     (`ringableSessionsLocked` fans out to every session not already in a call),
+     and **no, two cannot both answer** — first-answer-wins is enforced at the
+     `Calls` chokepoint, so a second session racing an `ANSWER` gets
+     `ErrAlreadyAnswered` and is never appended as a participant, while its ring is
+     retracted with `EventAnswerElsewhere`. Pinned by
+     `TestAnswer_DoubleAnswerFirstWins` (which asserts exactly two participants,
+     not merely that the second call errored) and driven live in S2.
+   - **Remaining from the release, not blocking:** push the four local commits and
+     tag `v0.4.1`, framed as *"closes findings 11 and 12; records 13 and 14 as
+     open"* rather than "audit fully closed".
+4. **PHONE call-state: one deferred design question** (finding 9 of
    `docs/audits/audit-2026-07-13-phone-call-admission.md`, deferred 2026-07-14).
-   Both are genuine design decisions, not missing guards, which is why the
-   admission fix deliberately left them alone:
+   **Finding 10 was also listed here and is now retired** — answered by the
+   per-session routing work on 2026-07-19, see step 3; its entry below is kept for
+   the record with that disposition noted. Finding 9 is a genuine design decision,
+   not a missing guard, which is why the admission fix deliberately left it alone:
    - **Callee disconnects mid-ring** — the caller sits on "Ringing X…" forever
      with no "X has disconnected", and a reconnecting X gets rung for a call
      placed before they logged in. Needs a behavior call (tear down and notify
@@ -1840,14 +1938,19 @@ default, it is still silent.
      effect of the admission fix**: a stale ring now also makes the disconnected
      user un-dialable by anyone until it clears, so it costs a reconnecting user
      inbound calls, not just a confused caller.
-   - **"One user, one call" is assumed but never enforced** — `HangupUser`'s
-     comment asserts it; nothing checks it, so with two sessions one account can
-     be in two calls, and teardown may hang up the wrong one. Unaffected by the
-     admission fix by design (the predicate never consults the *caller's*
-     membership, precisely so multi-session keeps working). Closing it means first
-     deciding whether an account may hold concurrent calls at all, and if not,
+   - ✅ **"One user, one call" is assumed but never enforced** — **RETIRED
+     2026-07-19.** The original text is kept below for the record. It called for
+     "deciding whether an account may hold concurrent calls at all, and if not,
      plumbing session identity through the registry — which is keyed by username
-     today with no per-session handle.
+     today with no per-session handle." That is exactly what `74a2ef5` did: session
+     identity now exists, the registry is no longer username-keyed for delivery,
+     and the decision is that an account **may** hold concurrent calls — one per
+     session. `HangupUser` became `HangupSession`, so teardown can no longer hang
+     up the wrong call.
+     *Original entry:* `HangupUser`'s comment asserts it; nothing checks it, so
+     with two sessions one account can be in two calls, and teardown may hang up
+     the wrong one. Unaffected by the admission fix by design (the predicate never
+     consults the *caller's* membership, precisely so multi-session keeps working).
 5. **Dependency refresh** — deferred as its own task (flagged 2026-07-13).
    `go list -u -m all` shows nearly the whole module tree has newer versions,
    including major bumps: `charmbracelet/bubbles v0.21.0 → v1.0.0` (a direct dep —

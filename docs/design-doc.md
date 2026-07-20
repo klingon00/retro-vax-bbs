@@ -210,9 +210,11 @@ Schema migrations run automatically at startup using `ALTER TABLE ADD COLUMN` (a
 `DIAL` and `ADD` are the only two ways to start a ring, and both route through a
 single `admitLocked` predicate in `internal/phone/call.go`. A ring is refused if
 the target is yourself (`%PHONE-E-SELF`), not connected (`%PHONE-E-NOLOGIN`),
-already in a call — pending or active (`%PHONE-E-BUSY`), or already being rung by
-anyone (`%PHONE-E-BUSY`). **One ring per callee at a time, with no per-call
-exception.**
+already being rung by anyone (`%PHONE-E-BUSY`), or **busy — meaning every one of
+their sessions is already in a call**, pending or active (`%PHONE-E-BUSY`). If any
+session is idle the ring is admitted and fans out to the idle ones; busy is
+per-session, being-rung is per-account, and the reason for that asymmetry is
+below. **One ring per callee at a time, with no per-call exception.**
 
 The predicate is deliberately at the `Calls` chokepoint rather than in the
 handlers. `DIAL` while already in a call is an alias for `ADD` (matching real

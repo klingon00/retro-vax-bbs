@@ -164,7 +164,7 @@ call-admission surface is untested.
 
 ### 6. Self-dial is admitted by every gate
 
-**Status:** ✅ Fixed in `3ecd86b`. `admitLocked` rejects a self-target before any ring logic, on both Dial and Add, returning `%PHONE-E-SELF, You cannot phone yourself.` Uses `strings.EqualFold`, so `DIAL ALICE` typed by alice names the real cause instead of falling through to the misleading "ALICE is not connected". Confirmed live in both cases. Note the self-check is account-level, so one session of an account cannot dial another session of the same account — a deliberate policy call, recorded because it could not work anyway (the ring goes to the account-shared notify channel, so a nondeterministic session receives it, and the dialing session sits in `CallPending` where any keypress cancels before it could type ANSWER).
+**Status:** ✅ Fixed in `3ecd86b`. `admitLocked` rejects a self-target before any ring logic, on both Dial and Add, returning `%PHONE-E-SELF, You cannot phone yourself.` Uses `strings.EqualFold`, so `DIAL ALICE` typed by alice names the real cause instead of falling through to the misleading "ALICE is not connected". Confirmed live in both cases. Note the self-check is account-level, so one session of an account cannot dial another session of the same account — a deliberate policy call, recorded because it could not work anyway (the ring goes to the account-shared notify channel, so a nondeterministic session receives it, and the dialing session sits in `CallPending` where any keypress cancels before it could type ANSWER). **Update (2026-07-19): that parenthetical rationale is obsolete — `74a2ef5` removed the account-shared channel, so session-to-session dialling within one account would now route correctly. The policy survives its justification: the self-check remains account-level by choice, and changing it would need a fresh decision rather than just deleting a check.**
 
 **Severity: definite bug (low impact) · Confidence: high**
 
@@ -254,6 +254,15 @@ neither is resolved as a side effect of centralizing admission.*
 
 - **Where:** `internal/phone/call.go:487-496` (`sendEvent` no-ops on
   `reg.Notify == nil`), `call.go:112-123` (`Dial`'s ring goroutine).
+- **API update (2026-07-19), since this finding is still open and someone will
+  work from it:** `sendEvent` and `reg.Notify` no longer exist. The equivalent is
+  `registry.SendToSession`, which no-ops when the session is absent from
+  `sessionIndex` — the same silent-no-op shape, so **the finding stands
+  unchanged**. Confirm one thing when designing the fix: the resurrection
+  behaviour also survives, because the re-ring goroutine resolves targets through
+  `ringLocked` → `SessionsOf(username)` on every tick. A callee who disconnects and
+  reconnects gets a *new* session ID, but they are still found by **username**, so
+  the stale ring still reaches their new session — exactly as described above.
 - **What:** When the callee disconnects mid-ring, `sendEvent` silently no-ops
   forever; nothing closes `stopRing` and the `CallPending` call is never reaped.
 - **Failure scenario:** The caller's status line reads "Ringing X…" **indefinitely**
@@ -560,6 +569,19 @@ the mechanism, unquantified on the likelihood**
 ---
 
 ## Verified clean
+
+> **Note (2026-07-19):** this section records what was verified clean *at the time
+> of the 2026-07-13 read*, and its code references have since moved. Two bullets
+> need re-reading with that in mind: the `Dial` busy-check bullet describes the
+> pre-`3ecd86b` layout (the check now lives in `admitLocked`, shared with `Add`,
+> and busy became **per-session** in `74a2ef5` — a callee is busy only when every
+> session is in a call); and `sendEvent` no longer exists, having become
+> `registry.SendToSession`. **The lock-ordering conclusion in that bullet still
+> holds and is load-bearing** — the registry takes its own lock and never calls
+> back into `Calls`, so there is no inversion, which is what makes the ~15 in-lock
+> `SendToSession` call sites safe (see the diagnostic-logging entry in
+> open-questions.md for why those sites matter). The other two bullets are
+> unaffected.
 
 - **`Dial`'s busy check is correct for the case it covers** (`call.go:77-85`): it
   scans every active call for the callee with no reference to the dialer's state.
