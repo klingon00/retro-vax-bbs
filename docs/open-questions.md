@@ -362,14 +362,17 @@ Commands implemented: `APPROVE <user>`, `REJECT USER <user>`,
 Key implementation notes:
 
 - **KICK** stores a `func()` (calling `s.Exit(0)`) per session in the
-  registry at connect time. `reg.Kick(username)` calls it; the session
-  goroutine sees the connection close and tears down cleanly.
+  registry at connect time, keyed by sessionID. `reg.Kick(username)` calls
+  **every** session's func and returns how many it terminated; each session
+  goroutine sees its connection close and tears down cleanly. (Until
+  2026-07-20 the func was stored per *account*, so only the newest session
+  was closed — see the retired entry further down.)
 - **BAN** stores `banned_until` as a datetime. Permanent bans use a
   sentinel of year 2099 (`NeverExpires()`). Timed bans auto-lift on the
   user's next login attempt via `CheckAndLiftExpiredBan` in the auth
   handler — no admin action required for expiry.
-- **DELETE USER** kicks the session first (if online), then hard-deletes
-  the row. Distinct from BAN: the account is gone, the username is free.
+- **DELETE USER** kicks every session of the account first (if online),
+  then hard-deletes the row. Distinct from BAN: the account is gone, the username is free.
   Self-delete is blocked.
 - **LIST USERS** shows all accounts (pending, active, suspended/banned,
   locked) with role, effective status, and last login date. "Effective
@@ -688,7 +691,8 @@ containers don't get Unraid's automatic update-checking — pulling a new
 stop/re-Apply. Not relevant to this repo's own template today (single
 version tag, no updates yet to check for), but will matter the moment a
 second version ships, and is now documented in admin-guide.md's Docker/
-Unraid section for whenever the CA submission (item #2 below) makes this
+Unraid section for whenever the CA submission (the "Unraid Community
+Applications submission" item under "Next concrete steps" below) makes this
 automatic for most users.
 
 With this, the bootstrap-admin flow has been verified end-to-end on real
@@ -1549,6 +1553,12 @@ only; PHONE routing/admission are per-session and unaffected. Not fixed here.
 
 ## Known minor: KICK only terminates one session of a multi-session account (2026-07-19)
 
+> **✅ RETIRED 2026-07-20 — fixed.** `kick` moved from the per-account `entry` to
+> `sessionState`, `SetKick` is now keyed by sessionID rather than username, and
+> `Kick` fans out across every session and returns a count instead of a bool. The
+> original entry is preserved unchanged below, per this file's convention. Full
+> write-up: "KICK now terminates every session of an account (2026-07-20)".
+
 Pre-existing and **not** cosmetic, unlike its sibling above. `entry.kick` is a single
 func stored per *account*, and `SetKick` is called by `sessionMiddleware` on every
 session — so the most recently registered session overwrites the previous one's kill
@@ -1571,6 +1581,88 @@ tracks per-session state, so `kick` should move from `entry` to `sessionState` a
 `Kick(username)` should iterate every session of the account. Not attempted here
 because it is a moderation-behaviour change and wants its own testing, not a rider on
 a PHONE release.
+
+## KICK now terminates every session of an account (2026-07-20)
+
+Closes the entry retired above. `KICK <user>` closed exactly one session of a
+multi-session account while reporting unqualified success — the admin got
+`'bob' has been disconnected.` and a still-connected user, with nothing in the
+output or the audit log indicating a partial effect.
+
+**The root cause was a cardinality assumption that outlived its truth**, not a
+missing check. `entry.kick` was a single `func()` stored per *account*, and
+`sessionMiddleware` called `SetKick` on every session, so each new session
+overwrote its predecessor's hook. That was *correct* while one account meant one
+session; it silently became last-writer-wins the moment multi-session was
+supported, with no code change and no error. `74a2ef5` built the per-session
+substrate (`sessionState`, `sessionIndex`, threaded session IDs) but deliberately
+left `kick` alone, since a moderation-behaviour change wanted its own testing
+rather than riding a PHONE release.
+
+**The fix is a move, not a redesign** — and the choice of key is the point.
+`kick` moved from `entry` to `sessionState`, and `SetKick` is now keyed by
+**sessionID rather than username**. Re-keying is what actually closes this:
+an account-keyed setter has exactly one slot per account, so clobbering stays
+permanently reachable and the code merely has to be careful; addressing the
+session directly makes the bug **unrepresentable**. Same move `74a2ef5` made for
+`notify`, for the same reason.
+
+**`Kick` returns a count, not a bool.** The count is not cosmetic — the entire
+harm here was an unqualified success message, so a partial or empty effect has to
+be *visible*. `kickCommand` reports it (suppressed at 1 to keep the common case
+clean); sessions still inside the brief `Register`→`SetKick` window are skipped
+rather than counted, since a session that cannot be terminated must not be
+reported as terminated.
+
+**Behaviour change worth naming: a BAN or DELETE USER can now close N
+connections where it previously closed one.** Both call `Kick` and inherit the
+fan-out automatically, and both now append a session clause when non-zero. This
+is the intended behaviour — a ban that leaves the banned user connected on
+another session was never sensible — but it is a real change in what those two
+commands do to a live system, not just a KICK fix.
+
+**The audit log now records the outcome, not just the intent.**
+`requireAdminLogged` logs at dispatch time, before the result is known, which is
+precisely how the log came to agree with the admin's belief rather than with what
+happened. `kickCommand` emits a second line after `Kick` returns —
+`admin action: sysop KICK bob (2 session(s) terminated)` — including for zero,
+since "kicked nobody" is worth having. Same two-phase shape as `CREATE USER` /
+`RESET PASSWORD`, except those log their outcome from a sub-app and KICK has
+none. Scoped to KICK; BAN and DELETE keep single-line logging.
+
+**The lock discipline is load-bearing and now says so in code.** `Kick` collects
+the hooks under `RLock`, releases, and only then calls them. It must not be
+collapsed into one loop: `kick` is `s.Exit(0)`, whose teardown defers
+`reg.Unregister(sid)`, which takes the **write** lock. `sync.RWMutex` is neither
+reentrant nor upgradable, so invoking a hook while still holding `RLock` risks a
+writer blocking on a reader that is itself waiting on the writer. The single-hook
+version already copied-then-called for this reason; iterating generalises that
+discipline rather than introducing it. Left uncommented, a two-pass loop reads
+like something to tidy away.
+
+**Verification: unit-level, and deliberately seen red first.** This is a
+state/cardinality bug, not the session-interleaving-timing shape finding 11 was,
+so unit coverage was the agreed bar and no live SSH pass was required. There was
+previously **zero** test coverage of `Kick`/`SetKick` anywhere in the tree; six
+tests now cover fan-out, sibling non-clobbering, account isolation, the
+not-connected zero case, the nil-hook skip, and stale-ID tolerance.
+
+The two regression tests were confirmed **red against pre-fix semantics** before
+being accepted —
+`TestKick_TerminatesEverySessionOfAccount` reporting `got 1` of 2 sessions and
+`TestSetKick_DoesNotClobberSiblingSession` reporting the hook clobbered. Note how
+that had to be done: a literal `git stash` of `registry.go` does **not**
+demonstrate anything, because the new tests expect `Kick` to return `int` and the
+old signature returns `bool` — you get a compile error, not a failing test. The
+old *semantics* were reconstructed behind the new *signatures* (one shared slot
+on `entry`, last-writer-wins) so the real test could run and produce a real
+number. Worth remembering the next time a "confirm it fails first" step meets a
+signature change: the two halves of a fix can be separated, but only on purpose.
+`go build` / `go vet` / `go test ./... -race` / `gofmt -l` all clean.
+
+**Still not fixed, and still cosmetic:** WHO's per-account app label remains
+last-writer-wins across sessions (its own entry above). That one is display-only
+and was explicitly out of scope here.
 
 ## v0.4.0 release: command abbreviation shipped, published to GHCR + verified end-to-end (2026-07-13)
 
@@ -1745,7 +1837,8 @@ a receiver on it, `Answer` can only address `call.Caller` by username, and
 `handlePhoneEvent` **ignores `event.CallID`** — so session 1 misreads session 2's
 `EventAnswer` as a conference join, session 2 never leaves `CallPending`, and
 `app.go`'s "any key cancels the outbound ring" hangs up a real call. Now
-prioritized (Next concrete steps #3), not deferred open-endedly.
+prioritized (the "PHONE per-session event routing" item under "Next concrete
+steps"), not deferred open-endedly.
 
 **The lesson worth keeping, because it is about the verification and not the
 code.** The admission fix shipped `TestDial_AdmitsCallerWhoseAccountIsAlreadyInACall`
@@ -1792,7 +1885,10 @@ precisely *because* delivery is now per-session, not as the mechanism.
 
 **What changed (`74a2ef5`).** The registry splits per-account presence (`entry`:
 role, admin visibility, WHO/FINGER app label, KICK hook) from per-session delivery
-(`sessionState`: its own notify and done channels). `Register` mints an opaque
+(`sessionState`: its own notify and done channels). *(The KICK hook moved to
+`sessionState` on 2026-07-20 — see "KICK now terminates every session of an
+account" below. This sentence is accurate as a record of `74a2ef5`, which
+deliberately left `kick` where it was.)* `Register` mints an opaque
 monotonic session ID and returns it, threaded middleware → context → lobby → PHONE
 → `Participant.SessionID`, so a call membership belongs to a session rather than an
 account. `Events`/`SendToSession`/`SessionsOf`/`Connected` replace the per-account
@@ -1899,12 +1995,20 @@ default, it is still silent.
 1. ✅ **VAX/VMS command abbreviation** — shortest unambiguous prefix (DCL style).
    **Done: implemented 2026-07-12, live-SSH-verified 2026-07-13** (see the two
    entries above). No further work outstanding on this feature.
-2. Unraid Community Applications submission — icon asset done (`icon.png`
+2. ✅ **KICK multi-session fix.** **Done 2026-07-20** — `kick` moved from the
+   per-account `entry` to `sessionState`, `SetKick` re-keyed by sessionID, `Kick`
+   fans out across every session and returns a count, and the audit log gained an
+   outcome line. BAN and DELETE USER inherit the fan-out. See "KICK now
+   terminates every session of an account (2026-07-20)" above. Unit-verified with
+   the two regression tests confirmed red against pre-fix semantics first; no live
+   SSH pass required for this one (state/cardinality bug, not an interleaving
+   one). No further work outstanding.
+3. Unraid Community Applications submission — icon asset done (`icon.png`
    at repo root, 256x256 transparent, wired into `unraid-template.xml`'s
    `<Icon>` as of 2026-07-04); CA repo listing itself still open. Gated on
    the manual GHCR steps above, which are confirmed working end-to-end
    (`docker pull` succeeding anonymously). Ops-only, no coding.
-3. ✅ **PHONE per-session event routing** (finding 11). **Done: fixed in
+4. ✅ **PHONE per-session event routing** (finding 11). **Done: fixed in
    `74a2ef5`, live-verified 2026-07-19** by a full two-session SSH pass (S0–S6) —
    see the "PHONE per-session event routing" entry above. The registry now splits
    per-account presence from per-session delivery. The `CallID`-filter shortcut was
@@ -1925,10 +2029,11 @@ default, it is still silent.
    - **Remaining from the release, not blocking:** push the four local commits and
      tag `v0.4.1`, framed as *"closes findings 11 and 12; records 13 and 14 as
      open"* rather than "audit fully closed".
-4. **PHONE call-state: one deferred design question** (finding 9 of
+5. **PHONE call-state: one deferred design question** (finding 9 of
    `docs/audits/audit-2026-07-13-phone-call-admission.md`, deferred 2026-07-14).
    **Finding 10 was also listed here and is now retired** — answered by the
-   per-session routing work on 2026-07-19, see step 3; its entry below is kept for
+   per-session routing work on 2026-07-19, see the "PHONE per-session event
+   routing" item above; its entry below is kept for
    the record with that disposition noted. Finding 9 is a genuine design decision,
    not a missing guard, which is why the admission fix deliberately left it alone:
    - **Callee disconnects mid-ring** — the caller sits on "Ringing X…" forever
@@ -1951,7 +2056,7 @@ default, it is still silent.
      with two sessions one account can be in two calls, and teardown may hang up
      the wrong one. Unaffected by the admission fix by design (the predicate never
      consults the *caller's* membership, precisely so multi-session keeps working).
-5. **Dependency refresh** — deferred as its own task (flagged 2026-07-13).
+6. **Dependency refresh** — deferred as its own task (flagged 2026-07-13).
    `go list -u -m all` shows nearly the whole module tree has newer versions,
    including major bumps: `charmbracelet/bubbles v0.21.0 → v1.0.0` (a direct dep —
    the `textarea` behind SET PLAN) and `charmbracelet/log v0.4.1 → v1.0.0`, plus

@@ -237,10 +237,14 @@ feature — driven end-to-end over real SSH, not merely permitted by a predicate
 so explicitly, and finding 11 of
 `docs/audits/audit-2026-07-13-phone-call-admission.md` records why.)
 
-**Presence is per-account; event delivery is per-session.** The registry splits
-into an `entry` per account — role, admin visibility, the WHO/FINGER app label,
-the KICK hook — and a `sessionState` per session, each owning its **own** notify
-and done channels. That split is the whole fix: `notify` is a single-consumer
+**Presence is per-account; event delivery and session termination are
+per-session.** The registry splits into an `entry` per account — role, admin
+visibility, the WHO/FINGER app label — and a `sessionState` per session, each
+owning its **own** notify and done channels plus its **own** KICK hook. (The
+KICK hook sat on the per-account `entry` until 2026-07-20; because there was one
+slot per account, each new session overwrote the previous session's hook and
+`KICK` closed only whichever registered last. See open-questions.md's "KICK now
+terminates every session of an account".) That split is the whole fix: `notify` is a single-consumer
 queue, so one channel shared by an account's sessions meant every control event
 was raced for and consumed by exactly one of them, at random. Sessions are
 identified by an opaque monotonic ID minted at `Register` and threaded

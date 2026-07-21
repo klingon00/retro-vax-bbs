@@ -392,7 +392,7 @@ logged. See **Logging** below for the exact format.
 
 | Command | Description |
 |---|---|
-| `DELETE USER <username>` | Permanently remove an account and free the username. Cannot be used on your own account, or on the last usable admin account. |
+| `DELETE USER <username>` | Permanently remove an account and free the username. Disconnects **all** their sessions first. Cannot be used on your own account, or on the last usable admin account. |
 | `UNLOCK <username>` | Clear a login lockout (triggered after 5 consecutive failed password attempts; normally lifts after 15 minutes). |
 
 ### Password management
@@ -410,9 +410,17 @@ not admin-only.
 
 | Command | Description |
 |---|---|
-| `KICK <username>` | Immediately disconnect a user's active session. They can reconnect right away. Use for troubleshooting or asking someone to reconnect. |
-| `BAN <username> <duration>` | Suspend an account for the specified duration. Disconnects them if currently online. See duration format below. Refused if the target is the last usable admin account (self-bans are fine as long as another usable admin remains). |
+| `KICK <username>` | Immediately disconnect **all** of a user's active sessions, and report how many were closed. They can reconnect right away. Use for troubleshooting or asking someone to reconnect. |
+| `BAN <username> <duration>` | Suspend an account for the specified duration. Disconnects **all** their sessions if currently online. See duration format below. Refused if the target is the last usable admin account (self-bans are fine as long as another usable admin remains). |
 | `UNBAN <username>` | Lift a ban and restore the account to active. |
+
+**A note on multiple sessions.** One account can hold several SSH sessions at
+once — this is normal and expected (PHONE in one window, something else in
+another), and the rate limiter's burst default is set to accommodate it.
+`KICK`, `BAN`, and `DELETE USER` all terminate **every** session of the target
+account, not just one, and `KICK` tells you how many it closed. If you see
+`'bob' has been disconnected (3 sessions).`, that is three real connections
+ending, not a display quirk.
 
 **Ban duration format:**
 
