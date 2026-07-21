@@ -248,7 +248,34 @@ neither is resolved as a side effect of centralizing admission.*
 
 ### 9. Callee disconnects mid-ring → caller hangs on "Ringing X…" forever
 
-**Status:** ⏸️ Deferred — needs a behavior decision, not just a guard.
+**Status:** ✅ **Fixed 2026-07-20** in `e0b7855` (`fix: reap PHONE rings when no
+session of the callee can receive them`). The behaviour decision it was waiting
+on was made: **immediate teardown on both sides, no grace period, no reconnect
+window.** Rationale recorded in `design-doc.md` — a dropped carrier on real
+VAX/VMS terminal/modem hardware was an immediate unconditional hangup, so this is
+the period-authentic choice as well as the simple one.
+
+New `Calls.ReapUnreachableRings(username)`, called from session teardown *after*
+`registry.Unregister`. It could not live in `HangupSession`, and the reason is
+the thing worth remembering: **a callee who is being rung is not a participant**
+(`Dial` adds only the caller; the callee joins on `Answer`), so a
+participant-keyed teardown structurally never sees this case — which is why the
+ring survived every prior hardening pass, including `74a2ef5`.
+
+Teardown triggers on **zero ringable sessions**, and the caller's message is
+chosen by re-checking **connected**: `EventCalleeGone` when the account really is
+gone, `EventCalleeUnavailable` when it is still online with every session busy
+elsewhere. Both are distinct types (precedent: `EventAnswerElsewhere`) and both
+call `goIdle`. Outstanding `pendingAdds` rings are reaped on the same rule — not
+optional, since `admitLocked` scans them too and a stale entry would keep the
+callee un-dialable regardless.
+
+Verified at the bar this finding's interleaving shape demanded: 7 unit tests (6
+confirmed red against pre-fix behaviour), plus a live SSH pass scoring **16/16 on
+the fix and 11/16 pre-fix** with debug logging off. Harness kept at `test/live/`.
+
+*Superseded status line, kept for the record:* ⏸️ Deferred — needs a behavior
+decision, not just a guard.
 
 **Severity: definite bug (low-medium impact) · Confidence: high**
 
@@ -486,7 +513,17 @@ fixed and re-verified live**
 ### 13. `EventHangup` in `CallPending` never returns the session to idle, unlike `EventReject`
 
 **Status:** 🔵 Open — **recorded, not fixed, and reachability not established.**
-Found by reading, not by reproducing. Deliberately written down rather than
+Found by reading, not by reproducing.
+
+> **Note (2026-07-20):** finding 9's fix (`e0b7855`) deliberately routes *around*
+> this rather than closing it. The two new event types it introduces
+> (`EventCalleeGone`, `EventCalleeUnavailable`) each call `goIdle()` in their own
+> handler, so the reap path cannot leave a session stranded in `CallPending`. No
+> new `EventHangup`→`CallPending` route was added, so this finding is neither
+> worsened nor fixed, and the reachability question below is untouched. Scoping
+> it out was a deliberate call: the entry itself notes that establishing
+> reachability is the bulk of the work, and adding a one-line `goIdle()` blind
+> would have been an unverified change riding along with a verified one. Deliberately written down rather than
 carried in a conversation: it was noticed while chasing a different symptom, and
 that is exactly the kind of observation that evaporates when attention moves on.
 

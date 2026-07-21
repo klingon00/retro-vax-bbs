@@ -282,6 +282,48 @@ first-answer-wins is enforced by the call layer rather than by UI timing.
 was a policy question, and this design answers it: the enforced unit is the
 session, and an account may hold as many concurrent calls as it has sessions.
 
+### Mid-ring disconnect — a ring lives only while something can receive it
+
+**A ring is reaped the moment no session of the callee can receive it.** Teardown
+is immediate on both sides: no grace period, no reconnect window, no timer state.
+
+This is the period-authentic behaviour as well as the pragmatic one. On real
+VAX/VMS the terminal/modem layer had no concept of a grace period — a dropped
+carrier was an immediate, unconditional hangup, and everything above it simply
+found the line gone. Holding a ring open for a callee who might come back would
+be the modern instinct, not the historical one.
+
+**The reap cannot live in the normal session teardown, and the reason is
+structural.** A callee who is merely being rung is *not* a participant: `Dial`
+puts only the caller into `call.participants`, and the callee becomes one only on
+`Answer`. `HangupSession` scans participants by session ID, so it never sees a
+rung-but-unanswered callee at all. `ReapUnreachableRings` is therefore a separate
+step keyed by **username**, reading the pending call's `Callee` field and the
+outstanding `pendingAdds`, and it runs *after* `Unregister` so the session count
+it consults is accurate.
+
+**Two causes, two messages — the split is the point.** "No session can be rung"
+happens two ways, and they are not the same thing to the person waiting:
+
+| Condition | Meaning | Event |
+|---|---|---|
+| no sessions at all | the callee really did disconnect | `EventCalleeGone` |
+| sessions exist, none ringable | still logged in, every session busy elsewhere | `EventCalleeUnavailable` |
+
+Teardown triggers on *zero ringable*; the message is selected by re-checking
+*connected*. Reporting "disconnected" for someone still online would be a
+falsehood of the same family as finding 12's misattribution, and it is designed
+out here rather than corrected later. As with `EventAnswerElsewhere`, these are
+distinct types rather than one type plus a discriminator field.
+
+**Consequences that motivated this beyond the caller's stuck status line.** A
+stale ring made the callee un-dialable by *anyone* (`admitLocked` refuses a callee
+with any ring outstanding), and the re-ring goroutine resolves its target by
+username — so a reconnecting user, with a brand-new session ID, was rung for a
+call placed before they logged in. Reaping clears both at once. Outstanding
+conference `ADD` rings are reaped on the same rule; the active call survives, only
+the ring dies.
+
 ---
 
 ## SET PLAN — inline profile editor

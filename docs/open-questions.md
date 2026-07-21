@@ -1990,6 +1990,93 @@ defect in its own right, not merely a visibility gap: it is tracked as **finding
 out. Logging makes it visible when the flag is on; with the flag off, which is the
 default, it is still silent.
 
+## PHONE mid-ring disconnect — finding 9 resolved and live-verified (2026-07-20)
+
+Closes audit finding 9, which had been deferred since 2026-07-14 because it needed
+a **behaviour decision**, not a guard. The decision: **immediate teardown on both
+sides — no grace period, no reconnect window, no new timer state.**
+
+**The rationale is period-authentic, not just pragmatic.** On real VAX/VMS the
+terminal/modem layer had no concept of a grace period: a dropped carrier was an
+immediate, unconditional hangup and everything above simply found the line gone.
+Holding a ring open for a callee who *might* come back is the modern instinct, not
+the historical one. Recorded in design-doc.md's new "Mid-ring disconnect"
+subsection.
+
+**The structural finding is the part worth not relearning.** The bug was not a
+missing check inside session teardown. **A callee who is being rung is not a
+participant** — `Dial` puts only the caller into `call.participants`, and the
+callee becomes one only on `Answer`. `HangupSession` scans participants by session
+ID, so it never saw a rung-but-unanswered callee at all. That is why the ring
+survived every previous teardown-hardening pass, `74a2ef5` included: not an
+oversight in the teardown, but a teardown that structurally could not observe the
+case. The fix is a separate step, `ReapUnreachableRings`, keyed by **username**
+and reading the pending call's `Callee` plus `pendingAdds`.
+
+**Two causes, two messages.** "No session can be rung" happens two ways and they
+are not the same thing to the person waiting: the callee's last session went away
+(`EventCalleeGone`), or they are still logged in with every session busy elsewhere
+(`EventCalleeUnavailable`). Teardown triggers on *zero ringable*; the message is
+selected by re-checking *connected*. Defaulting both to "disconnected" would say
+something false about a user who is still online — the same family of defect as
+finding 12's misattribution, designed out here rather than corrected later. Two
+distinct types rather than one plus a discriminator field, following
+`EventAnswerElsewhere`; the cost of the alternative is visible in `EventHangup`,
+whose overloaded `Callee` convention is what finding 13 is a consequence of.
+
+**Ordering is load-bearing.** The reap must run *after* `registry.Unregister`, or
+the departing session still counts as ringable and nothing is reaped.
+`sessionMiddleware`'s teardown became **one defer with an explicit sequence**
+rather than reversed-LIFO defers — a third defer would have made readers invert
+three registrations to recover the order.
+
+**Verification, and the part that actually mattered.** 7 unit tests, 6 confirmed
+red against pre-fix behaviour (the 7th is the over-reach guard and correctly
+passes both ways), plus a live SSH pass: **16/16 on the fix, 11/16 on a pre-fix
+binary**, with `PHONE_DEBUG_LOG` off so the widened-`c.mu` caveat does not apply.
+
+**The live harness caught two defects in itself, and that is the lesson.** Its
+first version scored **14/16 against knowingly-broken code**. Two scenarios proved
+nothing: (a) a keystroke sent at the caller to test something else had *cancelled
+the pending ring* through the pre-existing "any key cancels in `CallPending`"
+path, destroying the stale state the next check was about to probe; and (b) a
+1.5-second wait for a "resurrected ring" could never fire, because `RingInterval`
+is 10 seconds. Both are properties of the system under test, invisible from
+reading the harness. **A green harness on fixed code is consistent with a harness
+that asserts nothing** — running it against the broken build is the only thing
+that rules that out, and here it did.
+
+**Harness kept as standing infrastructure at `test/live/`** (`livelib.py`,
+`finding9_mid_ring_disconnect.py`, `README.md`) — it needs a live server and a
+seeded DB, so it is deliberately outside `go test`. Its README records the five
+behaviours that cost real debugging time, including the two above.
+
+**Finding 13 is deliberately still open.** The new event types route *around* it
+(each calls `goIdle()` in its own handler, so the reap path cannot strand a
+session in `CallPending`), and no new `EventHangup`→`CallPending` route was added,
+so it is neither worsened nor fixed. Closing it blind would have meant an
+unverified one-line change riding along with a verified fix.
+
+## Known minor: zero-ringable reached with no disconnect (2026-07-20)
+
+Out of scope for finding 9 and recorded here rather than left as a passing
+mention. The reap is driven from **session teardown**, so it only ever runs when a
+session departs. The same dead-ring state is reachable without anyone
+disconnecting: X is being rung, ignores it, and dials someone else — X's session
+becomes a participant of its own pending call and therefore stops being ringable,
+so the original caller's ring can no longer land on anybody.
+
+Nothing reaps that, because no teardown occurs. The caller sits on "Ringing X…"
+until they press a key, and X stays un-dialable to third parties while the stale
+ring stands. Strictly narrower than finding 9 was: X is present and will free up,
+and the re-ring goroutine recomputes ringable sessions every tick, so the ring
+lands the moment X's other call ends.
+
+Not fixed because the trigger is different in kind — closing it means reaping on
+*call-state transitions* (a session becoming non-ringable) rather than on session
+departure, which is a broader change than finding 9 called for and wants its own
+decision about whether a ring should survive the callee getting briefly busy.
+
 ## Next concrete steps
 
 1. ✅ **VAX/VMS command abbreviation** — shortest unambiguous prefix (DCL style).
@@ -2029,13 +2116,18 @@ default, it is still silent.
    - **Remaining from the release, not blocking:** push the four local commits and
      tag `v0.4.1`, framed as *"closes findings 11 and 12; records 13 and 14 as
      open"* rather than "audit fully closed".
-5. **PHONE call-state: one deferred design question** (finding 9 of
+5. ✅ **PHONE call-state: the deferred design question is answered** (finding 9 of
    `docs/audits/audit-2026-07-13-phone-call-admission.md`, deferred 2026-07-14).
-   **Finding 10 was also listed here and is now retired** — answered by the
-   per-session routing work on 2026-07-19, see the "PHONE per-session event
-   routing" item above; its entry below is kept for
-   the record with that disposition noted. Finding 9 is a genuine design decision,
-   not a missing guard, which is why the admission fix deliberately left it alone:
+   **Done 2026-07-20** in `e0b7855`: immediate teardown on both sides, with the
+   caller told *which* of two causes applied (`EventCalleeGone` vs
+   `EventCalleeUnavailable`). Live-verified 16/16 on the fix against 11/16
+   pre-fix — see "PHONE mid-ring disconnect — finding 9 resolved and
+   live-verified (2026-07-20)" above. **Finding 10 was also listed here and is
+   now retired** — answered by the per-session routing work on 2026-07-19, see
+   the "PHONE per-session event routing" item above; its entry below is kept for
+   the record with that disposition noted. The original framing of finding 9 is
+   preserved below, since it explains why the admission fix deliberately left it
+   alone:
    - **Callee disconnects mid-ring** — the caller sits on "Ringing X…" forever
      with no "X has disconnected", and a reconnecting X gets rung for a call
      placed before they logged in. Needs a behavior call (tear down and notify
