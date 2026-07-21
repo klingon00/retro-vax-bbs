@@ -291,20 +291,38 @@ func sessionMiddleware(db *store.Store, reg *registry.Registry, calls *phone.Cal
 			// own, and Kick fans out across all of them.
 			reg.SetKick(sid, func() { s.Exit(0) })
 
-			// Teardown cleanup. Go runs defers last-registered-first (LIFO), so
-			// this ordering is deliberate: Unregister is registered FIRST and
-			// HangupSession SECOND, which means at session end HangupSession
-			// runs BEFORE Unregister. HangupSession removes THIS session from
-			// any active PHONE call — closing its IncomingChar to reap the
-			// waitForChar goroutine and notifying the other participants — and
-			// Unregister then removes this session's registry state and closes
-			// its done channel, reaping the waitForPhoneEvent goroutine. Both
-			// are keyed by sessionID so a multi-session account's other sessions
-			// and their calls are untouched. A mid-call SSH *drop* runs neither
-			// HANGUP nor EXIT, so these defers are the only thing that tears
-			// down a call and its goroutines on an abrupt disconnect.
-			defer reg.Unregister(sid)
-			defer calls.HangupSession(sid)
+			// Teardown cleanup. A mid-call SSH *drop* runs neither HANGUP nor
+			// EXIT, so this is the only thing that tears down a session's calls
+			// and goroutines on an abrupt disconnect.
+			//
+			// One defer with an explicit sequence, deliberately, rather than
+			// three separate defers: the order below is load-bearing and three
+			// defers would force a reader to mentally invert LIFO registration
+			// to recover it. (This was previously two defers whose reversed
+			// registration needed a paragraph to explain; the sequence now
+			// states what that paragraph described.)
+			//
+			// The order matters at both steps:
+			//
+			//  1. HangupSession first — removes THIS session from any call it is
+			//     a participant in, closing its IncomingChar to reap the
+			//     waitForChar goroutine and notifying the other participants.
+			//     Keyed by sessionID, so a multi-session account's other
+			//     sessions and their calls are untouched.
+			//  2. Unregister second — drops the session's registry state and
+			//     closes its done channel, reaping waitForPhoneEvent.
+			//  3. ReapUnreachableRings LAST, and it must be last: it decides
+			//     whether any session can still receive a ring aimed at this
+			//     ACCOUNT, which is only accurate once Unregister has removed
+			//     this session. Run earlier it would still see the departing
+			//     session as ringable and reap nothing. This covers what step 1
+			//     structurally cannot — a callee who is only being rung is not
+			//     yet a participant, so HangupSession never sees them.
+			defer func() {
+				calls.HangupSession(sid)
+				reg.Unregister(sid)
+				calls.ReapUnreachableRings(s.User())
+			}()
 			next(s)
 		}
 	}

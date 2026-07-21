@@ -528,3 +528,242 @@ func TestHangup_PendingRingCancellationNamesInviterNotLastToLeave(t *testing.T) 
 		t.Fatalf("cancellation must name the inviter: want Caller=alice, got %q", cancel.Caller)
 	}
 }
+
+// --- Finding 9: callee disconnects mid-ring ---------------------------------
+//
+// The reap runs from session teardown AFTER registry.Unregister, so these tests
+// mirror that order: Unregister the departing session, then ReapUnreachableRings
+// on the account. Calling them the other way round reproduces the pre-fix
+// behaviour (the departing session still looks ringable and nothing is reaped),
+// which is what several of these assertions pin.
+
+func TestReap_SingleSessionCalleeDisconnects(t *testing.T) {
+	reg := registry.New()
+	aliceSid := reg.Register("alice", "user", false, "LOBBY")
+	bobSid := reg.Register("bob", "user", false, "LOBBY")
+	calls := NewCalls(reg)
+
+	call, _, err := calls.Dial(aliceSid, "alice", "bob")
+	if err != nil {
+		t.Fatalf("Dial: %v", err)
+	}
+
+	reg.Unregister(bobSid)
+	// Premise check: this test is only meaningful if bob really is fully gone.
+	// Without it a broken Unregister/SessionsOf upstream could leave bob
+	// "connected" and the EventCalleeGone assertion below would be testing
+	// something other than what its name claims.
+	if reg.Connected("bob") {
+		t.Fatal("premise broken: bob should have no sessions left after Unregister")
+	}
+	calls.ReapUnreachableRings("bob")
+
+	if _, ok := calls.calls[call.ID]; ok {
+		t.Fatal("pending call should be gone once the only callee session disconnects")
+	}
+	evs := drainEvents(t, reg, aliceSid)
+	if !containsType(evs, registry.EventCalleeGone) {
+		t.Fatalf("caller should be told the callee is gone, got %v", evs)
+	}
+	if containsType(evs, registry.EventCalleeUnavailable) {
+		t.Error("a full disconnect must not be reported as merely unavailable")
+	}
+}
+
+// TestReap_SurvivingSessionKeepsRinging is the over-reach guard: one session of
+// a multi-session callee dropping must NOT kill a ring the others can answer.
+func TestReap_SurvivingSessionKeepsRinging(t *testing.T) {
+	reg := registry.New()
+	aliceSid := reg.Register("alice", "user", false, "LOBBY")
+	bobSid1 := reg.Register("bob", "user", false, "LOBBY")
+	reg.Register("bob", "user", false, "LOBBY") // second session, stays connected
+	calls := NewCalls(reg)
+
+	call, _, err := calls.Dial(aliceSid, "alice", "bob")
+	if err != nil {
+		t.Fatalf("Dial: %v", err)
+	}
+	drainEvents(t, reg, aliceSid) // clear the dial-time events
+
+	reg.Unregister(bobSid1)
+	calls.ReapUnreachableRings("bob")
+
+	if _, ok := calls.calls[call.ID]; !ok {
+		t.Fatal("ring must survive while another session of the callee can still answer")
+	}
+	if evs := drainEvents(t, reg, aliceSid); len(evs) != 0 {
+		t.Errorf("caller should not be notified while the ring is still live, got %v", evs)
+	}
+}
+
+func TestReap_LastSessionOfSeveralDisconnects(t *testing.T) {
+	reg := registry.New()
+	aliceSid := reg.Register("alice", "user", false, "LOBBY")
+	bobSid1 := reg.Register("bob", "user", false, "LOBBY")
+	bobSid2 := reg.Register("bob", "user", false, "LOBBY")
+	calls := NewCalls(reg)
+
+	call, _, err := calls.Dial(aliceSid, "alice", "bob")
+	if err != nil {
+		t.Fatalf("Dial: %v", err)
+	}
+
+	reg.Unregister(bobSid1)
+	calls.ReapUnreachableRings("bob")
+	if _, ok := calls.calls[call.ID]; !ok {
+		t.Fatal("ring should still be live after only the first session leaves")
+	}
+
+	reg.Unregister(bobSid2)
+	calls.ReapUnreachableRings("bob")
+	if _, ok := calls.calls[call.ID]; ok {
+		t.Fatal("ring should be reaped once the last session leaves")
+	}
+	if !containsType(drainEvents(t, reg, aliceSid), registry.EventCalleeGone) {
+		t.Error("caller should be told the callee is gone")
+	}
+}
+
+// TestReap_ConnectedButUnringableIsUnavailable is the discriminating test for
+// the two-cause split. bob still has a session, but it is busy in another call,
+// so no session can be rung. Written as the "gone" case it would pass either way
+// and prove nothing — the same trap as finding 12's leave order.
+func TestReap_ConnectedButUnringableIsUnavailable(t *testing.T) {
+	reg := registry.New()
+	aliceSid := reg.Register("alice", "user", false, "LOBBY")
+	bobSid1 := reg.Register("bob", "user", false, "LOBBY")
+	bobSid2 := reg.Register("bob", "user", false, "LOBBY")
+	carolSid := reg.Register("carol", "user", false, "LOBBY")
+	calls := NewCalls(reg)
+
+	// bob's second session takes a call with carol, so it stops being ringable.
+	if _, _, err := calls.Dial(bobSid2, "bob", "carol"); err != nil {
+		t.Fatalf("bob->carol Dial: %v", err)
+	}
+	// alice rings bob; only bobSid1 is ringable.
+	call, _, err := calls.Dial(aliceSid, "alice", "bob")
+	if err != nil {
+		t.Fatalf("alice->bob Dial: %v", err)
+	}
+	_ = carolSid
+
+	// bob's ringable session drops. bob is STILL CONNECTED via bobSid2.
+	reg.Unregister(bobSid1)
+	// Premise checks, both load-bearing for what this test claims to prove: bob
+	// must still be connected (else this is just the "gone" case wearing the
+	// wrong name) AND must have no ringable session (else nothing should reap at
+	// all and the assertions below would be vacuous).
+	if !reg.Connected("bob") {
+		t.Fatal("premise broken: bob should still be connected via his second session")
+	}
+	// Take c.mu: ringableSessionsLocked requires it, and Dial's re-ring
+	// goroutines are live for the duration of this test.
+	calls.mu.Lock()
+	ringable := len(calls.ringableSessionsLocked("bob"))
+	calls.mu.Unlock()
+	if ringable != 0 {
+		t.Fatalf("premise broken: bob should have 0 ringable sessions, got %d", ringable)
+	}
+	calls.ReapUnreachableRings("bob")
+
+	if _, ok := calls.calls[call.ID]; ok {
+		t.Fatal("ring should be reaped once no session is ringable")
+	}
+	evs := drainEvents(t, reg, aliceSid)
+	if !containsType(evs, registry.EventCalleeUnavailable) {
+		t.Fatalf("a still-connected callee must be reported unavailable, got %v", evs)
+	}
+	if containsType(evs, registry.EventCalleeGone) {
+		t.Error("must not claim a still-connected callee disconnected")
+	}
+}
+
+// TestReap_RestoresDialability pins the requirement that motivated this beyond
+// the caller's stuck status line: a stale ring made the callee un-dialable by
+// anyone, so reaping has to clear ErrBeingRung too.
+func TestReap_RestoresDialability(t *testing.T) {
+	reg := registry.New()
+	aliceSid := reg.Register("alice", "user", false, "LOBBY")
+	bobSid := reg.Register("bob", "user", false, "LOBBY")
+	daveSid := reg.Register("dave", "user", false, "LOBBY")
+	calls := NewCalls(reg)
+
+	if _, _, err := calls.Dial(aliceSid, "alice", "bob"); err != nil {
+		t.Fatalf("Dial: %v", err)
+	}
+	// While the ring stands, bob is refused to everyone else.
+	if _, _, err := calls.Dial(daveSid, "dave", "bob"); !errors.Is(err, ErrBeingRung) {
+		t.Fatalf("expected ErrBeingRung while the ring stands, got %v", err)
+	}
+
+	reg.Unregister(bobSid)
+	calls.ReapUnreachableRings("bob")
+
+	// bob reconnects with a NEW session id and must be dialable at once.
+	newBobSid := reg.Register("bob", "user", false, "LOBBY")
+	if _, _, err := calls.Dial(daveSid, "dave", "bob"); err != nil {
+		t.Fatalf("bob should be dialable immediately after reconnecting, got %v", err)
+	}
+	_ = newBobSid
+}
+
+// TestReap_ConferenceRingCancelledCallSurvives covers the ADD half. It is not
+// optional: admitLocked scans pendingAdds as well as pending calls, so a stale
+// entry here would keep the callee un-dialable even with the pending-call half
+// reaped.
+func TestReap_ConferenceRingCancelledCallSurvives(t *testing.T) {
+	calls, call, callerP, calleeP := dialAndAnswer(t)
+	reg := calls.reg
+
+	carolSid := reg.Register("carol", "user", false, "LOBBY")
+	if err := calls.Add(call.ID, "alice", "carol"); err != nil {
+		t.Fatalf("Add: %v", err)
+	}
+
+	reg.Unregister(carolSid)
+	calls.ReapUnreachableRings("carol")
+
+	if _, ok := calls.pendingAdds[addKey{callID: call.ID, callee: "carol"}]; ok {
+		t.Fatal("the conference ring should be cancelled when its target disconnects")
+	}
+	if _, ok := calls.calls[call.ID]; !ok {
+		t.Fatal("the active conference call itself must survive its ADD target leaving")
+	}
+	if len(call.participants) != 2 {
+		t.Errorf("both original participants should remain, got %d", len(call.participants))
+	}
+	// Both participants are told, so the "alice is ringing carol" note clears.
+	for _, p := range []*Participant{callerP, calleeP} {
+		if !containsType(drainEvents(t, reg, p.SessionID), registry.EventCalleeGone) {
+			t.Errorf("participant %s should be told the ring target is gone", p.Username)
+		}
+	}
+	// And carol is dialable again rather than stuck as "already being rung".
+	newCarolSid := reg.Register("carol", "user", false, "LOBBY")
+	if _, _, err := calls.Dial(newCarolSid, "carol", "alice"); err != nil && errors.Is(err, ErrBeingRung) {
+		t.Error("carol must not still be marked as being rung after the reap")
+	}
+}
+
+// TestReap_ClosesCallerIncomingChar pins the goroutine-reaping half: the caller
+// leaves a reaped pending call via goIdle in its event handler, not via Hangup,
+// so nothing else would close its IncomingChar and its waitForChar goroutine
+// would leak. Same reasoning as Reject's pending-call teardown.
+func TestReap_ClosesCallerIncomingChar(t *testing.T) {
+	reg := registry.New()
+	aliceSid := reg.Register("alice", "user", false, "LOBBY")
+	bobSid := reg.Register("bob", "user", false, "LOBBY")
+	calls := NewCalls(reg)
+
+	_, callerP, err := calls.Dial(aliceSid, "alice", "bob")
+	if err != nil {
+		t.Fatalf("Dial: %v", err)
+	}
+
+	reg.Unregister(bobSid)
+	calls.ReapUnreachableRings("bob")
+
+	if !isChanClosed(callerP.IncomingChar) {
+		t.Fatal("the caller's IncomingChar must be closed so waitForChar is reaped")
+	}
+}

@@ -602,6 +602,124 @@ func (c *Calls) HangupSession(sessionID string) {
 	}
 }
 
+// ReapUnreachableRings tears down every outstanding ring aimed at username once
+// no session of theirs can receive it, and tells the ringing side why. Called
+// from the session-teardown path AFTER registry.Unregister, so SessionsOf and
+// Connected already reflect the departure.
+//
+// This exists because HangupSession structurally cannot cover this case. A
+// callee who is being rung is NOT a participant — Dial puts only the caller into
+// call.participants, and the callee becomes one only on Answer — so
+// HangupSession's participant scan finds nothing for them and the ring outlives
+// their disconnect. That is what left a caller on "Ringing X…" indefinitely and,
+// worse, left X un-dialable by anyone (admitLocked refuses a callee with any
+// ring outstanding) while a re-ring goroutine resolved them by USERNAME on every
+// tick — so a reconnecting X, with a brand-new session ID, was still found and
+// rung for a call placed before they logged in. Finding 9 of
+// docs/audits/audit-2026-07-13-phone-call-admission.md.
+//
+// Teardown triggers on zero RINGABLE sessions, but the message is chosen by
+// re-checking CONNECTED, because zero-ringable has two causes and they are not
+// the same thing to the person waiting:
+//
+//   - no sessions at all      -> EventCalleeGone: they really did disconnect.
+//   - sessions, none ringable -> EventCalleeUnavailable: still logged in, but
+//     every session is busy in another call.
+//
+// Defaulting both to "disconnected" would tell the caller something false about
+// a user who is still online. The direct precedent is EventAnswerElsewhere,
+// introduced for exactly this reason: a distinct type so a retracted ring is not
+// reported as the caller cancelling. Same shape here — mechanism correct,
+// message false — and it is designed out rather than fixed later, so unlike
+// findings 12 and 13 there is no defect on record to point at.
+func (c *Calls) ReapUnreachableRings(username string) {
+	// LIFO-deferred emit, same pattern and same reason as Dial/Answer/Add/
+	// HangupSession: registered before the unlock defer so it runs after it,
+	// keeping the log write outside c.mu. Accumulated across both loops because
+	// one departure can reap several rings.
+	var logLines []string
+	defer func() {
+		for _, l := range logLines {
+			debuglog.Logf("%s", l)
+		}
+	}()
+
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
+	// Nothing is unreachable while a ringable session remains: with several
+	// sessions, one dropping must NOT kill a ring the others can still answer.
+	if len(c.ringableSessionsLocked(username)) > 0 {
+		return
+	}
+
+	// Classify once: which of the two events this reap sends. Evaluated after
+	// the ringable check so it describes why the ring can no longer land.
+	eventType := registry.EventCalleeGone
+	if c.reg.Connected(username) {
+		eventType = registry.EventCalleeUnavailable
+	}
+
+	// 1. Pending DIAL rings: the call exists only for this ring, so it goes.
+	for id, call := range c.calls {
+		if call.State != CallPending || call.Callee != username {
+			continue
+		}
+		close(call.stopRing)
+		// Same teardown shape as Reject's pending-call path, and for the same
+		// reason: the caller leaves via goIdle in its own event handler rather
+		// than through Hangup, so their IncomingChar must be closed here to reap
+		// the waitForChar goroutine. In a pending call the caller is the only
+		// participant, and the call is deleted immediately below, so no later
+		// BroadcastChar can target the closed channel.
+		for _, p := range call.participants {
+			close(p.IncomingChar)
+			c.reg.SendToSession(p.SessionID, registry.PhoneEvent{
+				Type:   eventType,
+				CallID: id,
+				Caller: call.Caller,
+				Callee: username,
+			})
+		}
+		delete(c.calls, id)
+		if debuglog.Enabled() {
+			logLines = append(logLines, fmt.Sprintf(
+				"reap-ring call=%s callee=%s caller=%s: pending call torn down (%s)",
+				id, username, call.Caller, eventType))
+		}
+	}
+
+	// 2. Outstanding conference ADD rings. The call itself is CallActive and
+	// must survive — only the ring dies. Covering this is not optional:
+	// admitLocked scans pendingAdds as well as pending calls, so a stale entry
+	// here keeps the callee un-dialable even after the loop above has run.
+	for k, ring := range c.pendingAdds {
+		if k.callee != username {
+			continue
+		}
+		close(ring.stop)
+		delete(c.pendingAdds, k)
+		// Tell the participants so their "X is ringing Y" notification clears.
+		// Callee non-empty marks this as a ring ending rather than a participant
+		// departure, matching CancelAdd's convention.
+		if call, ok := c.calls[k.callID]; ok {
+			for _, p := range call.participants {
+				c.reg.SendToSession(p.SessionID, registry.PhoneEvent{
+					Type:   eventType,
+					CallID: k.callID,
+					Caller: ring.inviter,
+					Callee: username,
+				})
+			}
+		}
+		if debuglog.Enabled() {
+			logLines = append(logLines, fmt.Sprintf(
+				"reap-ring call=%s callee=%s inviter=%s: conference ring cancelled (%s)",
+				k.callID, username, ring.inviter, eventType))
+		}
+	}
+}
+
 // hangupLocked removes username from call: it closes their IncomingChar (waking
 // their waitForChar goroutine, which returns on the !ok receive), notifies the
 // remaining participants, and tears the call down ONLY if it is now empty. The

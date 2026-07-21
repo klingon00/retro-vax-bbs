@@ -349,6 +349,39 @@ func (m Model) handlePhoneEvent(event registry.PhoneEvent) (Model, tea.Cmd) {
 		m = m.goIdle()
 		return m.setNotification(msg, notifyDur)
 
+	case registry.EventCalleeGone, registry.EventCalleeUnavailable:
+		// A ring we had outstanding was reaped because no session of the callee
+		// could receive it any more. Only act on our own call (defence-in-depth).
+		if event.CallID != m.callID {
+			return m, nil
+		}
+		// The two types differ only in what we tell the user, and that is the
+		// entire reason they are separate types: the callee is either genuinely
+		// gone or merely unreachable for this call, and reporting the first when
+		// it was the second says something false about someone still online.
+		reason := fmt.Sprintf("%s has disconnected", event.Callee)
+		if event.Type == registry.EventCalleeUnavailable {
+			reason = fmt.Sprintf("%s is unavailable (on another call)", event.Callee)
+		}
+		if m.state == CallActive {
+			// A conference ADD ring died; the call itself is unaffected, so stay
+			// in it and just clear the "ringing X" state, same as EventReject's
+			// CallActive branch.
+			if m.pendingAddTarget == event.Callee {
+				m.pendingAddTarget = ""
+			}
+			return m.setNotification(fmt.Sprintf("*** %s ***", reason), notifyDur)
+		}
+		// Pending outbound call: the ring can never land, so return to idle.
+		// Calling goIdle here is load-bearing beyond tidiness — it is what keeps
+		// this path clear of finding 13. A session left in CallPending has its
+		// next keystroke consumed by the "any key cancels the outbound ring"
+		// branch below, hanging up a call that no longer exists. Message is built
+		// before goIdle because goIdle clears m.msg (same ordering as
+		// EventReject).
+		m = m.goIdle()
+		return m.setNotification(fmt.Sprintf("*** %s ***", reason), notifyDur)
+
 	case registry.EventAnswerElsewhere:
 		// We were being rung for this call inside PHONE (idle at the % prompt),
 		// and another session of this account answered it. Clear our pending

@@ -260,6 +260,21 @@ func (m Model) handleRing(event registry.PhoneEvent) (Model, tea.Cmd) {
 		m.pendingCallID = ""
 		m.history = append(m.history,
 			"%VAX-BBS-I-PHONE, Call answered on another session.")
+	case registry.EventCalleeGone, registry.EventCalleeUnavailable:
+		// Defence-in-depth. A caller waiting on a ring is normally inside the
+		// PHONE app (DIAL launches it), which handles these in handlePhoneEvent,
+		// so this path is not the primary route — but an event that reached the
+		// lobby should still say something truthful rather than be dropped.
+		// Deliberately NOT added to the app-exit mapping in Update(): these
+		// events call goIdle rather than ending the app, so that block never
+		// sees them and a case there would be dead code.
+		if event.Type == registry.EventCalleeUnavailable {
+			m.history = append(m.history,
+				fmt.Sprintf("%%VAX-BBS-I-PHONE, %s is unavailable.", event.Callee))
+		} else {
+			m.history = append(m.history,
+				fmt.Sprintf("%%VAX-BBS-I-PHONE, %s has disconnected.", event.Callee))
+		}
 	case registry.EventAdminNotify:
 		if m.role == "admin" {
 			m.history = append(m.history,

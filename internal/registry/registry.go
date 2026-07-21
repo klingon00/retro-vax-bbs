@@ -33,6 +33,23 @@ const (
 	EventRinging                          // advisory: someone in the call is ringing another user
 	EventAdminNotify                      // one-shot notification delivered to admin lobby sessions
 	EventAnswerElsewhere                  // ring retracted: another session of this account answered
+
+	// EventCalleeGone and EventCalleeUnavailable both tell a caller that their
+	// pending ring was reaped because no session of the callee could receive it
+	// any more. They are separate types, not one type plus a discriminator
+	// field, for the same reason EventAnswerElsewhere is separate from
+	// EventHangup: the two cases read differently to the person waiting, and a
+	// distinct type puts that difference in the dispatch rather than in a
+	// conditional inside a shared handler.
+	//
+	// The cost of the alternative is visible in EventHangup, whose
+	// Callee-non-empty convention makes one type carry several distinct
+	// situations. Finding 13 is a direct consequence: its CallPending branch
+	// handles one of those meanings and silently mishandles another. (Finding 12
+	// is NOT an instance of that — it was a wrong username in the Caller field,
+	// unrelated to the discriminator.)
+	EventCalleeGone        // callee's last session went away — they really did disconnect
+	EventCalleeUnavailable // callee still connected, but no session can be rung (busy elsewhere)
 )
 
 // String renders an event type as its constant name so diagnostic logs read as
@@ -59,6 +76,10 @@ func (e EventType) String() string {
 		return "EventAdminNotify"
 	case EventAnswerElsewhere:
 		return "EventAnswerElsewhere"
+	case EventCalleeGone:
+		return "EventCalleeGone"
+	case EventCalleeUnavailable:
+		return "EventCalleeUnavailable"
 	default:
 		return "EventType(" + strconv.Itoa(int(e)) + ")"
 	}
