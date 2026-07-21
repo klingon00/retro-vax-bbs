@@ -269,6 +269,101 @@ func TestEvents_MatchedPairAndNilWhenAbsent(t *testing.T) {
 	}
 }
 
+// --- KICK (per-session termination) -----------------------------------------
+
+// TestKick_TerminatesEverySessionOfAccount is the regression test for the
+// per-account kick hook: entry held ONE func, so each new session's SetKick
+// overwrote its predecessor and KICK closed only the most recently registered
+// session while reporting unqualified success. Run against the old code this
+// fails with 1 of 2 sessions terminated — which is the bug, stated as an
+// assertion. Both hooks firing is the whole fix.
+func TestKick_TerminatesEverySessionOfAccount(t *testing.T) {
+	r := New()
+	sid1 := r.Register("bob", "user", false, "LOBBY")
+	sid2 := r.Register("bob", "user", false, "LOBBY")
+
+	var kicked1, kicked2 bool
+	r.SetKick(sid1, func() { kicked1 = true })
+	r.SetKick(sid2, func() { kicked2 = true })
+
+	if n := r.Kick("bob"); n != 2 {
+		t.Fatalf("Kick should report 2 sessions terminated, got %d", n)
+	}
+	if !kicked1 || !kicked2 {
+		t.Fatalf("every session must be terminated, got session1=%v session2=%v", kicked1, kicked2)
+	}
+}
+
+// TestSetKick_DoesNotClobberSiblingSession is the direct inverse of the bug:
+// storing a hook for one session must leave a sibling's intact. Under the old
+// account-keyed SetKick there was a single slot, so this could not hold.
+func TestSetKick_DoesNotClobberSiblingSession(t *testing.T) {
+	r := New()
+	sid1 := r.Register("bob", "user", false, "LOBBY")
+	sid2 := r.Register("bob", "user", false, "LOBBY")
+
+	var kicked1 bool
+	r.SetKick(sid1, func() { kicked1 = true })
+	r.SetKick(sid2, func() {}) // must not displace sid1's hook
+
+	r.Kick("bob")
+	if !kicked1 {
+		t.Fatal("the first session's kick hook was clobbered by the second SetKick")
+	}
+}
+
+func TestKick_DoesNotTouchOtherAccounts(t *testing.T) {
+	r := New()
+	sidBob := r.Register("bob", "user", false, "LOBBY")
+	sidCarol := r.Register("carol", "user", false, "LOBBY")
+
+	var bobKicked, carolKicked bool
+	r.SetKick(sidBob, func() { bobKicked = true })
+	r.SetKick(sidCarol, func() { carolKicked = true })
+
+	if n := r.Kick("bob"); n != 1 {
+		t.Fatalf("expected 1 session terminated for bob, got %d", n)
+	}
+	if !bobKicked {
+		t.Error("bob's session should have been terminated")
+	}
+	if carolKicked {
+		t.Error("kicking bob must never terminate another account's session")
+	}
+}
+
+func TestKick_ReturnsZeroWhenNotConnected(t *testing.T) {
+	r := New()
+	if n := r.Kick("nobody"); n != 0 {
+		t.Fatalf("Kick on an absent account should report 0, got %d", n)
+	}
+}
+
+// TestKick_SkipsSessionsWithoutKickFunc pins the counting rule for the real
+// window between Register and SetKick in sessionMiddleware: a session with no
+// hook cannot be terminated, so it must not be counted as though it were.
+func TestKick_SkipsSessionsWithoutKickFunc(t *testing.T) {
+	r := New()
+	sid1 := r.Register("bob", "user", false, "LOBBY")
+	r.Register("bob", "user", false, "LOBBY") // registered, no SetKick yet
+
+	var kicked1 bool
+	r.SetKick(sid1, func() { kicked1 = true })
+
+	if n := r.Kick("bob"); n != 1 {
+		t.Fatalf("only the session with a kick hook should be counted, got %d", n)
+	}
+	if !kicked1 {
+		t.Error("the session that did have a hook should have been terminated")
+	}
+}
+
+func TestSetKick_UnknownSessionIsNoop(t *testing.T) {
+	r := New()
+	// Must not panic; matches SendToSession/Events tolerance for stale IDs.
+	r.SetKick("no-such-session", func() {})
+}
+
 func TestNotifyAdmins_ReachesEveryAdminSession(t *testing.T) {
 	r := New()
 	a1 := r.Register("sysop", "admin", false, "LOBBY")

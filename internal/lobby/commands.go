@@ -1025,10 +1025,22 @@ func kickCommand(m Model, username string) (string, tea.Cmd) {
 	if m.reg == nil {
 		return "KICK is not available — session registry not initialized.", nil
 	}
-	if m.reg.Kick(username) {
+	n := m.reg.Kick(username)
+	// Second, outcome-bearing audit line. requireAdminLogged above logs the
+	// invocation at dispatch time, before the result is known — which is how
+	// the log came to record the admin's intent rather than what happened when
+	// KICK silently closed only one session of a multi-session account. Same
+	// two-phase shape as CREATE USER / RESET PASSWORD, except those log their
+	// outcome from a sub-app; KICK has none, so it logs here. Deliberately
+	// emitted for n == 0 too: "kicked nobody" is worth having in the log.
+	log.Printf("admin action: %s KICK %s (%d session(s) terminated)", m.username, username, n)
+	if n == 0 {
+		return fmt.Sprintf("'%s' is not currently connected.", username), nil
+	}
+	if n == 1 {
 		return fmt.Sprintf("'%s' has been disconnected.", username), nil
 	}
-	return fmt.Sprintf("'%s' is not currently connected.", username), nil
+	return fmt.Sprintf("'%s' has been disconnected (%d sessions).", username, n), nil
 }
 
 // ---- BAN / UNBAN --------------------------------------------------------
@@ -1071,8 +1083,11 @@ func banCommand(m Model, args string) (string, tea.Cmd) {
 		}
 	}
 	// Only disconnect the user once the ban is durably applied — avoids
-	// kicking someone we then refuse to ban in the last-admin race.
-	m.reg.Kick(username)
+	// kicking someone we then refuse to ban in the last-admin race. Kick
+	// closes every session of the account, so a ban can end N connections.
+	if n := m.reg.Kick(username); n > 0 {
+		return fmt.Sprintf("'%s' has been banned (%s). %d session(s) disconnected.", username, display, n), nil
+	}
 	return fmt.Sprintf("'%s' has been banned (%s).", username, display), nil
 }
 
@@ -1352,7 +1367,10 @@ func deleteUserCommand(m Model, username string) (string, tea.Cmd) {
 		}
 	}
 	// Only disconnect once the delete is durably applied — see banCommand.
-	_ = m.reg.Kick(username) // ignore "not online" errors
+	// Every session of the account is closed, not just the newest.
+	if n := m.reg.Kick(username); n > 0 {
+		return fmt.Sprintf("%%VAX-BBS-S-DELETED, Account '%s' has been permanently deleted. %d session(s) disconnected.", username, n), nil
+	}
 	return fmt.Sprintf("%%VAX-BBS-S-DELETED, Account '%s' has been permanently deleted.", username), nil
 }
 

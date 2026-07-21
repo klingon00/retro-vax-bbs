@@ -284,8 +284,12 @@ func sessionMiddleware(db *store.Store, reg *registry.Registry, calls *phone.Cal
 
 			sid := reg.Register(s.User(), user.Role, user.AdminVisible, "LOBBY")
 			s.Context().SetValue(sessionIDKey, sid)
-			// Store a kick function so admin KICK command can close this session.
-			reg.SetKick(s.User(), func() { s.Exit(0) })
+			// Store a kick function so the admin KICK command can close this
+			// session. Keyed by sid, not username: an account-keyed hook gave
+			// each account one slot, so a second session overwrote the first
+			// and KICK closed only the newest. Every session now carries its
+			// own, and Kick fans out across all of them.
+			reg.SetKick(sid, func() { s.Exit(0) })
 
 			// Teardown cleanup. Go runs defers last-registered-first (LIFO), so
 			// this ordering is deliberate: Unregister is registered FIRST and

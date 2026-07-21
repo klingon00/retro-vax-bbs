@@ -4,12 +4,13 @@
 // that genuinely needs to be cross-session (the WHO list, PHONE call
 // routing) will live behind an explicit registry passed into New()."
 //
-// Presence is account-level (keyed by username); event delivery is
-// per-session. One account can have several concurrent SSH sessions, and
-// each gets its OWN notify channel — so a PHONE control event (ring, answer,
-// hangup, reject) is delivered to a specific session, not raced for by all of
-// an account's sessions on a single shared channel. WHO/FINGER/KICK stay
-// account-level; only the notify/done event path is per-session.
+// Presence is account-level (keyed by username); event delivery and session
+// termination are per-session. One account can have several concurrent SSH
+// sessions, and each gets its OWN notify channel — so a PHONE control event
+// (ring, answer, hangup, reject) is delivered to a specific session, not raced
+// for by all of an account's sessions on a single shared channel. Each session
+// likewise owns its own kick hook, so KICK terminates all of them rather than
+// whichever registered last. WHO/FINGER remain account-level display state.
 package registry
 
 import (
@@ -75,9 +76,10 @@ type PhoneEvent struct {
 }
 
 // sessionState is the per-session delivery state: one SSH session's notify
-// and done channels. Every session of an account has its own, so events
-// addressed to a specific session (via SendToSession) reach only that session
-// and are never stolen by a sibling session sharing the account.
+// and done channels, plus its kick hook. Every session of an account has its
+// own, so events addressed to a specific session (via SendToSession) reach only
+// that session and are never stolen by a sibling session sharing the account,
+// and KICK can terminate every session rather than whichever registered last.
 type sessionState struct {
 	// username is the owning account, so Unregister can find the account
 	// entry from a sessionID alone.
@@ -94,6 +96,17 @@ type sessionState struct {
 	// goroutine blocked in waitForPhoneEvent so it exits instead of leaking.
 	// Signal-only: nothing ever sends on it, so closing is always race-free.
 	done chan struct{}
+
+	// kick, when non-nil, terminates THIS session's SSH connection. Set by
+	// sessionMiddleware via SetKick(sessionID, ...) once the session is
+	// registered; used by the KICK admin command (and by BAN / DELETE USER).
+	// Per-session, not per-account: it lived on entry until 2026-07-20, where a
+	// single slot meant each new session overwrote the previous session's hook
+	// and KICK closed only the most recently registered one. Keying it by
+	// session makes that clobbering unrepresentable rather than merely fixed.
+	// Briefly nil between Register and SetKick — Kick skips such sessions
+	// rather than counting a session it cannot actually terminate.
+	kick func()
 }
 
 // entry tracks account-level presence and all sessions for one account.
@@ -101,13 +114,6 @@ type entry struct {
 	role         string
 	adminVisible bool
 	currentApp   string // e.g. "LOBBY", "PHONE", "MAIL" — account-level display label
-
-	// kick, when non-nil, terminates the user's active SSH session. Set by
-	// sessionMiddleware; used by the KICK admin command. Account-level and
-	// last-writer-wins: with several concurrent sessions, the most recent
-	// SetKick overwrites the prior func, so KICK only closes the most-recently-
-	// registered session. Known limitation, tracked in the PHONE audit report.
-	kick func()
 
 	// sessions holds every active session for this account, keyed by sessionID.
 	sessions map[string]*sessionState
@@ -397,33 +403,66 @@ func (r *Registry) Get(username string) (SessionView, bool) {
 	}, true
 }
 
-// SetKick stores a function that terminates the given user's active SSH
-// session. Called by sessionMiddleware when a session starts; the stored
-// function calls ssh.Session.Exit(0) on the underlying connection. Account-
-// level and last-writer-wins — see the entry.kick comment.
-func (r *Registry) SetKick(username string, kick func()) {
+// SetKick stores the function that terminates one specific session's SSH
+// connection. Called by sessionMiddleware immediately after Register, with the
+// sessionID that Register returned; the stored function calls
+// ssh.Session.Exit(0) on that session's underlying connection.
+//
+// Keyed by sessionID, not username, and deliberately so: an account-keyed
+// setter has exactly one slot per account, so each new session overwrote its
+// predecessor's hook and KICK could only ever close the last one to connect.
+// Addressing the session directly makes that clobbering structurally
+// impossible instead of relying on callers to be careful.
+//
+// A sessionID the registry doesn't know is a silent no-op, matching the
+// tolerance of the other session-addressed methods (SendToSession, Events).
+func (r *Registry) SetKick(sessionID string, kick func()) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
-	if e, ok := r.accounts[username]; ok {
-		e.kick = kick
+	if ss, ok := r.sessionIndex[sessionID]; ok {
+		ss.kick = kick
 	}
 }
 
-// Kick calls the stored kick function for username, forcibly closing their
-// SSH session. Returns true if a session was found and kicked.
-func (r *Registry) Kick(username string) bool {
+// Kick terminates EVERY active session of username, forcibly closing each SSH
+// connection, and returns how many it actually terminated. Zero means the
+// account had no connected session with a usable kick hook — i.e. the caller
+// should report "not currently connected" rather than success.
+//
+// The count is what makes a partial or empty effect visible to the admin: KICK
+// used to close one session of a multi-session account and report unqualified
+// success, so the on-screen message and the audit log both recorded the admin's
+// belief rather than what happened.
+func (r *Registry) Kick(username string) int {
+	// Two phases, and the split is load-bearing — do NOT collapse this into a
+	// single loop that calls ss.kick() while the lock is held.
+	//
+	// kick is ssh.Session.Exit(0), which triggers that session's teardown, and
+	// teardown's deferred reg.Unregister(sid) (cmd/server/main.go) takes
+	// r.mu.Lock(). sync.RWMutex is neither reentrant nor upgradable, so invoking
+	// a kick hook while still holding RLock risks a deadlock: the writer blocks
+	// waiting for a reader that is itself waiting on the writer to return.
+	//
+	// So: collect the hooks under RLock, release, and only then call them. The
+	// single-hook version of Kick already copied-then-called for this reason;
+	// iterating sessions generalises that discipline rather than introducing it.
 	r.mu.RLock()
-	e, ok := r.accounts[username]
-	var kick func()
-	if ok {
-		kick = e.kick
+	var kicks []func()
+	if e, ok := r.accounts[username]; ok {
+		for _, ss := range e.sessions {
+			// Skip the brief Register→SetKick window: a session with no hook
+			// cannot be terminated and must not be counted as though it were.
+			if ss.kick != nil {
+				kicks = append(kicks, ss.kick)
+			}
+		}
 	}
 	r.mu.RUnlock()
-	if kick != nil {
+
+	for _, kick := range kicks {
 		kick()
-		return true
 	}
-	return false
+	return len(kicks)
 }
 
 // NotifyAdmins sends a PhoneEvent to every connected admin session. Used to
