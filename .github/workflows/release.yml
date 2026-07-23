@@ -7,23 +7,58 @@ on:
   workflow_dispatch:
     inputs:
       tag:
-        description: 'Existing tag to create a Release for (backfill / re-run)'
+        description: 'Existing tag to create/refresh a Release for (backfill / re-run)'
         required: true
 
 permissions:
-  contents: write   # scoped to this workflow only; needed to create Releases
+  contents: write   # scoped to this workflow only; needed to create/edit Releases
 
 jobs:
   release:
     runs-on: ubuntu-latest
     steps:
-      - name: Create GitHub Release with auto-generated notes
+      - name: Checkout (full history + tags for the changelog)
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          fetch-tags: true
+
+      - name: Build changelog and create/refresh the Release
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          REPO: ${{ github.repository }}
         run: |
+          set -euo pipefail
           TAG="${{ inputs.tag || github.ref_name }}"
-          gh release create "$TAG" \
-            --repo "${{ github.repository }}" \
-            --title "$TAG" \
-            --generate-notes \
-            --verify-tag
+
+          # Previous version tag by version order (empty if TAG is the earliest).
+          PREV="$(git tag --list 'v*.*.*' --sort=v:refname \
+            | awk -v t="$TAG" '$0==t{print prev; exit} {prev=$0}')"
+
+          # One-line commit subjects (not full bodies) for what this tag introduced,
+          # written to a file so subjects are never re-interpreted by the shell.
+          BODY="$(mktemp)"
+          {
+            echo "## What's Changed"
+            echo
+            if [ -n "$PREV" ]; then
+              git log --no-merges --pretty=format:'- %s' "$PREV..$TAG"
+            else
+              git log --no-merges --pretty=format:'- %s' "$TAG"
+            fi
+            echo
+            echo
+            if [ -n "$PREV" ]; then
+              echo "**Full Changelog**: https://github.com/$REPO/compare/$PREV...$TAG"
+            else
+              echo "**Full Changelog**: https://github.com/$REPO/commits/$TAG"
+            fi
+          } > "$BODY"
+
+          # Idempotent: create the Release if absent, otherwise replace its notes
+          # (so a re-run against an existing tag refreshes the body in place).
+          if gh release view "$TAG" --repo "$REPO" >/dev/null 2>&1; then
+            gh release edit "$TAG" --repo "$REPO" --notes-file "$BODY"
+          else
+            gh release create "$TAG" --repo "$REPO" --title "$TAG" --notes-file "$BODY" --verify-tag
+          fi
