@@ -62,7 +62,7 @@ type Model struct {
 // New returns a fresh lobby Model for the authenticated session. sessionID is
 // this session's registry ID (from Registry.Register), used to receive PHONE
 // events addressed to this specific session rather than the account.
-func New(username, role, sessionID string, reg *registry.Registry, db *store.Store, calls *phone.Calls, out io.Writer, pendingExpiry time.Duration) Model {
+func New(username, role, sessionID, version string, reg *registry.Registry, db *store.Store, calls *phone.Calls, out io.Writer, pendingExpiry time.Duration) Model {
 	return Model{
 		username:      username,
 		role:          role,
@@ -72,23 +72,72 @@ func New(username, role, sessionID string, reg *registry.Registry, db *store.Sto
 		calls:         calls,
 		out:           out,
 		pendingExpiry: pendingExpiry,
-		history:       buildWelcome(username, role, db),
+		history:       buildWelcome(username, role, version, db),
 	}
 }
 
-// buildWelcome constructs the initial history for a new session.
-// Admins additionally see a count of pending registrations if any exist.
-func buildWelcome(username, role string, db *store.Store) []string {
-	msgs := []string{fmt.Sprintf("Welcome, %s. Type HELP for a list of commands.", username)}
-	if role == "admin" && db != nil {
-		if n, err := db.CountPendingAccounts(); err == nil && n > 0 {
-			msgs = append(msgs,
-				fmt.Sprintf("%%VAX-BBS-I-PEND, %d account registration(s) awaiting approval.", n),
-				"  Type LIST PENDING to review.",
-			)
-		}
+// bannerContext carries everything a banner provider may need to decide what
+// (if anything) to contribute to a session's login welcome. It is deliberately
+// not an ssh.Session: the lobby package stays decoupled from the SSH layer, so
+// providers see only the session facts assembled at New() time. Add a field
+// here when a future provider needs one (e.g. a mail store for unread counts).
+type bannerContext struct {
+	username string
+	role     string
+	version  string
+	db       *store.Store
+}
+
+// bannerProvider produces zero or more login-banner lines for a session.
+// Returning nil (or an empty slice) means "nothing to show" — which subsumes a
+// separate show bool, and lets one provider emit several lines (the pending-
+// approvals provider emits a status line plus a follow-up hint).
+type bannerProvider func(bannerContext) []string
+
+// bannerProviders is the ordered list of system-driven banner providers. The
+// login banner is the greeting line followed by each provider's output, in
+// this order. Adding a provider (e.g. a mail unread-count line once the Mail
+// app exists) is an append here plus the function — no change to the login
+// flow. This is a static registry, not per-session state, so a package-level
+// var is appropriate: nothing mutates it at runtime.
+var bannerProviders = []bannerProvider{
+	versionBanner,
+	pendingApprovalsBanner,
+}
+
+// buildWelcome constructs the initial history for a new session: a fixed
+// greeting followed by every banner provider's contribution, in order.
+func buildWelcome(username, role, version string, db *store.Store) []string {
+	ctx := bannerContext{username: username, role: role, version: version, db: db}
+	msgs := []string{
+		fmt.Sprintf("Welcome, %s. Type HELP for a list of commands.", username),
+	}
+	for _, provider := range bannerProviders {
+		msgs = append(msgs, provider(ctx)...)
 	}
 	return msgs
+}
+
+// versionBanner stamps the running server version. Always shown.
+func versionBanner(ctx bannerContext) []string {
+	return []string{fmt.Sprintf("%%VAX-BBS-I-VERSION, running %s", ctx.version)}
+}
+
+// pendingApprovalsBanner shows admins how many registrations await approval,
+// with a hint on how to review them. Nothing for non-admins, when the store is
+// unavailable, or when the queue is empty.
+func pendingApprovalsBanner(ctx bannerContext) []string {
+	if ctx.role != "admin" || ctx.db == nil {
+		return nil
+	}
+	n, err := ctx.db.CountPendingAccounts()
+	if err != nil || n == 0 {
+		return nil
+	}
+	return []string{
+		fmt.Sprintf("%%VAX-BBS-I-PEND, %d account registration(s) awaiting approval.", n),
+		"  Type LIST PENDING to review.",
+	}
 }
 
 // ringBellCmd writes BEL directly to the SSH session output, bypassing

@@ -56,6 +56,13 @@ const (
 	dummyHash = "$argon2id$v=19$m=65536,t=3,p=4$PBeQih8r5fJuNB0J6vk/XA$VT14oAs2u5DJILc+W5E+VwUpB17pcNC33Em2HeHt054"
 )
 
+// Version is the server version string, shown in the startup log and the
+// login banner. Overridden at build time with a linker flag
+// (-ldflags "-X main.Version=<tag>"), wired up in the Dockerfile and
+// .github/workflows/docker-publish.yml. A plain `go build` with no ldflags
+// reports "dev".
+var Version = "dev"
+
 // contextKey is an unexported type for ssh.Context keys set by this
 // package. Using a named type (rather than a plain string) prevents
 // accidental collision with keys set by wish or other middleware.
@@ -126,6 +133,7 @@ func loadConfig() config {
 }
 
 func main() {
+	log.Printf("version: %s", Version)
 	cfg := loadConfig()
 
 	db, err := store.Open(dbPath)
@@ -374,7 +382,7 @@ func teaHandler(s ssh.Session) (tea.Model, []tea.ProgramOption) {
 		log.Printf("session handler: missing session ID for %q; refusing session", s.User())
 		return nil, nil
 	}
-	m := lobby.New(s.User(), role, sid, globalReg, globalDB, globalCalls, s, globalPendingExpiry)
+	m := lobby.New(s.User(), role, sid, Version, globalReg, globalDB, globalCalls, s, globalPendingExpiry)
 	return m, []tea.ProgramOption{tea.WithAltScreen()}
 }
 
