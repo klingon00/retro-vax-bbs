@@ -2175,6 +2175,53 @@ generic lobby command.
 Throwaway container removed afterward (`docker rm -f`). **The release is verified
 end-to-end; v0.4.2 is fully closed.**
 
+## PHONE finding 13 resolved by analysis — unreachable dead code (2026-07-23)
+
+Closes audit finding 13 (`EventHangup` in `CallPending` never calls `goIdle()`,
+unlike `EventReject`) **without a code change** — the branch is proven
+**unreachable**, so there is nothing to fix. The deliverable is the proof and a
+comment marking the branch, not a line of behaviour.
+
+**The claim is an absence, established over finite static paths.** The
+fall-through fires only when `m.state == CallPending` *and* `event.CallID ==
+m.callID`. Reachability reduces to one question: can any code emit an `EventHangup`
+carrying call C's ID to the session that is the `CallPending` caller of C? All five
+`EventHangup` emit sites were traced and none can:
+
+- A `CallPending` session is the **sole caller-participant** of its pending call
+  (`Dial` creates `[caller]/CallPending`; the only append flips the call to
+  `CallActive` in the same locked step), and caller/callee are always different
+  accounts (`admitLocked` self-call reject).
+- Every emitter targets either the **callee account's sessions** (`hangupLocked`
+  last-participant fan-out, both `CancelAdd` sites — a different account from the
+  caller) or the **remaining participants after one leaves** (`hangupLocked`'s main
+  notify — and a pending call has none once its lone caller is removed; the
+  active-call `pendingAdds`/`CancelAdd` sites carry an active-call `CallID` that the
+  receiver's guard filters).
+- The one timing route (call answered, then a participant hangs up) can't strand a
+  `CallPending` session either: **finding 11's per-session FIFO delivery** means the
+  session consumes the earlier `EventAnswer` (→ `CallActive`) before any later
+  `EventHangup`, so the `CallActive` branch handles it. A cancelled/rejected/reaped
+  pending caller instead receives `EventReject` or
+  `EventCalleeGone`/`EventCalleeUnavailable`, all of which `goIdle()`.
+
+**Deliberately not "fixed".** Adding a `goIdle()` for symmetry would be
+unexercisable today — an untestable change riding along with a verified one, which
+is exactly the anti-pattern this project avoided all through the finding-9/11 work
+and the reason finding 13 was left open rather than patched in passing. The branch
+is **kept, not deleted**: it is a harmless guard, and it is the correct place to
+handle the event if a future emit site ever addresses a pending caller. A comment
+at the fall-through in `internal/phone/app.go` records the unreachability, names the
+two conditions that would reopen it (a new `EventHangup` emitter addressing a
+pending caller, or a break in per-session FIFO delivery), and warns against both
+deleting the branch and blind-adding the `goIdle()`.
+
+**No live SSH pass, by design.** Live testing cannot prove a negative better than
+this trace does — the claim is the non-existence of a route through static code,
+not a behaviour under load. Full trace and the emit-site table live in
+`docs/audits/audit-2026-07-13-phone-call-admission.md` finding 13. Finding 14
+(latent buffer-full discard) remains the only open item from that audit.
+
 ## Next concrete steps
 
 1. ✅ **VAX/VMS command abbreviation** — shortest unambiguous prefix (DCL style).

@@ -327,6 +327,35 @@ func (m Model) handlePhoneEvent(event registry.PhoneEvent) (Model, tea.Cmd) {
 			}
 			return m.setNotification(notification, notifyDur)
 		}
+		// --- Finding 13: UNREACHABLE branch, deliberately kept -------------------
+		// Reached only when m.state == CallPending — the sole CallState left after
+		// the Idle and Active branches above — AND event.CallID == m.callID. No
+		// EventHangup emit site in call.go can produce that combination, so unlike
+		// the EventReject twin below (which goIdle()s a rejected pending call) this
+		// branch cannot strand a live session and needs no goIdle() of its own.
+		// Resolved by analysis as finding 13 of
+		// docs/audits/audit-2026-07-13-phone-call-admission.md; full trace there.
+		// In short:
+		//   - A CallPending session is the SOLE caller-participant of its pending
+		//     call (Answer appends the callee and flips to CallActive in one locked
+		//     step; caller and callee are always different accounts). Every
+		//     EventHangup emitter targets either the CALLEE account's sessions or
+		//     the REMAINING participants after one leaves — and a pending call has
+		//     no remaining participant once its lone caller is removed. So the
+		//     caller of a pending call is never in an EventHangup recipient set
+		//     tagged with its own call's ID.
+		//   - The one timing route (call answered, then a participant hangs up) can
+		//     not land here either: finding 11's per-session FIFO delivery means
+		//     this session consumes the earlier EventAnswer (-> CallActive) before
+		//     any later EventHangup, so the CallActive branch handles it. A
+		//     cancelled/rejected/reaped pending caller instead receives EventReject
+		//     or EventCalleeGone/EventCalleeUnavailable, all of which goIdle().
+		// Do NOT delete this branch, and do NOT blind-add a goIdle() to mirror
+		// EventReject: today that goIdle() is unexercisable, so it would be an
+		// untestable change (the exact reason finding 13 stayed open rather than
+		// being "fixed" in passing). Kept as a harmless guard — if a future emit
+		// site ever sends EventHangup to a pending caller, this is the correct
+		// place to handle it; reopen finding 13 then.
 		m.pendingIncomingCallID = ""
 		m.pendingIncomingCaller = ""
 		return m.setNotification(fmt.Sprintf("*** %s cancelled the call ***", event.Caller), notifyDur)

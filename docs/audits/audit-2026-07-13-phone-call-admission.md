@@ -26,7 +26,7 @@ fix — see "Found during finding 11 verification" below.
 | 10 | 🔵 **Retired 2026-07-19** — superseded by finding 11's fix, which answers the policy question: the enforced unit is the *session*, and an account may hold one call per session |
 | 11 | ✅ **Fixed in `74a2ef5`, live-verified 2026-07-19** — per-session event delivery (registry split into per-account presence + per-session notify/done). Verified by the full two-session SSH pass (S0–S6), not by unit tests alone |
 | 12 | ✅ Fixed — pending-ring cancellation named the wrong person (a real regression from finding 3's fix) |
-| 13 | 🔵 **Open, unconfirmed** — `EventHangup` in `CallPending` never returns the session to idle, unlike `EventReject`. Found by inspection, reachability not established, no fix attempted |
+| 13 | ✅ **Resolved by analysis 2026-07-23** — the `CallPending` branch is unreachable dead code: no `EventHangup` emit site can deliver a matching-`CallID` event to a session in `CallPending` (full trace in the entry). No code change beyond a comment marking the branch; the `EventReject` asymmetry is intentionally left, and the branch is deliberately kept as a harmless guard rather than removed |
 | 14 | 🔵 **Open, latent** — `SendToSession` silently discards an event when a session's notify buffer is full. Pre-existing and by design; recorded because the failure is invisible and indistinguishable from finding 11's symptom |
 
 **A note on what the unit tests missed, worth keeping.** Findings 11 and 12 were
@@ -512,8 +512,75 @@ fixed and re-verified live**
 
 ### 13. `EventHangup` in `CallPending` never returns the session to idle, unlike `EventReject`
 
-**Status:** 🔵 Open — **recorded, not fixed, and reachability not established.**
-Found by reading, not by reproducing.
+**Status:** ✅ **Resolved by analysis 2026-07-23 — the `CallPending` branch is
+UNREACHABLE dead code, kept as a deliberate defensive guard.** No `EventHangup`
+emit site can deliver an event with a matching `CallID` to a session sitting in
+`CallPending`, so the missing `goIdle()` can never fire and the described
+consequence (flashed cancellation + swallowed keystroke) cannot occur through any
+current path. Deliberately **not** "fixed": adding a `goIdle()` for symmetry with
+`EventReject` would be an unexercisable, untestable change today — avoiding exactly
+that kind of unverified ride-along is why the finding was left open rather than
+patched in passing. The value delivered here is the proof, not a line of code. A
+comment at `internal/phone/app.go`'s `EventHangup` `CallPending` fall-through now
+records the unreachability, so a future editor neither deletes the branch nor
+blind-adds the `goIdle()`. Full trace below.
+
+#### Reachability trace (2026-07-23)
+
+The fall-through at `internal/phone/app.go`'s `EventHangup` handler fires **iff
+`m.state == CallPending` and `event.CallID == m.callID`** — `CallState` has exactly
+three values (`call.go:44-46`), the Idle and Active branches above handle the other
+two, and a `CallID` guard sits between them. So the question reduces to: *can any
+code emit an `EventHangup` carrying call C's ID to the session that is the
+`CallPending` caller of C?*
+
+Two structural facts bound the answer:
+
+1. **A `CallPending` session is always the sole caller-participant of its pending
+   call.** `Dial` creates the call as `[caller] / CallPending` (`call.go:288-291`);
+   the only append to a pending call (`call.go:431`) is immediately followed by
+   `call.State = CallActive` (`call.go:434`) under the same lock, so a pending call
+   never has two participants.
+2. **Caller and callee are always different accounts** — `admitLocked` rejects
+   self-calls via `strings.EqualFold` (`call.go:140`).
+
+All five `EventHangup` emit sites (the only ones in the tree):
+
+| # | Site | Recipients | Reaches a `CallPending` caller w/ matching `CallID`? |
+|---|---|---|---|
+| 1 | `hangupLocked` `call.go:753` | remaining participants after one left | **No** — a pending call has one participant; removing the caller leaves none, so the loop is empty |
+| 2 | `hangupLocked` `call.go:769` | all sessions of `call.Callee` | **No** — targets the callee account, disjoint from the caller (fact 2) |
+| 3 | `hangupLocked` `call.go:785` (pendingAdds) | ADD-callee's sessions | **No** — only on `CallActive` calls; the active-call `CallID` can't match a pending session's `m.callID`, and is filtered by the guard |
+| 4 | `CancelAdd` `call.go:935` | ADD-callee's sessions | **No** — active-call `CallID`, filtered |
+| 5 | `CancelAdd` `call.go:952` | other participants of an active call | **No** — those sessions are `CallActive`, not `CallPending` |
+
+**The one timing-dependent route** is site 1 after C is answered and then a
+participant hangs up. It cannot strand a `CallPending` session: the answer sends
+`EventAnswer` to the caller's session (`call.go:437`) *before* any later hangup, and
+since **finding 11's per-session FIFO delivery** each session has its own
+single-consumer queue — so the caller consumes `EventAnswer` (→ `CallActive`)
+before it ever sees the `EventHangup`, which is then handled by the `CallActive`
+branch. Before the answer, a cancelled/rejected/reaped pending caller receives
+`EventReject` (`call.go:527`) or `EventCalleeGone`/`EventCalleeUnavailable`
+(`call.go:677`) — never `EventHangup` — and all of those call `goIdle()`.
+
+**Both routes the original entry named are cleared:** `Reject` sends `EventReject`,
+not `EventHangup`, to the caller (`call.go:527`); and `hangupLocked`'s `EventHangup`
+emissions never address the caller of a pending call.
+
+**Confidence / caveat.** High on the structural half — sites 2/3/4 target a
+disjoint account and do not depend on timing at all; sites 1/5 cannot reach a lone
+caller-participant. The single timing-dependent route (site 1) rests on per-session
+FIFO ordering, which is the finding-11 invariant. As with any reachability proof
+over concurrent queues, a future change that either (a) adds an `EventHangup`
+emitter addressing a pending caller or (b) breaks per-session FIFO delivery would
+reopen this — which is exactly why the branch is kept rather than deleted, and why
+its comment names both conditions. No live SSH pass was run: the claim is the
+*absence* of a route through finite, static code paths, which this trace
+establishes and which live testing cannot prove any better.
+
+*Superseded status line, kept for the record:* 🔵 Open — recorded, not fixed, and
+reachability not established. Found by reading, not by reproducing.
 
 > **Note (2026-07-20):** finding 9's fix (`e0b7855`) deliberately routes *around*
 > this rather than closing it. The two new event types it introduces
@@ -527,8 +594,15 @@ Found by reading, not by reproducing.
 carried in a conversation: it was noticed while chasing a different symptom, and
 that is exactly the kind of observation that evaporates when attention moves on.
 
-**Severity: suspected bug (unconfirmed) · Confidence: medium on the asymmetry
-being real, low on it being reachable**
+*The original entry is preserved below for the record. In particular its
+**Not investigated** and **Next step** bullets — which asked whether an
+`EventHangup` with a matching `CallID` can reach a `CallPending` session — are now
+answered by the trace above: it cannot.*
+
+**Severity (original): suspected bug (unconfirmed) · Confidence: medium on the
+asymmetry being real, low on it being reachable.** Updated by the 2026-07-23 trace
+to: **established UNREACHABLE in the current code · Confidence high on the
+structural argument, medium-high overall.**
 
 - **Where:** `internal/phone/app.go:328-331` (the `EventHangup` fall-through)
   against `app.go:346-349` (`EventReject`).
