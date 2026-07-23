@@ -2077,6 +2077,67 @@ Not fixed because the trigger is different in kind — closing it means reaping 
 departure, which is a broader change than finding 9 called for and wants its own
 decision about whether a ring should survive the callee getting briefly busy.
 
+## v0.4.2 release: PHONE KICK multi-session termination + mid-ring disconnect, hand-verified (2026-07-22)
+
+Patch bump `v0.4.1` → `v0.4.2` — both changes are bug fixes, not new user-facing
+features, so a patch earns it (same reasoning as v0.4.1's finding-11/12 fixes). The
+one behaviour change worth naming — **a BAN or DELETE USER can now close N
+connections where it closed one** — is a *correction* of wrong behaviour, not a new
+capability, so it stays a patch rather than a minor.
+
+Bundles five commits on top of `v0.4.1` (`ebea990`); tree = `4a5c175`:
+
+- `9e1f3ad` **fix: terminate every session of an account on KICK** — `kick` moved
+  from the per-account `entry` to `sessionState`, `SetKick` re-keyed by sessionID
+  (clobbering made unrepresentable, not merely guarded), `Kick` fans out and
+  returns a count, and `kickCommand` emits a second, outcome line
+  (`admin action: sysop KICK bob (2 session(s) terminated)`) so the audit trail
+  records what happened rather than what was intended. BAN and DELETE USER inherit
+  the fan-out. Full detail: "KICK now terminates every session of an account
+  (2026-07-20)" above.
+- `ca414f1` docs correcting the KICK claims the per-session fix falsified.
+- `a637e71` **test: the live-SSH verification harness** now at `test/live/`
+  (standing infrastructure, deliberately outside `go test`).
+- `e0b7855` **fix: reap PHONE rings when no session of the callee can receive
+  them** (audit finding 9) — `ReapUnreachableRings`, run from session teardown
+  *after* `registry.Unregister`, with the caller told *which* of two causes
+  applied: `EventCalleeGone` (the callee's last session went away) vs
+  `EventCalleeUnavailable` (still online, every session busy elsewhere). Immediate
+  teardown, no grace window — period-authentic to a dropped VMS carrier. The
+  two-message split exists precisely so a still-online user is never reported as
+  disconnected. Full detail: "PHONE mid-ring disconnect — finding 9 resolved and
+  live-verified (2026-07-20)" above.
+- `4a5c175` docs recording finding 9 resolved, with its structural lesson (a rung
+  callee is *not* a participant, so participant-keyed teardown structurally could
+  never see it).
+
+**The release gate was a hands-on live pass, not the automated suites.** This
+project's standing rule is that for anything session-interleaving-shaped, "a green
+suite" and "a green scripted pass" are both insufficient — finding 11 slipped past
+both. So before this tag, **both** bugs were reproduced by hand on the preserved
+pre-fix rig binary (`vaxbbs-prefix`, built before either fix) and then confirmed
+cleared on the current build, over real SSH. KICK's automated bar was unit-level (a
+state/cardinality bug, seen red first); finding 9 additionally had a live harness
+scoring 16/16 on the fix vs 11/16 pre-fix — but the by-hand pass is what actually
+released it.
+
+**Scope of the release, stated honestly:** closes the KICK multi-session gap and
+audit finding 9. **Still open and deliberately not in this release:** findings 13
+and 14 (both low-severity, reachability unestablished) and the "zero-ringable
+reached with no disconnect" known-minor (its own entry directly above) — finding
+9's fix routes *around* 13 rather than closing it.
+
+Lightweight tag, matching `v0.4.1`/`v0.4.0` (tag style across releases is mixed and
+nothing depends on it).
+
+**Remaining (operator's step):** `git tag v0.4.2` and push the tag;
+`docker-publish.yml` fires on the `v*.*.*` tag and builds/pushes
+`ghcr.io/klingon00/retro-vax-bbs:0.4.2` (amd64, `v`-prefix stripped). Then verify
+the *published* image to the v0.4.0 standard — anonymous pull + clean boot +
+dual-listener partition + a feature-in-the-artifact check over SSH — and append
+that confirmation here, so this entry closes "verified end-to-end" like its
+predecessors rather than "tagged and assumed."
+
 ## Next concrete steps
 
 1. ✅ **VAX/VMS command abbreviation** — shortest unambiguous prefix (DCL style).

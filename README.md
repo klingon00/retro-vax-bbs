@@ -146,12 +146,12 @@ docker compose up -d
 ```
 
 Pre-built images are published to `ghcr.io/klingon00/retro-vax-bbs` on each
-version tag push. Note the tag naming: pushing git tag `v0.4.0` publishes
-the image as `0.4.0` — **no `v` prefix** (the publish workflow strips it via
+version tag push. Note the tag naming: pushing git tag `v0.4.2` publishes
+the image as `0.4.2` — **no `v` prefix** (the publish workflow strips it via
 `${GITHUB_REF_NAME#v}`). Pull by the bare version, not the git tag:
 
 ```bash
-docker pull ghcr.io/klingon00/retro-vax-bbs:0.4.0
+docker pull ghcr.io/klingon00/retro-vax-bbs:0.4.2
 ```
 
 `:latest` also tracks the newest published build, if you'd rather not pin a
