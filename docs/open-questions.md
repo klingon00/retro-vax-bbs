@@ -2077,7 +2077,7 @@ Not fixed because the trigger is different in kind — closing it means reaping 
 departure, which is a broader change than finding 9 called for and wants its own
 decision about whether a ring should survive the callee getting briefly busy.
 
-## v0.4.2 release: PHONE KICK multi-session termination + mid-ring disconnect, hand-verified (2026-07-22)
+## v0.4.2 release: PHONE KICK multi-session termination + mid-ring disconnect, published to GHCR + verified end-to-end (2026-07-22)
 
 Patch bump `v0.4.1` → `v0.4.2` — both changes are bug fixes, not new user-facing
 features, so a patch earns it (same reasoning as v0.4.1's finding-11/12 fixes). The
@@ -2130,13 +2130,50 @@ reached with no disconnect" known-minor (its own entry directly above) — findi
 Lightweight tag, matching `v0.4.1`/`v0.4.0` (tag style across releases is mixed and
 nothing depends on it).
 
-**Remaining (operator's step):** `git tag v0.4.2` and push the tag;
-`docker-publish.yml` fires on the `v*.*.*` tag and builds/pushes
-`ghcr.io/klingon00/retro-vax-bbs:0.4.2` (amd64, `v`-prefix stripped). Then verify
-the *published* image to the v0.4.0 standard — anonymous pull + clean boot +
-dual-listener partition + a feature-in-the-artifact check over SSH — and append
-that confirmation here, so this entry closes "verified end-to-end" like its
-predecessors rather than "tagged and assumed."
+**Verified end-to-end (2026-07-23).** The tag push fired `docker-publish.yml`,
+which built and pushed `ghcr.io/klingon00/retro-vax-bbs:0.4.2` (amd64, `v`-prefix
+stripped — git tag `v0.4.2` → image `0.4.2`). Verified to the v0.4.0 standard —
+anonymous-pull proof, a boot-and-serve check, and the dual-listener partition read
+from the server's *own* auth log — and this release went one better than v0.4.0:
+the feature-in-the-artifact check exercised *its own headline fix*, not just a
+generic lobby command.
+
+- **Anonymous pull.** `docker logout ghcr.io` first, then
+  `docker pull ghcr.io/klingon00/retro-vax-bbs:0.4.2` pulled clean — manifest digest
+  `sha256:7841343b…`, config digest `sha256:258b4e4a…` (the 15-layer amd64 v2
+  manifest confirmed earlier by an anonymous `manifests/0.4.2` poll).
+- **Clean boot.** Detached bridge-mode run with a bootstrap admin and
+  `ADMIN_HOST=0.0.0.0` (the documented bridge-mode requirement). Startup logged the
+  config line —
+  `config: public=0.0.0.0:2222 admin=0.0.0.0:2223 ratelimit=1.0/min burst=5 maxIPs=1000 authTimeout=120s registration=closed pendingExpiry=7d`
+  — then `bootstrap admin: created initial admin account "smokeadmin"` and both
+  listeners up (`public listener: 0.0.0.0:2222 (refuses admin-role accounts)` /
+  `admin listener:  0.0.0.0:2223 (refuses non-admin accounts; …)`), no `/data` crash.
+- **Dual-listener partition, from the server's own auth log.** On 2223,
+  `admin auth success: "smokeadmin" from 172.17.0.1:59892` — and only after two
+  `admin auth failure: wrong password for "smokeadmin"`, so the auth path is
+  actually verifying, not rubber-stamping. The same account on 2222 was refused
+  three separate times: `public auth failure: admin account "smokeadmin" rejected
+  on public listener from 172.17.0.1:39378`.
+- **Feature-in-the-artifact (abbreviation).** In the 2223 lobby, `WH` resolved to
+  `WHO` — the shipped binary carries the abbreviation resolver and boots into a
+  working lobby, the same gap-closing check v0.4.0 introduced.
+- **Feature-in-the-artifact (*this* release's fix — new, and stronger than
+  v0.4.0's check).** KICK was exercised against a real multi-session account:
+  `smokeadmin` held two sessions, and a single `KICK smokeadmin` terminated
+  **both**, visible as two `INFO disconnect user=smokeadmin` lines (durations
+  `14.045…s` and `24m41.063…s`). The audit log carries exactly the two-phase shape
+  the fix was built to produce — the dispatch-time
+  `admin action: smokeadmin KICK smokeadmin` immediately followed by the new
+  outcome-time `admin action: smokeadmin KICK smokeadmin (2 session(s) terminated)`.
+  That is proof *in the published artifact* that both the multi-session fan-out and
+  the outcome-count logging shipped, not merely that the image boots. (This check
+  covers the KICK fix specifically; finding 9's proof remains the hands-on rig pass
+  and the 16/16-vs-11/16 harness recorded above — a disconnect-race timing is not
+  something a single-operator smoke test reproduces.)
+
+Throwaway container removed afterward (`docker rm -f`). **The release is verified
+end-to-end; v0.4.2 is fully closed.**
 
 ## Next concrete steps
 
