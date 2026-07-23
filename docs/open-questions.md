@@ -2289,6 +2289,60 @@ banner — `%VAX-BBS-I-VERSION, running v0.4.2-live` on its own line between the
 greeting and the `LOBBY>` prompt, read out of the real bubbletea alt-screen
 stream.
 
+## v0.5.0 release: server version display + login-banner provider pipeline, published to GHCR + verified end-to-end (2026-07-23)
+
+**Minor bump `v0.4.2` → `v0.5.0`, not a patch `v0.4.3` — and the reasoning
+follows the convention `v0.4.0` set.** This release adds a **new user-facing
+feature**: every session now sees a version line (`%VAX-BBS-I-VERSION, running
+v0.5.0`) in the login banner that was not there before. That is a new
+capability, not a bug fix or a correction of wrong behaviour — so by the same
+rule that made command abbreviation a minor (`v0.4.0`: "a new user-facing
+feature earns a minor bump even pre-1.0") rather than a patch, this is a minor.
+Patches here are reserved for bug fixes (`v0.4.1`/`v0.4.2`); a user-facing
+*addition* does not fit that, so `v0.4.3` would have quietly broken the
+self-documenting version convention. The banner *pipeline* refactor is
+behaviour-preserving and does not itself move the version — the new banner line
+is what earns the bump. The `feat:` commit type (`91267a9`) agrees.
+
+Tag `v0.5.0` → `2c5bc90` (the feat + docs commits `91267a9` + `2c5bc90`); the
+README refresh (`248a8ed`) is a separate doc-only follow-up and deliberately
+**not** in the tagged tree — the release artifact and the doc refresh are
+decoupled by construction (a tag snapshots the commit, not the working tree).
+The tag fired `docker-publish.yml` (built/pushed `ghcr.io/klingon00/retro-vax-bbs`,
+amd64) and `release.yml` (GitHub Release, auto-notes built from commit subjects
+in the `v0.4.2...v0.5.0` range — verified rendered, not a draft, and marked
+Latest). Lightweight tag, matching `v0.4.0`/`v0.4.1`/`v0.4.2`.
+
+Verified to the v0.4.x standard — an anonymous-pull proof *plus* a
+feature-in-the-artifact check exercising **this release's own headline
+feature**:
+
+- **Anonymous pull.** `docker logout ghcr.io` first, then
+  `docker pull ghcr.io/klingon00/retro-vax-bbs:0.5.0` pulled every layer clean.
+  Manifest digest
+  `sha256:29dc7d05cb3666d7bd6d7e52acd90826d6e3b06f0601d80593fc5b174cd2f8af`,
+  cross-checked against the registry's own `Docker-Content-Digest`. The
+  `v`-prefix strip still holds: git tag `v0.5.0` → image tag `0.5.0`.
+- **Baked version, from the published binary's own startup log.** Booted the
+  pulled image (bridge mode, `ADMIN_HOST=0.0.0.0`, bootstrap admin) and it
+  logged `version: v0.5.0` — proof the `-ldflags -X main.Version` injection
+  carried `github.ref_name` (with its `v`) into the *released* binary, not just
+  a local build.
+- **Feature-in-the-artifact (the version banner itself).** Drove a real admin
+  SSH login into the *published* container and read the rendered banner out of
+  the bubbletea alt-screen: `%VAX-BBS-I-VERSION, running v0.5.0` on its own line
+  between the greeting and the `LOBBY>` prompt. Proof in the published image that
+  the feature shipped with the correct baked version — the first release whose
+  banner shows a real version (v0.4.2 and earlier had no version line at all).
+
+Throwaway container removed afterward (`docker rm -fv`). **The release is
+verified end-to-end; v0.5.0 is fully closed.**
+
+Accompanied by the README refresh (`248a8ed`): the Status checklist gains the
+feature; the `docker pull` example → `:0.5.0`; the tag-strip *explanation* is
+genericized to `vX.Y.Z` so it is no longer a per-release staleness point.
+CLAUDE.md's status line updated locally (gitignored).
+
 ## Next concrete steps
 
 1. ✅ **VAX/VMS command abbreviation** — shortest unambiguous prefix (DCL style).
