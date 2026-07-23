@@ -2222,6 +2222,73 @@ not a behaviour under load. Full trace and the emit-site table live in
 `docs/audits/audit-2026-07-13-phone-call-admission.md` finding 13. Finding 14
 (latent buffer-full discard) remains the only open item from that audit.
 
+## Server version display + login-banner provider pipeline (2026-07-23)
+
+Two related but separable pieces, landed together in `91267a9`
+(code/tests/build-wiring; this docs entry is the follow-up commit).
+
+**Version stamping.** `cmd/server/main.go` gained `var Version = "dev"`,
+overridden at build time via `-ldflags "-X main.Version=<tag>"`. It is
+surfaced two ways: a startup log line (`version: <v>`, logged first in
+`main()`) and a VAX-style banner line (`%VAX-BBS-I-VERSION, running <v>`).
+The `Dockerfile` builder stage takes `ARG VERSION=dev` and passes
+`-X main.Version=${VERSION}` on the *server* build only (adduser has no such
+var); `docker-publish.yml` passes `VERSION=${{ github.ref_name }}`, so a
+released image bakes the full git tag *with* its `v` (e.g. `v0.4.2`) while a
+plain `go build` reports `dev`.
+
+Two decisions worth recording because the obvious-looking alternative was
+wrong:
+
+- **stdlib `log`, not `charmbracelet/log`.** The request sketched
+  `log.Info("starting", "version", Version)` — charmbracelet/log's structured
+  API — but `cmd/server` imports **stdlib `log`** (all ~40 calls are
+  `log.Printf`/`log.Fatalln`), and `charmbracelet/log` is only an `// indirect`
+  dependency. `log.Info(...)` would not have compiled. Matched the existing
+  `log.Printf("version: %s", …)` style rather than take a new direct dependency
+  for one line.
+- **Keep the `v`, display verbatim.** The image *tag* is stripped to `0.4.2`
+  (`${GITHUB_REF_NAME#v}`), but the banner shows `running v0.4.2` — so the baked
+  value comes from `github.ref_name` (keeps the `v`) and prints as-is. Baking
+  the stripped `0.4.2` and re-prepending `v` would print an ugly `vdev` for
+  unstamped local builds.
+
+**Login-banner provider pipeline.** The one-off admin pending-count line was
+generalized into an ordered list of providers, so the next system-driven banner
+line is a plug-in rather than a login-flow edit. The shape deliberately diverges
+from the sketched `func(session) (line string, show bool)` in two ways the
+existing code forced:
+
+- **`bannerProvider = func(bannerContext) []string`**, where nil/empty means
+  "show nothing." A single `line string` couldn't represent the pending block,
+  which is genuinely *two* lines (status + `Type LIST PENDING` hint); the
+  `[]string` return also subsumes the `show bool` and composes without a
+  per-provider branch (a nil slice spreads to nothing in
+  `append(msgs, provider(ctx)...)`).
+- **`bannerContext`, not an `ssh.Session`.** The lobby package never imports
+  `ssh` (it takes `out io.Writer`), so providers get the facts assembled at
+  `New()` time — `{username, role, version, db}` — and a future provider that
+  needs more adds a field.
+
+The greeting stays a fixed preamble. The provider list is a **static
+package-level registry** (`bannerProviders`) — the right use of a package var
+(not per-session state, never mutated at runtime), and what makes "add a
+provider" a one-line append. Kept in `model.go` next to `buildWelcome`.
+**User-configurable providers (a `SET LOGIN` picking WHO/FINGER/notes) are
+explicitly deferred** until the Mail app gives a second real consumer to design
+the configuration surface against — this pass is system-driven providers only.
+
+**Verification.** `go build` / `go vet` / `go test ./...` / `gofmt -l` clean;
+`-race` clean on `internal/lobby`. New `TestBuildWelcome_ProviderPipeline` pins
+banner ordering and the empty-slice-hides contract across non-admin /
+admin-empty / admin-with-pending. The `-X` injection was proven, not assumed:
+`-X main.Version=v9.9.9-smoke` logged `version: v9.9.9-smoke` and an unstamped
+build logged `version: dev`. A live pexpect SSH pass (isolated loopback ports,
+throwaway seeded DB, injected `v0.4.2-live`) visually confirmed the rendered
+banner — `%VAX-BBS-I-VERSION, running v0.4.2-live` on its own line between the
+greeting and the `LOBBY>` prompt, read out of the real bubbletea alt-screen
+stream.
+
 ## Next concrete steps
 
 1. ✅ **VAX/VMS command abbreviation** — shortest unambiguous prefix (DCL style).

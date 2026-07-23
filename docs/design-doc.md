@@ -403,6 +403,42 @@ message, then quit and require a fresh connection.
 
 ---
 
+## Login banner — provider pipeline
+
+The lines shown after login (the greeting, the running-version stamp, and — for
+admins — a count of pending registrations) are composed by an ordered **provider
+pipeline** rather than hardcoded inline. `buildWelcome`
+(`internal/lobby/model.go`) emits a fixed greeting and then iterates an ordered
+list of providers, appending each one's output.
+
+A provider is `func(bannerContext) []string`:
+
+- **`bannerContext`** carries the session facts a provider may need — currently
+  `{username, role, version, db}`. It is deliberately *not* an `ssh.Session`:
+  the lobby package stays decoupled from the SSH layer, so a provider sees only
+  what `New()` assembled. A provider that needs something new adds a field here.
+- **The `[]string` return is the whole contract.** Returning `nil` (or an empty
+  slice) means "contribute nothing" — that is how a provider hides itself; there
+  is no separate `show` flag. Returning multiple lines is normal (the
+  pending-approvals provider emits a status line plus a follow-up hint).
+
+The pipeline is a static, package-level registry in display order
+(`bannerProviders`). **Adding a provider is a plug-in, not a login-flow change:**
+write a `func(bannerContext) []string` and append it, at the desired position,
+to that list. Nothing in the session/auth path changes, and the provider decides
+its own visibility by returning lines or nothing. This is the extension point
+reserved for future system-driven banner lines — for example, a line the Mail
+app might contribute once it exists.
+
+**Scope, and what is deliberately deferred.** The providers here are
+**system-driven** only. *User-configurable* banner content — a command letting
+each user choose which lines they see, and in what order — is intentionally out
+of scope until there is a second real consumer to design that configuration
+surface against. The pipeline shape is the commitment made now; the
+configuration model is not.
+
+---
+
 ## Deployment model
 
 - **One codebase, one Docker image** — no separate "VPN version" vs. "open version."
