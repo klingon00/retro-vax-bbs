@@ -44,6 +44,7 @@ Per the build order in `docs/open-questions.md`:
 - [x] Lobby scrollback (PgUp / PgDn / End)
 - [x] Docker packaging
 - [x] Command abbreviation (DCL-style shortest unambiguous prefix, role-scoped)
+- [x] Server version display (startup log + login banner) + banner provider pipeline
 
 ## ⚠️ Security status — read before running anywhere but your laptop
 
@@ -146,12 +147,12 @@ docker compose up -d
 ```
 
 Pre-built images are published to `ghcr.io/klingon00/retro-vax-bbs` on each
-version tag push. Note the tag naming: pushing git tag `v0.4.2` publishes
-the image as `0.4.2` — **no `v` prefix** (the publish workflow strips it via
+version tag push. Note the tag naming: pushing git tag `vX.Y.Z` publishes
+the image as `X.Y.Z` — **no `v` prefix** (the publish workflow strips it via
 `${GITHUB_REF_NAME#v}`). Pull by the bare version, not the git tag:
 
 ```bash
-docker pull ghcr.io/klingon00/retro-vax-bbs:0.4.2
+docker pull ghcr.io/klingon00/retro-vax-bbs:0.5.0
 ```
 
 `:latest` also tracks the newest published build, if you'd rather not pin a
